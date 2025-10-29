@@ -993,8 +993,8 @@ def EnsureWindowAndBuffer()
   call win_execute(s_winid, 'autocmd!')
   call win_execute(s_winid, 'autocmd BufWipeout <buffer> ++once call simpletree#OnBufWipe()')
   call win_execute(s_winid, 'augroup END')
-  call win_execute(s_winid, 'nnoremap <silent> <buffer> v :call simpletree#OnOpenVSplit()<CR>')
-  call win_execute(s_winid, 'nnoremap <silent> <buffer> s :call simpletree#OnOpenSplit()<CR>')
+  call win_execute(s_winid, 'nnoremap <silent> <buffer> V :call simpletree#OnOpenVSplit()<CR>')
+  call win_execute(s_winid, 'nnoremap <silent> <buffer> S :call simpletree#OnOpenSplit()<CR>')
   call win_execute(s_winid, 'nnoremap <silent> <buffer> t :call simpletree#OnOpenTab()<CR>')
 enddef
 
@@ -1801,7 +1801,7 @@ def BuildHelpLines(): list<string>
     'N     在目标目录中新建文件夹',
     'r     重命名当前节点',
     'D     删除当前节点（目录为递归删除）',
-    ca_key .. '     一键折叠根下所有目录',
+    'Z     一键折叠根下所有目录',
     '?     显示/关闭本帮助面板',
     '----------------------------------------',
     '提示：粘贴/重命名时若存在同名目标：可选择覆盖或重命名；剪切成功后自动清空剪贴板。',
