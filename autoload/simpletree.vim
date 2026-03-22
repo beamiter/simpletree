@@ -23,13 +23,19 @@ var s_file_icon_map: dict<string> = {
   'zip': '', 'tar': '', 'gz': '', '7z': ''
 }
 
+var s_file_icon_map_ready: bool = false
+
 def SetupFileIconMap()
+  if s_file_icon_map_ready
+    return
+  endif
   var override = get(g:, 'simpletree_file_icon_map', {})
   if type(override) == v:t_dict
     for [k, v] in items(override)
       s_file_icon_map[k] = v
     endfor
   endif
+  s_file_icon_map_ready = true
 enddef
 
 def SetupIcons()
@@ -65,8 +71,6 @@ def FileIcon(name: string): string
   if ext ==# ''
     return '󰈙'   # 通用文件（无扩展）
   endif
-  # 确保映射已初始化
-  SetupFileIconMap()
   return get(s_file_icon_map, ext, s_icons.file)
 enddef
 
@@ -482,18 +486,8 @@ def WinValid(): bool
 enddef
 
 def OtherWindowId(): number
-  var wins = getwininfo()
-  for w in wins
-    if w.winid == s_winid
-      continue
-    endif
-    # 只选择普通缓冲区窗口（buftype 为空）
-    var bt = getbufvar(w.bufnr, '&buftype')
-    if type(bt) == v:t_string && bt ==# ''
-      return w.winid
-    endif
-  endfor
-  return 0
+  var cands = CandidateWindows()
+  return len(cands) > 0 ? cands[0].winid : 0
 enddef
 
 def Log(msg: string, hl: string = 'None')
@@ -753,6 +747,14 @@ def ScanDirAsync(path: string)
         call remove(s_pending, p)
       endif
       ScheduleRender()
+      # Reveal 回调：扫描完成后尝试定位目标，避免轮询定时器
+      if s_reveal_target !=# '' && FocusIfPresent(s_reveal_target)
+        s_reveal_target = ''
+        if s_reveal_timer != 0
+          try | call timer_stop(s_reveal_timer) | catch | endtry
+          s_reveal_timer = 0
+        endif
+      endif
     },
     (msg) => {
       s_loading[p] = false
@@ -1042,7 +1044,6 @@ def Render()
   endif
   EnsureWindowAndBuffer()
 
-  call SetupIcons()
   call EnsureSyntaxTree()
 
   var lines: list<string> = []
@@ -1488,31 +1489,14 @@ export def OnCollapseAll()
       count += 1
     endif
   endfor
-  # 取消所有非 root 的挂起请求与加载标记（避免无谓的后台任务）
+  # 取消所有非 root 的挂起请求与加载标记
   for [p, id] in items(s_pending)
     if p !=# s_root
-      try
-        BCancel(id)
-      catch
-      endtry
+      try | BCancel(id) | catch | endtry
     endif
   endfor
-  for p in keys(s_pending)
-    if p !=# s_root
-      try
-        call remove(s_pending, p)
-      catch
-      endtry
-    endif
-  endfor
-  for p in keys(s_loading)
-    if p !=# s_root
-      try
-        call remove(s_loading, p)
-      catch
-      endtry
-    endif
-  endfor
+  s_pending = filter(s_pending, (k, _) => k ==# s_root)
+  s_loading = filter(s_loading, (k, _) => k ==# s_root)
 
   Render()
   echo '[SimpleTree] collapsed all under root (' .. count .. ' dirs)'
@@ -2010,7 +1994,7 @@ def RevealPath(path: string)
     return
   endif
 
-  # 否则再用定时器重复尝试定位
+  # 用少量重试的定时器作为回退（主要靠 ScanDirAsync OnDone 回调触发）
   if exists('*timer_start')
     try
       if s_reveal_timer != 0
@@ -2019,7 +2003,7 @@ def RevealPath(path: string)
     catch
     endtry
     try
-      s_reveal_timer = timer_start(100, (id) => RevealTimerCb(id), {repeat: 30})
+      s_reveal_timer = timer_start(150, (id) => RevealTimerCb(id), {repeat: 5})
     catch
       FocusPath(ap)
     endtry
