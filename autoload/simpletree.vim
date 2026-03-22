@@ -994,10 +994,19 @@ def EnsureWindowAndBuffer()
   call win_execute(s_winid, 'augroup SimpleTreeBuf')
   call win_execute(s_winid, 'autocmd!')
   call win_execute(s_winid, 'autocmd BufWipeout <buffer> ++once call simpletree#OnBufWipe()')
+  call win_execute(s_winid, 'autocmd WinClosed <buffer> call simpletree#OnAutoClose()')
   call win_execute(s_winid, 'augroup END')
+
+  # 状态栏显示当前根路径
+  call win_execute(s_winid, 'setlocal statusline=%{simpletree#StatusLine()}')
   call win_execute(s_winid, 'nnoremap <silent> <buffer> V :call simpletree#OnOpenVSplit()<CR>')
   call win_execute(s_winid, 'nnoremap <silent> <buffer> S :call simpletree#OnOpenSplit()<CR>')
   call win_execute(s_winid, 'nnoremap <silent> <buffer> t :call simpletree#OnOpenTab()<CR>')
+  # Yank path
+  call win_execute(s_winid, 'nnoremap <silent> <buffer> y :call simpletree#OnYankPath()<CR>')
+  call win_execute(s_winid, 'nnoremap <silent> <buffer> Y :call simpletree#OnYankAbsPath()<CR>')
+  # Open with system app
+  call win_execute(s_winid, 'nnoremap <silent> <buffer> gx :call simpletree#OnSystemOpen()<CR>')
 enddef
 
 def BuildLines(path: string, depth: number, lines: list<string>, idx: list<dict<any>>)
@@ -1163,6 +1172,9 @@ export def OnRootHere()
 enddef
 
 export def OnRootUp()
+  if GuardRootLock()
+    return
+  endif
   if s_root ==# ''
     return
   endif
@@ -1717,6 +1729,8 @@ export def OnRename()
 
   if MovePath(src, dst)
     echo '[SimpleTree] renamed: ' .. base .. ' -> ' .. newname
+    # 更新指向旧路径的 Vim 缓冲区
+    RenameBuf(src, dst)
     Refresh()
     RevealPath(dst)
   else
@@ -1751,6 +1765,8 @@ export def OnDelete()
     echohl ErrorMsg | echom '[SimpleTree] delete failed' | echohl None
     return
   endif
+  # 清除指向已删除路径的缓冲区
+  WipeBuf(p)
   echo '[SimpleTree] deleted: ' .. p
   Refresh()
   if parent !=# ''
@@ -1785,6 +1801,12 @@ def BuildHelpLines(): list<string>
     'N     在目标目录中新建文件夹',
     'r     重命名当前节点',
     'D     删除当前节点（目录为递归删除）',
+    'V     垂直分屏打开文件',
+    'S     水平分屏打开文件',
+    't     在新标签页打开文件',
+    'y     复制文件名到寄存器',
+    'Y     复制完整路径到寄存器',
+    'gx    用系统默认程序打开',
     'Z     一键折叠根下所有目录',
     '?     显示/关闭本帮助面板',
     '----------------------------------------',
@@ -2177,4 +2199,114 @@ enddef
 
 export def GetRoot(): string
   return s_root
+enddef
+
+# =============================================================
+# 缓冲区同步（重命名/删除后更新 Vim buffers）
+# =============================================================
+def RenameBuf(old_path: string, new_path: string)
+  var bnr = bufnr(old_path)
+  if bnr > 0 && bufexists(bnr)
+    try
+      execute 'silent! buffer ' .. bnr
+      execute 'silent! file ' .. fnameescape(new_path)
+      execute 'silent! edit!'
+    catch
+    endtry
+    if WinValid()
+      call win_gotoid(s_winid)
+    endif
+  endif
+enddef
+
+def WipeBuf(path: string)
+  var bnr = bufnr(path)
+  if bnr > 0 && bufexists(bnr)
+    try
+      execute 'silent! bwipeout! ' .. bnr
+    catch
+    endtry
+  endif
+enddef
+
+# =============================================================
+# Yank / 系统打开 / Tab 打开
+# =============================================================
+export def OnYankPath()
+  var node = CursorNode()
+  if empty(node) || get(node, 'loading', v:false)
+    return
+  endif
+  var name = fnamemodify(node.path, ':t')
+  setreg('"', name)
+  setreg('+', name)
+  echo '[SimpleTree] yanked: ' .. name
+enddef
+
+export def OnYankAbsPath()
+  var node = CursorNode()
+  if empty(node) || get(node, 'loading', v:false)
+    return
+  endif
+  setreg('"', node.path)
+  setreg('+', node.path)
+  echo '[SimpleTree] yanked: ' .. node.path
+enddef
+
+export def OnSystemOpen()
+  var node = CursorNode()
+  if empty(node) || get(node, 'loading', v:false)
+    return
+  endif
+  var cmd = ''
+  if has('mac') || has('macunix')
+    cmd = 'open'
+  elseif has('unix')
+    cmd = 'xdg-open'
+  elseif has('win32') || has('win64')
+    cmd = 'start'
+  endif
+  if cmd ==# ''
+    echo '[SimpleTree] system open not supported on this platform'
+    return
+  endif
+  var full = printf('%s %s &', cmd, shellescape(node.path))
+  call system(full)
+  echo '[SimpleTree] opened: ' .. fnamemodify(node.path, ':t')
+enddef
+
+export def OnOpenTab()
+  var node = CursorNode()
+  if empty(node) || node.is_dir || get(node, 'loading', v:false)
+    return
+  endif
+  execute 'tabedit ' .. fnameescape(node.path)
+enddef
+
+# =============================================================
+# 自动关闭（树为最后一个窗口时自动退出）
+# =============================================================
+export def OnAutoClose()
+  # 延迟到下一帧检测，避免在 WinClosed 期间窗口状态不稳定
+  if exists('*timer_start')
+    timer_start(0, (_) => {
+      if winnr('$') == 1 && &filetype ==# 'simpletree'
+        quit
+      endif
+    })
+  endif
+enddef
+
+# 状态栏
+export def StatusLine(): string
+  if s_root ==# ''
+    return ' SimpleTree'
+  endif
+  var display = s_root
+  var home = expand('~')
+  if home !=# '' && stridx(display, home) == 0
+    display = '~' .. display[len(home) :]
+  endif
+  var lock_icon = s_root_locked ? ' ' : ''
+  return ' ' .. display .. lock_icon
 enddef
