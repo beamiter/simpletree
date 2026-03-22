@@ -2239,7 +2239,7 @@ export def OnYankPath()
   endif
   var name = fnamemodify(node.path, ':t')
   setreg('"', name)
-  setreg('+', name)
+  simpleclipboard#CopyToSystemClipboard(name)
   echo '[SimpleTree] yanked: ' .. name
 enddef
 
@@ -2249,7 +2249,7 @@ export def OnYankAbsPath()
     return
   endif
   setreg('"', node.path)
-  setreg('+', node.path)
+  simpleclipboard#CopyToSystemClipboard(node.path)
   echo '[SimpleTree] yanked: ' .. node.path
 enddef
 
