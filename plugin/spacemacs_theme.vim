@@ -1,12 +1,9 @@
-vim9script
+" spacemacs_theme plugin 入口 — 兼容 Vim 8.x / 9.0+
 
-import autoload 'spacemacs_theme.vim' as Theme
+command! SpacemacsThemeToggle call spacemacs_theme#toggle()
+command! SpacemacsThemeDark   call spacemacs_theme#set('dark')
+command! SpacemacsThemeLight  call spacemacs_theme#set('light')
 
-command! SpacemacsThemeToggle Theme.toggle()
-command! SpacemacsThemeDark Theme.set('dark')
-command! SpacemacsThemeLight Theme.set('light')
-
-# 可选：首次加载时，若用户未设置模式，则以当前 &background 为准
 if !exists('g:spacemacs_theme_mode')
-  g:spacemacs_theme_mode = &background
+  let g:spacemacs_theme_mode = &background
 endif
