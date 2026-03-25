@@ -24,6 +24,9 @@ var s_file_icon_map: dict<string> = {
 }
 
 var s_file_icon_map_ready: bool = false
+var s_icon_version: number = 0
+var s_cached_syntax_sig: string = ''
+var s_cached_syntax_sig_ver: number = -1
 
 def SetupFileIconMap()
   if s_file_icon_map_ready
@@ -36,6 +39,7 @@ def SetupFileIconMap()
     endfor
   endif
   s_file_icon_map_ready = true
+  s_icon_version += 1
 enddef
 
 def SetupIcons()
@@ -58,6 +62,7 @@ def SetupIcons()
   for [k, v] in items(get(g:, 'simpletree_icons', {}))
     s_icons[k] = v
   endfor
+  s_icon_version += 1
   # 保证文件类型图标映射已加载（供 FileIcon/SetupSyntaxTree 复用）
   SetupFileIconMap()
 enddef
@@ -782,20 +787,24 @@ enddef
 # =============================================================
 var s_syntax_sig: string = ''
 def ComputeSyntaxSig(): string
+  # 如果 icon 版本未变，直接返回缓存签名
+  if s_cached_syntax_sig_ver == s_icon_version && s_cached_syntax_sig !=# ''
+    return s_cached_syntax_sig
+  endif
   # 将影响语法的关键配置进行签名
   SetupFileIconMap()
   var parts: list<string> = []
   parts->add('NF=' .. (NFEnabled() ? '1' : '0'))
   parts->add('show_icons=' .. (get(g:, 'simpletree_show_file_icons', 1) ? '1' : '0'))
-  # s_icons 当前集合（含用户覆盖）
   for [k, v] in items(s_icons)
     parts->add(k .. '=' .. v)
   endfor
-  # 文件类型图标映射（只签名键和值）
   for [k, v] in items(s_file_icon_map)
     parts->add('file:' .. k .. '=' .. v)
   endfor
-  return join(parts, '|')
+  s_cached_syntax_sig = join(parts, '|')
+  s_cached_syntax_sig_ver = s_icon_version
+  return s_cached_syntax_sig
 enddef
 
 def EnsureSyntaxTree(): void
@@ -814,91 +823,85 @@ def SetupSyntaxTree(): void
     return
   endif
   try
+    var cmds: list<string> = []
+
     # 清理语法组
-    call win_execute(s_winid, 'silent! syntax clear SimpleTreeIcon SimpleTreeIconDir SimpleTreeIconHidden SimpleTreeDirName SimpleTreeDirSlash SimpleTreeHidden SimpleTreeLoading SimpleTreeIconLang SimpleTreeIconScript SimpleTreeIconWeb SimpleTreeIconData SimpleTreeIconDoc SimpleTreeIconImage SimpleTreeIconArchive SimpleTreeIconFileDefault')
+    cmds->add('silent! syntax clear SimpleTreeIcon SimpleTreeIconDir SimpleTreeIconHidden SimpleTreeDirName SimpleTreeDirSlash SimpleTreeHidden SimpleTreeLoading SimpleTreeIconLang SimpleTreeIconScript SimpleTreeIconWeb SimpleTreeIconData SimpleTreeIconDoc SimpleTreeIconImage SimpleTreeIconArchive SimpleTreeIconFileDefault')
 
     # 基础匹配
-    call win_execute(s_winid, 'syntax match SimpleTreeHidden "^\s*.\{-}\s\zs\.\S\+"')
-    call win_execute(s_winid, 'syntax match SimpleTreeLoading "Loading\.\.\."')
+    cmds->add('syntax match SimpleTreeHidden "^\s*.\{-}\s\zs\.\S\+"')
+    cmds->add('syntax match SimpleTreeLoading "Loading\.\.\."')
 
     # 目录：图标 -> 名称 -> 斜杠（nextgroup + contained）
     var dir1 = s_icons.dir
     var dir2 = s_icons.dir_open
-    # 在 very nomagic 下对字面量图标匹配，再恢复 \m
     var dir_pat = '\%(' .. '\V' .. escape(dir1, '\') .. '\m' .. '\|' .. '\V' .. escape(dir2, '\') .. '\m' .. '\)'
-    var cmd_dir = 'syntax match SimpleTreeIconDir "^\s*\zs' .. dir_pat .. '\ze\s" nextgroup=SimpleTreeDirName,SimpleTreeDirSlash skipwhite'
-    call win_execute(s_winid, cmd_dir)
-    # 目录名：图标后面的非斜杠字符段（允许空格，直到斜杠或行尾）
-    call win_execute(s_winid, 'syntax match SimpleTreeDirName "[^/]\+" contained nextgroup=SimpleTreeDirSlash')
-    # 斜杠（如果启用了后缀）
-    call win_execute(s_winid, 'syntax match SimpleTreeDirSlash "/$" contained')
+    cmds->add('syntax match SimpleTreeIconDir "^\s*\zs' .. dir_pat .. '\ze\s" nextgroup=SimpleTreeDirName,SimpleTreeDirSlash skipwhite')
+    cmds->add('syntax match SimpleTreeDirName "[^/]\+" contained nextgroup=SimpleTreeDirSlash')
+    cmds->add('syntax match SimpleTreeDirSlash "/$" contained')
 
     # 文件 icon 分色（仅当启用 Nerd Font 且显示文件图标）
     if NFEnabled() && !!get(g:, 'simpletree_show_file_icons', 1)
       SetupFileIconMap()
-      var cats_lang = ['vim', 'lua', 'py', 'rb', 'go', 'rs', 'js', 'ts', 'jsx', 'tsx', 'c', 'h', 'cpp', 'hpp', 'java', 'kt']
-      var cats_script = ['sh', 'bash', 'zsh']
-      var cats_web = ['html', 'css', 'scss']
-      var cats_data = ['json', 'toml', 'yml', 'yaml', 'ini', 'lock']
-      var cats_doc = ['md', 'txt', 'pdf']
-      var cats_img = ['png', 'jpg', 'jpeg', 'gif', 'svg', 'webp']
-      var cats_arc = ['zip', 'tar', 'gz', '7z']
+      # 用 dict 做 O(1) 分类查找，替代 index() 的 O(n) 扫描
+      var cat_map: dict<string> = {}
+      for ext in ['vim', 'lua', 'py', 'rb', 'go', 'rs', 'js', 'ts', 'jsx', 'tsx', 'c', 'h', 'cpp', 'hpp', 'java', 'kt']
+        cat_map[ext] = 'SimpleTreeIconLang'
+      endfor
+      for ext in ['sh', 'bash', 'zsh']
+        cat_map[ext] = 'SimpleTreeIconScript'
+      endfor
+      for ext in ['html', 'css', 'scss']
+        cat_map[ext] = 'SimpleTreeIconWeb'
+      endfor
+      for ext in ['json', 'toml', 'yml', 'yaml', 'ini', 'lock']
+        cat_map[ext] = 'SimpleTreeIconData'
+      endfor
+      for ext in ['md', 'txt', 'pdf']
+        cat_map[ext] = 'SimpleTreeIconDoc'
+      endfor
+      for ext in ['png', 'jpg', 'jpeg', 'gif', 'svg', 'webp']
+        cat_map[ext] = 'SimpleTreeIconImage'
+      endfor
+      for ext in ['zip', 'tar', 'gz', '7z']
+        cat_map[ext] = 'SimpleTreeIconArchive'
+      endfor
 
-      var kv = items(s_file_icon_map)
-      var i = 0
-      while i < len(kv)
-        var ext = kv[i][0]
-        var ico = kv[i][1]
-        var grp = 'SimpleTreeIconFileDefault'
-        if index(cats_lang, ext) >= 0
-          grp = 'SimpleTreeIconLang'
-        elseif index(cats_script, ext) >= 0
-          grp = 'SimpleTreeIconScript'
-        elseif index(cats_web, ext) >= 0
-          grp = 'SimpleTreeIconWeb'
-        elseif index(cats_data, ext) >= 0
-          grp = 'SimpleTreeIconData'
-        elseif index(cats_doc, ext) >= 0
-          grp = 'SimpleTreeIconDoc'
-        elseif index(cats_img, ext) >= 0
-          grp = 'SimpleTreeIconImage'
-        elseif index(cats_arc, ext) >= 0
-          grp = 'SimpleTreeIconArchive'
-        endif
-        # very nomagic 包裹图标，末尾恢复 \m
+      for [ext, ico] in items(s_file_icon_map)
+        var grp = get(cat_map, ext, 'SimpleTreeIconFileDefault')
         var pat = '^\s*\zs\V' .. escape(ico, '\') .. '\m\ze\s'
-        var cmd = 'syntax match ' .. grp .. ' "' .. pat .. '"'
-        call win_execute(s_winid, cmd)
-        i = i + 1
-      endwhile
+        cmds->add('syntax match ' .. grp .. ' "' .. pat .. '"')
+      endfor
     else
-      # 退化：通用文件 icon 高亮
-      call win_execute(s_winid, 'syntax match SimpleTreeIconFileDefault "^\s*\zs\S\+\ze\s"')
+      cmds->add('syntax match SimpleTreeIconFileDefault "^\s*\zs\S\+\ze\s"')
     endif
 
     # 隐藏文件/目录的图标置灰（优先生效，放在分色匹配之后）
-    call win_execute(s_winid, 'syntax match SimpleTreeIconHidden "^\s*\zs\S\+\ze\s\."')
-    call win_execute(s_winid, 'highlight default SimpleTreeIconHidden ctermfg=245 guifg=#6a6a6a')
+    cmds->add('syntax match SimpleTreeIconHidden "^\s*\zs\S\+\ze\s\."')
+    cmds->add('highlight default SimpleTreeIconHidden ctermfg=245 guifg=#6a6a6a')
 
-    # 自定义目录颜色组（避免受配色主题 Directory 影响）
+    # 自定义目录颜色组
     var dir_cterm = get(g:, 'simpletree_dir_ctermfg', 75)
     var dir_gui   = get(g:, 'simpletree_dir_guifg', '#61afef')
-    call win_execute(s_winid, 'highlight default SimpleTreeDirColor ctermfg=' .. dir_cterm .. ' guifg=' .. dir_gui)
-    call win_execute(s_winid, 'highlight default link SimpleTreeDirName SimpleTreeDirColor')
-    call win_execute(s_winid, 'highlight default link SimpleTreeIconDir SimpleTreeDirColor')
-    call win_execute(s_winid, 'highlight default link SimpleTreeDirSlash SimpleTreeDirColor')
+    cmds->add('highlight default SimpleTreeDirColor ctermfg=' .. dir_cterm .. ' guifg=' .. dir_gui)
+    cmds->add('highlight default link SimpleTreeDirName SimpleTreeDirColor')
+    cmds->add('highlight default link SimpleTreeIconDir SimpleTreeDirColor')
+    cmds->add('highlight default link SimpleTreeDirSlash SimpleTreeDirColor')
 
-    # 其他高亮链接（可覆盖）
-    call win_execute(s_winid, 'highlight default link SimpleTreeHidden Comment')
-    call win_execute(s_winid, 'highlight default link SimpleTreeLoading WarningMsg')
-    call win_execute(s_winid, 'highlight default link SimpleTreeIconLang Type')
-    call win_execute(s_winid, 'highlight default link SimpleTreeIconScript Statement')
-    call win_execute(s_winid, 'highlight default link SimpleTreeIconWeb PreProc')
-    call win_execute(s_winid, 'highlight default link SimpleTreeIconData Constant')
-    call win_execute(s_winid, 'highlight default link SimpleTreeIconDoc Identifier')
-    call win_execute(s_winid, 'highlight default link SimpleTreeIconImage Special')
-    call win_execute(s_winid, 'highlight default link SimpleTreeIconArchive WarningMsg')
-    call win_execute(s_winid, 'highlight default link SimpleTreeIconFileDefault Special')
+    # 其他高亮链接
+    cmds->add('highlight default link SimpleTreeHidden Comment')
+    cmds->add('highlight default link SimpleTreeLoading WarningMsg')
+    cmds->add('highlight default link SimpleTreeIconLang Type')
+    cmds->add('highlight default link SimpleTreeIconScript Statement')
+    cmds->add('highlight default link SimpleTreeIconWeb PreProc')
+    cmds->add('highlight default link SimpleTreeIconData Constant')
+    cmds->add('highlight default link SimpleTreeIconDoc Identifier')
+    cmds->add('highlight default link SimpleTreeIconImage Special')
+    cmds->add('highlight default link SimpleTreeIconArchive WarningMsg')
+    cmds->add('highlight default link SimpleTreeIconFileDefault Special')
+
+    # 一次 win_execute 执行所有命令
+    call win_execute(s_winid, join(cmds, " | "))
   catch
   endtry
 enddef
@@ -963,50 +966,44 @@ def EnsureWindowAndBuffer()
   endfor
   call SetupSyntaxTree()
 
-  call win_execute(s_winid, 'nnoremap <silent> <buffer> <CR> :call simpletree#OnEnter()<CR>')
-  call win_execute(s_winid, 'nnoremap <silent> <buffer> l :call simpletree#OnExpand()<CR>')
-  call win_execute(s_winid, 'nnoremap <silent> <buffer> h :call simpletree#OnCollapse()<CR>')
-  call win_execute(s_winid, 'nnoremap <silent> <buffer> R :call simpletree#OnRefresh()<CR>')
-  call win_execute(s_winid, 'nnoremap <silent> <buffer> H :call simpletree#OnToggleHidden()<CR>')
-  call win_execute(s_winid, 'nnoremap <silent> <buffer> q :call simpletree#OnClose()<CR>')
-  call win_execute(s_winid, 'nnoremap <silent> <buffer> e :call simpletree#OnRootHere()<CR>')
-  call win_execute(s_winid, 'nnoremap <nowait> <silent> <buffer> U :call simpletree#OnRootUp()<CR>')
-  call win_execute(s_winid, 'nnoremap <silent> <buffer> C :call simpletree#OnRootPrompt()<CR>')
-  call win_execute(s_winid, 'nnoremap <silent> <buffer> . :call simpletree#OnRootCwd()<CR>')
-  call win_execute(s_winid, 'nnoremap <nowait> <silent> <buffer> d :call simpletree#OnRootCurrent()<CR>')
-  call win_execute(s_winid, 'nnoremap <silent> <buffer> L :call simpletree#OnToggleRootLock()<CR>')
-  # File ops
-  call win_execute(s_winid, 'nnoremap <silent> <buffer> c :call simpletree#OnCopy()<CR>')
-  call win_execute(s_winid, 'nnoremap <silent> <buffer> x :call simpletree#OnCut()<CR>')
-  call win_execute(s_winid, 'nnoremap <silent> <buffer> p :call simpletree#OnPaste()<CR>')
-  call win_execute(s_winid, 'nnoremap <silent> <buffer> a :call simpletree#OnNewFile()<CR>')
-  call win_execute(s_winid, 'nnoremap <silent> <buffer> n :call simpletree#OnNewFile()<CR>')
-  call win_execute(s_winid, 'nnoremap <silent> <buffer> A :call simpletree#OnNewFolder()<CR>')
-  call win_execute(s_winid, 'nnoremap <silent> <buffer> N :call simpletree#OnNewFolder()<CR>')
-  call win_execute(s_winid, 'nnoremap <silent> <buffer> r :call simpletree#OnRename()<CR>')
-  call win_execute(s_winid, 'nnoremap <silent> <buffer> D :call simpletree#OnDelete()<CR>')
-  # 一键折叠（Collapse All）
   var ca_key = get(g:, 'simpletree_collapse_all_key', 'z')
-  call win_execute(s_winid, 'nnoremap <nowait> <silent> <buffer> ' .. ca_key .. ' :call simpletree#OnCollapseAll()<CR>')
-  # Help
-  call win_execute(s_winid, 'nnoremap <silent> <buffer> ? :call simpletree#ShowHelp()<CR>')
+  var keymaps: list<string> = [
+    'nnoremap <silent> <buffer> <CR> :call simpletree#OnEnter()<CR>',
+    'nnoremap <silent> <buffer> l :call simpletree#OnExpand()<CR>',
+    'nnoremap <silent> <buffer> h :call simpletree#OnCollapse()<CR>',
+    'nnoremap <silent> <buffer> R :call simpletree#OnRefresh()<CR>',
+    'nnoremap <silent> <buffer> H :call simpletree#OnToggleHidden()<CR>',
+    'nnoremap <silent> <buffer> q :call simpletree#OnClose()<CR>',
+    'nnoremap <silent> <buffer> e :call simpletree#OnRootHere()<CR>',
+    'nnoremap <nowait> <silent> <buffer> U :call simpletree#OnRootUp()<CR>',
+    'nnoremap <silent> <buffer> C :call simpletree#OnRootPrompt()<CR>',
+    'nnoremap <silent> <buffer> . :call simpletree#OnRootCwd()<CR>',
+    'nnoremap <nowait> <silent> <buffer> d :call simpletree#OnRootCurrent()<CR>',
+    'nnoremap <silent> <buffer> L :call simpletree#OnToggleRootLock()<CR>',
+    'nnoremap <silent> <buffer> c :call simpletree#OnCopy()<CR>',
+    'nnoremap <silent> <buffer> x :call simpletree#OnCut()<CR>',
+    'nnoremap <silent> <buffer> p :call simpletree#OnPaste()<CR>',
+    'nnoremap <silent> <buffer> a :call simpletree#OnNewFile()<CR>',
+    'nnoremap <silent> <buffer> n :call simpletree#OnNewFile()<CR>',
+    'nnoremap <silent> <buffer> A :call simpletree#OnNewFolder()<CR>',
+    'nnoremap <silent> <buffer> N :call simpletree#OnNewFolder()<CR>',
+    'nnoremap <silent> <buffer> r :call simpletree#OnRename()<CR>',
+    'nnoremap <silent> <buffer> D :call simpletree#OnDelete()<CR>',
+    'nnoremap <nowait> <silent> <buffer> ' .. ca_key .. ' :call simpletree#OnCollapseAll()<CR>',
+    'nnoremap <silent> <buffer> ? :call simpletree#ShowHelp()<CR>',
+    'nnoremap <silent> <buffer> V :call simpletree#OnOpenVSplit()<CR>',
+    'nnoremap <silent> <buffer> S :call simpletree#OnOpenSplit()<CR>',
+    'nnoremap <silent> <buffer> t :call simpletree#OnOpenTab()<CR>',
+    'nnoremap <silent> <buffer> y :call simpletree#OnYankPath()<CR>',
+    'nnoremap <silent> <buffer> Y :call simpletree#OnYankAbsPath()<CR>',
+    'nnoremap <silent> <buffer> gx :call simpletree#OnSystemOpen()<CR>',
+  ]
+  call win_execute(s_winid, join(keymaps, " | "))
 
-  call win_execute(s_winid, 'augroup SimpleTreeBuf')
-  call win_execute(s_winid, 'autocmd!')
-  call win_execute(s_winid, 'autocmd BufWipeout <buffer> ++once call simpletree#OnBufWipe()')
-  call win_execute(s_winid, 'autocmd WinClosed <buffer> call simpletree#OnAutoClose()')
-  call win_execute(s_winid, 'augroup END')
+  call win_execute(s_winid, 'augroup SimpleTreeBuf | autocmd! | autocmd BufWipeout <buffer> ++once call simpletree#OnBufWipe() | autocmd WinClosed <buffer> call simpletree#OnAutoClose() | augroup END')
 
   # 状态栏显示当前根路径
   call win_execute(s_winid, 'setlocal statusline=%{simpletree#StatusLine()}')
-  call win_execute(s_winid, 'nnoremap <silent> <buffer> V :call simpletree#OnOpenVSplit()<CR>')
-  call win_execute(s_winid, 'nnoremap <silent> <buffer> S :call simpletree#OnOpenSplit()<CR>')
-  call win_execute(s_winid, 'nnoremap <silent> <buffer> t :call simpletree#OnOpenTab()<CR>')
-  # Yank path
-  call win_execute(s_winid, 'nnoremap <silent> <buffer> y :call simpletree#OnYankPath()<CR>')
-  call win_execute(s_winid, 'nnoremap <silent> <buffer> Y :call simpletree#OnYankAbsPath()<CR>')
-  # Open with system app
-  call win_execute(s_winid, 'nnoremap <silent> <buffer> gx :call simpletree#OnSystemOpen()<CR>')
 enddef
 
 def BuildLines(path: string, depth: number, lines: list<string>, idx: list<dict<any>>)
@@ -1028,20 +1025,24 @@ def BuildLines(path: string, depth: number, lines: list<string>, idx: list<dict<
   endif
 
   var entries = s_cache[path]
+  var show_icons = !!get(g:, 'simpletree_show_file_icons', 1)
+  var show_suffix = !!get(g:, 'simpletree_folder_suffix', 1)
+  var indent = repeat('  ', depth)
   for e in entries
+    var expanded = false
     var icon = ''
     if e.is_dir
-      icon = GetNodeState(e.path).expanded ? s_icons.dir_open : s_icons.dir
+      expanded = GetNodeState(e.path).expanded
+      icon = expanded ? s_icons.dir_open : s_icons.dir
     else
-      icon = !!get(g:, 'simpletree_show_file_icons', 1) ? FileIcon(e.name) : s_icons.file
+      icon = show_icons ? FileIcon(e.name) : s_icons.file
     endif
-    var suffix = (e.is_dir && !!get(g:, 'simpletree_folder_suffix', 1)) ? '/' : ''
-    var text = repeat('  ', depth) .. icon .. ' ' .. e.name .. suffix
+    var suffix = (e.is_dir && show_suffix) ? '/' : ''
 
-    lines->add(text)
+    lines->add(indent .. icon .. ' ' .. e.name .. suffix)
     idx->add({path: e.path, is_dir: e.is_dir, name: e.name, depth: depth})
 
-    if e.is_dir && GetNodeState(e.path).expanded
+    if expanded
       BuildLines(e.path, depth + 1, lines, idx)
     endif
   endfor
@@ -1323,9 +1324,12 @@ def FocusPath(path: string): void
   if !WinValid() || path ==# ''
     return
   endif
+  # 预规范化一次，循环内用 ==# 直接比较（路径来自 daemon，已是绝对路径）
+  var np = NormPath(path)
   var target: number = 0
   for i in range(len(s_line_index))
-    if PathEq(get(s_line_index[i], 'path', ''), path)
+    var ep = get(s_line_index[i], 'path', '')
+    if ep ==# np || (ep !=# '' && NormPath(ep) ==# np)
       target = i + 1
       break
     endif
@@ -1613,7 +1617,6 @@ export def OnPaste()
 
   Render()
   if focused !=# ''
-    Refresh()
     RevealPath(focused)
   endif
 
@@ -1655,7 +1658,8 @@ export def OnNewFile()
     return
   endtry
   echo '[SimpleTree] created file: ' .. dst
-  Refresh()
+  InvalidateAndRescan(destDir)
+  Render()
   RevealPath(dst)
 enddef
 
@@ -1689,7 +1693,8 @@ export def OnNewFolder()
     return
   endtry
   echo '[SimpleTree] created folder: ' .. dst
-  Refresh()
+  InvalidateAndRescan(destDir)
+  Render()
   RevealPath(dst)
 enddef
 
@@ -1731,7 +1736,8 @@ export def OnRename()
     echo '[SimpleTree] renamed: ' .. base .. ' -> ' .. newname
     # 更新指向旧路径的 Vim 缓冲区
     RenameBuf(src, dst)
-    Refresh()
+    InvalidateAndRescan(parent)
+    Render()
     RevealPath(dst)
   else
     echohl ErrorMsg | echom '[SimpleTree] rename failed' | echohl None
@@ -1768,7 +1774,8 @@ export def OnDelete()
   # 清除指向已删除路径的缓冲区
   WipeBuf(p)
   echo '[SimpleTree] deleted: ' .. p
-  Refresh()
+  InvalidateAndRescan(parent)
+  Render()
   if parent !=# ''
     RevealPath(parent)
   endif
@@ -1943,8 +1950,10 @@ enddef
 
 # ====== Reveal：展开并定位到目标路径 ======
 def FocusIfPresent(path: string): bool
+  var np = NormPath(path)
   for i in range(len(s_line_index))
-    if PathEq(get(s_line_index[i], 'path', ''), path)
+    var ep = get(s_line_index[i], 'path', '')
+    if ep ==# np || (ep !=# '' && NormPath(ep) ==# np)
       FocusPath(path)
       return true
     endif

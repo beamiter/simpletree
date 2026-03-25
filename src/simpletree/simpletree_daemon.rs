@@ -4,9 +4,17 @@ use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, path::PathBuf, sync::Arc};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
-    sync::RwLock,
+    sync::Mutex,
 };
 use tokio_util::sync::CancellationToken;
+
+macro_rules! debug_log {
+    ($($arg:tt)*) => {
+        if cfg!(debug_assertions) {
+            eprintln!($($arg)*);
+        }
+    };
+}
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type")]
@@ -41,7 +49,7 @@ enum Event {
     Error { id: u64, message: String },
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Serialize)]
 struct Entry {
     name: String,
     path: String,
@@ -64,29 +72,29 @@ async fn stdout_writer(mut rx: tokio::sync::mpsc::Receiver<String>) {
 
 type EventTx = tokio::sync::mpsc::Sender<String>;
 
-#[tokio::main(flavor = "multi_thread")]
+#[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
     let stdin = BufReader::new(tokio::io::stdin());
     let mut lines = stdin.lines();
-    eprintln!("start");
+    debug_log!("start");
 
     // stdout 写入 channel（容量足够大避免阻塞扫描任务）
     let (out_tx, out_rx) = tokio::sync::mpsc::channel::<String>(4096);
     tokio::spawn(stdout_writer(out_rx));
 
     // 任务取消表：id -> token
-    let cancels: Arc<RwLock<HashMap<u64, CancellationToken>>> =
-        Arc::new(RwLock::new(HashMap::new()));
+    let cancels: Arc<Mutex<HashMap<u64, CancellationToken>>> =
+        Arc::new(Mutex::new(HashMap::new()));
 
     while let Some(line) = lines.next_line().await? {
         if line.trim().is_empty() {
             continue;
         }
-        eprintln!("REQ LINE: {line}");
+        debug_log!("REQ LINE: {line}");
         let req = match serde_json::from_str::<Request>(&line) {
             Ok(r) => r,
             Err(e) => {
-                eprintln!("REQ PARSE ERR: {e}");
+                debug_log!("REQ PARSE ERR: {e}");
                 send_event(
                     &out_tx,
                     &Event::Error {
@@ -98,7 +106,7 @@ async fn main() -> Result<()> {
                 continue;
             }
         };
-        eprintln!("REQ DECODED: {:?}", req);
+        debug_log!("REQ DECODED: {:?}", req);
 
         match req {
             Request::List {
@@ -114,7 +122,7 @@ async fn main() -> Result<()> {
                 // 建立取消 token
                 let token = CancellationToken::new();
                 {
-                    let mut map = cancels.write().await;
+                    let mut map = cancels.lock().await;
                     map.insert(id, token.clone());
                 }
 
@@ -132,13 +140,13 @@ async fn main() -> Result<()> {
                         .await;
                     }
                     // 结束后移除取消 token
-                    let mut map = cancels_clone.write().await;
+                    let mut map = cancels_clone.lock().await;
                     map.remove(&id);
                 });
             }
             Request::Cancel { id } => {
                 let maybe = {
-                    let map = cancels.read().await;
+                    let map = cancels.lock().await;
                     map.get(&id).cloned()
                 };
                 if let Some(tok) = maybe {
@@ -159,12 +167,12 @@ async fn handle_list(
     out: EventTx,
     cancel: CancellationToken,
 ) -> Result<()> {
-    eprintln!("handle_list start id={id} path={:?}", path);
+    debug_log!("handle_list start id={id} path={:?}", path);
     let cancel_clone = cancel.clone();
     let scan_path = path.clone();
 
     // 在阻塞线程中完成扫描 + 排序，避免 channel 开销
-    let entries = tokio::task::spawn_blocking(move || {
+    let mut entries: Vec<Entry> = tokio::task::spawn_blocking(move || {
         let mut wb = WalkBuilder::new(&scan_path);
         wb.follow_links(false)
             .hidden(!show_hidden)
@@ -175,10 +183,10 @@ async fn handle_list(
             .max_depth(Some(1));
         let walker = wb.build();
 
-        let mut entries: Vec<Entry> = Vec::with_capacity(512);
+        let mut keyed: Vec<(String, Entry)> = Vec::with_capacity(512);
         for dent in walker {
             if cancel_clone.is_cancelled() {
-                return entries;
+                return keyed.into_iter().map(|(_, e)| e).collect();
             }
             match dent {
                 Ok(d) => {
@@ -191,28 +199,29 @@ async fn handle_list(
                             .metadata()
                             .map(|m| m.is_dir())
                             .unwrap_or_else(|_| p.is_dir());
-                        entries.push(Entry {
+                        let sort_key = name.to_lowercase();
+                        keyed.push((sort_key, Entry {
                             name: name.to_string(),
                             path: p.to_string_lossy().into_owned(),
                             is_dir,
-                        });
+                        }));
                     }
                 }
                 Err(_) => {}
             }
         }
 
-        // 目录优先 + 名称不区分大小写排序
-        entries.sort_by(|a, b| match (a.is_dir, b.is_dir) {
+        // 目录优先 + 名称不区分大小写排序（预计算 sort key，避免重复分配）
+        keyed.sort_by(|a, b| match (a.1.is_dir, b.1.is_dir) {
             (true, false) => std::cmp::Ordering::Less,
             (false, true) => std::cmp::Ordering::Greater,
-            _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+            _ => a.0.cmp(&b.0),
         });
-        entries
+        keyed.into_iter().map(|(_, e)| e).collect()
     })
     .await?;
 
-    eprintln!("handle_list done id={id} entries={}", entries.len());
+    debug_log!("handle_list done id={id} entries={}", entries.len());
 
     if cancel.is_cancelled() {
         return Ok(());
@@ -232,23 +241,26 @@ async fn handle_list(
         return Ok(());
     }
 
+    let total = entries.len();
     let mut i = 0usize;
-    while i < entries.len() {
+    while i < total {
         if cancel.is_cancelled() {
             break;
         }
-        let end = (i + page).min(entries.len());
-        let chunk = entries[i..end].to_vec();
+        let end = (i + page).min(total);
+        let done = end >= total;
+        // drain 从前端取走所有权，避免 to_vec() 克隆
+        let chunk: Vec<Entry> = entries.drain(..end - i).collect();
+        i = end;
         send_event(
             &out,
             &Event::ListChunk {
                 id,
                 entries: chunk,
-                done: end >= entries.len(),
+                done,
             },
         )
         .await;
-        i = end;
     }
     Ok(())
 }
