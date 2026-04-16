@@ -25,6 +25,8 @@ enum Request {
         path: String,
         #[serde(default)]
         show_hidden: bool,
+        #[serde(default = "default_git_ignore")]
+        git_ignore: bool,
         #[serde(default = "default_page")]
         max: usize,
     },
@@ -34,6 +36,10 @@ enum Request {
 
 fn default_page() -> usize {
     200
+}
+
+fn default_git_ignore() -> bool {
+    true
 }
 
 #[derive(Debug, Serialize)]
@@ -113,6 +119,7 @@ async fn main() -> Result<()> {
                 id,
                 path,
                 show_hidden,
+                git_ignore,
                 max,
             } => {
                 let path = PathBuf::from(path);
@@ -128,7 +135,7 @@ async fn main() -> Result<()> {
 
                 tokio::spawn(async move {
                     let res =
-                        handle_list(id, path, show_hidden, max, tx.clone(), token.clone()).await;
+                        handle_list(id, path, show_hidden, git_ignore, max, tx.clone(), token.clone()).await;
                     if let Err(e) = res {
                         send_event(
                             &tx,
@@ -163,6 +170,7 @@ async fn handle_list(
     id: u64,
     path: PathBuf,
     show_hidden: bool,
+    git_ignore: bool,
     page: usize,
     out: EventTx,
     cancel: CancellationToken,
@@ -176,10 +184,10 @@ async fn handle_list(
         let mut wb = WalkBuilder::new(&scan_path);
         wb.follow_links(false)
             .hidden(!show_hidden)
-            .git_ignore(true)
-            .git_global(true)
-            .git_exclude(true)
-            .parents(true)
+            .git_ignore(git_ignore)
+            .git_global(git_ignore)
+            .git_exclude(git_ignore)
+            .parents(git_ignore)
             .max_depth(Some(1));
         let walker = wb.build();
 

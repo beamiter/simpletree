@@ -89,6 +89,7 @@ var s_winid: number = 0
 var s_root: string = ''
 var s_hide_dotfiles: bool = !!g:simpletree_hide_dotfiles
 var s_root_locked: bool = !!g:simpletree_root_locked
+var s_git_ignore: bool = !!get(g:, 'simpletree_git_ignore', 1)
 
 var s_state: dict<any> = {}               # path -> {expanded: bool}
 var s_cache: dict<list<dict<any>>> = {}   # path -> entries[]
@@ -668,7 +669,7 @@ def BSend(req: dict<any>): void
   endtry
 enddef
 
-def BList(path: string, show_hidden: bool, max: number, OnChunk: func, OnDone: func, OnError: func): number
+def BList(path: string, show_hidden: bool, git_ignore: bool, max: number, OnChunk: func, OnDone: func, OnError: func): number
   if !BEnsureBackend()
     try
       OnError('backend not available')
@@ -678,7 +679,7 @@ def BList(path: string, show_hidden: bool, max: number, OnChunk: func, OnDone: f
   endif
   var id = BNextId()
   s_bcbs[id] = {OnChunk: OnChunk, OnDone: OnDone, OnError: OnError}
-  BSend({type: 'list', id: id, path: path, show_hidden: show_hidden, max: max})
+  BSend({type: 'list', id: id, path: path, show_hidden: show_hidden, git_ignore: git_ignore, max: max})
   return id
 enddef
 
@@ -739,6 +740,7 @@ def ScanDirAsync(path: string)
   req_id = BList(
     p,
     !s_hide_dotfiles,
+    s_git_ignore,
     g:simpletree_page,
     (entries) => {
       acc += entries
@@ -973,6 +975,7 @@ def EnsureWindowAndBuffer()
     'nnoremap <silent> <buffer> h :call simpletree#OnCollapse()<CR>',
     'nnoremap <silent> <buffer> R :call simpletree#OnRefresh()<CR>',
     'nnoremap <silent> <buffer> H :call simpletree#OnToggleHidden()<CR>',
+    'nnoremap <silent> <buffer> I :call simpletree#OnToggleGitIgnore()<CR>',
     'nnoremap <silent> <buffer> q :call simpletree#OnClose()<CR>',
     'nnoremap <silent> <buffer> e :call simpletree#OnRootHere()<CR>',
     'nnoremap <nowait> <silent> <buffer> U :call simpletree#OnRootUp()<CR>',
@@ -1528,6 +1531,12 @@ export def OnToggleHidden()
   Refresh()
 enddef
 
+export def OnToggleGitIgnore()
+  s_git_ignore = !s_git_ignore
+  g:simpletree_git_ignore = s_git_ignore ? 1 : 0
+  Refresh()
+enddef
+
 export def OnClose()
   Close()
 enddef
@@ -1792,6 +1801,7 @@ def BuildHelpLines(): list<string>
     'h     折叠当前目录；若已折叠或在文件上，则折叠最近的已展开祖先',
     'R     刷新树（仅重扫缓存）',
     'H     显示/隐藏点文件',
+    'I     切换 gitignore 过滤（显示/隐藏被 git 忽略的文件）',
     'q     关闭树窗口',
     'e     将当前节点设为根（目录；文件取父目录））',
     'U     根上移一层',
@@ -2317,5 +2327,6 @@ export def StatusLine(): string
     display = '~' .. display[len(home) :]
   endif
   var lock_icon = s_root_locked ? ' ' : ''
-  return ' ' .. display .. lock_icon
+  var gi_icon = s_git_ignore ? '' : ' '
+  return ' ' .. display .. lock_icon .. gi_icon
 enddef

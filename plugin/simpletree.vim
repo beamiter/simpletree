@@ -10,6 +10,8 @@ g:loaded_simpletree = 1
 # =============================================================
 g:simpletree_width = get(g:, 'simpletree_width', 45)
 g:simpletree_hide_dotfiles = get(g:, 'simpletree_hide_dotfiles', 1)
+# 是否启用 gitignore 过滤（默认开启；关闭后可看到被 git 忽略的文件）
+g:simpletree_git_ignore = get(g:, 'simpletree_git_ignore', 1)
 g:simpletree_page = get(g:, 'simpletree_page', 200)
 # 打开文件后保持焦点在文件缓冲区
 g:simpletree_keep_focus = get(g:, 'simpletree_keep_focus', 1)
