@@ -66,3 +66,18 @@ augroup SimpleTreeAutoFollow
         \ try | call simpletree#AutoFollow() | catch | endtry |
         \ endif
 augroup END
+
+# 自动刷新配置（默认启用）
+g:simpletree_auto_refresh = get(g:, 'simpletree_auto_refresh', 1)
+
+augroup SimpleTreeAutoRefresh
+  autocmd!
+  # 当 Vim 获得焦点时自动刷新（检测外部文件变化）
+  autocmd FocusGained * if get(g:, 'simpletree_auto_refresh', 1) |
+        \ try | call simpletree#AutoRefreshOnFocus() | catch | endtry |
+        \ endif
+  # 当光标停止移动一段时间后刷新（updatetime 控制延迟，默认 4000ms）
+  autocmd CursorHold * if get(g:, 'simpletree_auto_refresh', 1) |
+        \ try | call simpletree#AutoRefreshOnIdle() | catch | endtry |
+        \ endif
+augroup END

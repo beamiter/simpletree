@@ -753,6 +753,10 @@ def ScanDirAsync(path: string)
       if has_key(s_pending, p) && s_pending[p] == req_id
         call remove(s_pending, p)
       endif
+      # 更新目录修改时间缓存
+      if isdirectory(p)
+        s_dir_mtimes[p] = GetDirMtime(p)
+      endif
       ScheduleRender()
       # Reveal 回调：扫描完成后尝试定位目标，避免轮询定时器
       if s_reveal_target !=# '' && FocusIfPresent(s_reveal_target)
@@ -1145,6 +1149,7 @@ def SetRoot(new_root: string, lock: bool = false)
   s_pending = {}
   s_loading = {}
   s_cache = {}
+  s_dir_mtimes = {}
 
   ScanDirAsync(s_root)
   Render()
@@ -1645,7 +1650,7 @@ export def OnNewFile()
     echo '[SimpleTree] invalid target directory'
     return
   endif
-  var name = input('New file name: ')
+  var name = trim(input('New file name:', ''))
   if name ==# ''
     return
   endif
@@ -1683,7 +1688,7 @@ export def OnNewFolder()
     echo '[SimpleTree] invalid target directory'
     return
   endif
-  var name = input('New folder name: ')
+  var name = trim(input('New folder name:', ''))
   if name ==# ''
     return
   endif
@@ -2110,6 +2115,10 @@ export def Toggle(root: string = '')
 enddef
 
 export def Refresh()
+  # 保存当前光标位置
+  var current_node = CursorNode()
+  var current_path = get(current_node, 'path', '')
+
   for [p, id] in items(s_pending)
     try
       BCancel(id)
@@ -2119,10 +2128,176 @@ export def Refresh()
   s_pending = {}
   s_loading = {}
   s_cache = {}
+  # 清空修改时间缓存，强制重新检测
+  s_dir_mtimes = {}
   if s_root !=# ''
     ScanDirAsync(s_root)
   endif
   Render()
+
+  # 恢复光标位置
+  if current_path !=# ''
+    FocusPath(current_path)
+  endif
+enddef
+
+# =============================================================
+# 自动刷新相关
+# =============================================================
+# 上次刷新时间戳（避免过于频繁的刷新）
+var s_last_refresh_time: float = 0.0
+# 最小刷新间隔（毫秒）- 避免短时间内多次刷新
+const MIN_REFRESH_INTERVAL_MS: float = 1000.0
+# 目录修改时间缓存（用于检测文件变化）
+var s_dir_mtimes: dict<number> = {}
+
+def ShouldAutoRefresh(): bool
+  # 检查是否应该进行自动刷新
+  if !WinValid() || s_root ==# ''
+    return false
+  endif
+
+  # 检查时间间隔
+  var now = reltime()->reltimefloat() * 1000.0
+  if (now - s_last_refresh_time) < MIN_REFRESH_INTERVAL_MS
+    return false
+  endif
+
+  return true
+enddef
+
+# 获取目录的修改时间
+def GetDirMtime(dir_path: string): number
+  try
+    return getftime(dir_path)
+  catch
+    return -1
+  endtry
+enddef
+
+# 检测展开的目录是否有变化
+def DetectChangesInExpandedDirs(): list<string>
+  var changed: list<string> = []
+
+  # 检查根目录
+  if s_root !=# '' && isdirectory(s_root)
+    var mtime = GetDirMtime(s_root)
+    var cached_mtime = get(s_dir_mtimes, s_root, -1)
+    if mtime != cached_mtime && mtime != -1
+      changed->add(s_root)
+    endif
+  endif
+
+  # 检查所有展开的目录
+  for [path, state] in items(s_state)
+    if get(state, 'expanded', false) && isdirectory(path)
+      var mtime = GetDirMtime(path)
+      var cached_mtime = get(s_dir_mtimes, path, -1)
+      if mtime != cached_mtime && mtime != -1
+        changed->add(path)
+      endif
+    endif
+  endfor
+
+  return changed
+enddef
+
+# 更新目录修改时间缓存
+def UpdateDirMtimes(dirs: list<string> = [])
+  if len(dirs) == 0
+    # 更新所有展开的目录
+    if s_root !=# '' && isdirectory(s_root)
+      s_dir_mtimes[s_root] = GetDirMtime(s_root)
+    endif
+    for [path, state] in items(s_state)
+      if get(state, 'expanded', false) && isdirectory(path)
+        s_dir_mtimes[path] = GetDirMtime(path)
+      endif
+    endfor
+  else
+    # 只更新指定的目录
+    for path in dirs
+      if isdirectory(path)
+        s_dir_mtimes[path] = GetDirMtime(path)
+      endif
+    endfor
+  endif
+enddef
+
+# 智能刷新：只在有变化时刷新，并保持光标位置
+def SmartRefresh()
+  if !WinValid() || s_root ==# ''
+    return
+  endif
+
+  # 检测哪些目录有变化
+  var changed_dirs = DetectChangesInExpandedDirs()
+
+  # 如果没有变化，直接返回
+  if len(changed_dirs) == 0
+    return
+  endif
+
+  # 保存当前光标位置的节点路径
+  var current_node = CursorNode()
+  var current_path = get(current_node, 'path', '')
+
+  # 增量刷新：只清除有变化的目录的缓存
+  for dir_path in changed_dirs
+    if has_key(s_cache, dir_path)
+      call remove(s_cache, dir_path)
+    endif
+    # 取消该目录的待处理请求
+    CancelPending(dir_path)
+  endfor
+
+  # 重新扫描有变化的目录
+  for dir_path in changed_dirs
+    if get(GetNodeState(dir_path), 'expanded', false)
+      ScanDirAsync(dir_path)
+    endif
+  endfor
+
+  # 更新修改时间缓存
+  UpdateDirMtimes(changed_dirs)
+
+  # 重新渲染
+  Render()
+
+  # 恢复光标位置
+  if current_path !=# ''
+    FocusPath(current_path)
+  endif
+enddef
+
+def DoAutoRefresh()
+  # 执行自动刷新并更新时间戳
+  if ShouldAutoRefresh()
+    s_last_refresh_time = reltime()->reltimefloat() * 1000.0
+    SmartRefresh()
+  endif
+enddef
+
+export def AutoRefreshOnFocus()
+  # 当 Vim 获得焦点时自动刷新
+  # 这通常意味着用户从其他应用程序切换回来，可能有外部文件变化
+  DoAutoRefresh()
+enddef
+
+export def AutoRefreshOnIdle()
+  # 当光标停止移动一段时间后刷新
+  # 仅当 simpletree 窗口可见时才刷新
+  if !WinValid()
+    return
+  endif
+
+  # 使用更长的间隔来避免在编辑时频繁刷新
+  var now = reltime()->reltimefloat() * 1000.0
+  if (now - s_last_refresh_time) < 3000
+    return
+  endif
+
+  DoAutoRefresh()
 enddef
 
 export def Close()
