@@ -1055,6 +1055,39 @@ def BuildLines(path: string, depth: number, lines: list<string>, idx: list<dict<
   endfor
 enddef
 
+# Write `out` into the tree buffer touching only the lines that actually
+# changed. The previous approach rewrote every line via setbufline(buf, 1, out)
+# on each render — including every streamed chunk during a directory scan and
+# every expand/collapse — forcing Vim to re-render and re-syntax the whole
+# buffer. Diffing means unchanged rows aren't marked modified, so large trees
+# and streaming updates stay smooth.
+def UpdateBufferDiff(out: list<string>)
+  var cur = getbufline(s_bufnr, 1, '$')
+  var n_new = len(out)
+  var n_cur = len(cur)
+  var i = 0
+  while i < n_new
+    if i < n_cur && cur[i] ==# out[i]
+      i += 1
+      continue
+    endif
+    # Start of a run of changed (or newly added) lines; extend until the next
+    # line that already matches, then write the whole run in one call.
+    var j = i
+    while j < n_new && !(j < n_cur && cur[j] ==# out[j])
+      j += 1
+    endwhile
+    call setbufline(s_bufnr, i + 1, out[i : j - 1])
+    i = j
+  endwhile
+  if n_cur > n_new
+    try
+      call deletebufline(s_bufnr, n_new + 1, n_cur)
+    catch
+    endtry
+  endif
+enddef
+
 def Render()
   if s_root ==# ''
     return
@@ -1086,18 +1119,7 @@ def Render()
   endtry
 
   var out = len(lines) == 0 ? [''] : lines
-  call setbufline(s_bufnr, 1, out)
-
-  var bi = getbufinfo(s_bufnr)
-  if len(bi) > 0
-    var lc = get(bi[0], 'linecount', 0)
-    if lc > len(out)
-      try
-        call deletebufline(s_bufnr, len(out) + 1, lc)
-      catch
-      endtry
-    endif
-  endif
+  UpdateBufferDiff(out)
 
   try
     call setbufvar(s_bufnr, '&modifiable', 0)
