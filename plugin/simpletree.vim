@@ -6,9 +6,91 @@ endif
 g:loaded_simpletree = 1
 
 # =============================================================
+# 宽度持久化
+# =============================================================
+def DefaultWidthStateFile(): string
+  if exists('$XDG_STATE_HOME') && $XDG_STATE_HOME !=# ''
+    return expand('$XDG_STATE_HOME/simpletree/width')
+  endif
+  if has('win32') || has('win64')
+    return expand('~/vimfiles/simpletree/width')
+  endif
+  return expand('~/.local/state/simpletree/width')
+enddef
+
+def LoadPersistedWidth(fallback: number): number
+  if !get(g:, 'simpletree_persist_width', 1)
+    return fallback
+  endif
+  var state_file = expand(get(g:, 'simpletree_width_state_file', DefaultWidthStateFile()))
+  if state_file ==# '' || !filereadable(state_file)
+    return fallback
+  endif
+  try
+    var lines = readfile(state_file, '', 1)
+    if len(lines) > 0
+      var width = str2nr(trim(lines[0]))
+      if width > 0
+        return width
+      endif
+    endif
+  catch
+  endtry
+  return fallback
+enddef
+
+var s_last_persisted_width: number = -1
+
+def CurrentTreeWidth(): number
+  for win in getwininfo()
+    if getbufvar(win.bufnr, '&filetype') ==# 'simpletree'
+      return get(win, 'width', 0)
+    endif
+  endfor
+  return 0
+enddef
+
+def g:SimpleTreeCaptureWidth()
+  var width = CurrentTreeWidth()
+  if width <= 0
+    return
+  endif
+
+  # 先同步运行时配置，避免 Render() 再次把手动宽度改回默认值。
+  g:simpletree_width = width
+
+  if !get(g:, 'simpletree_persist_width', 1) || width == s_last_persisted_width
+    return
+  endif
+
+  var state_file = expand(get(g:, 'simpletree_width_state_file', DefaultWidthStateFile()))
+  if state_file ==# ''
+    return
+  endif
+  try
+    call mkdir(fnamemodify(state_file, ':h'), 'p')
+    if writefile([string(width)], state_file) == 0
+      s_last_persisted_width = width
+    endif
+  catch
+    if get(g:, 'simpletree_debug', 0)
+      echom '[SimpleTree] failed to persist width: ' .. v:exception
+    endif
+  endtry
+enddef
+
+def g:SimpleTreeInstallWidthMappings()
+  nnoremap <silent> <buffer> <C-W><lt> <C-W><lt><Cmd>call g:SimpleTreeCaptureWidth()<CR>
+  nnoremap <silent> <buffer> <C-W>> <C-W>><Cmd>call g:SimpleTreeCaptureWidth()<CR>
+enddef
+
+# =============================================================
 # 配置
 # =============================================================
-g:simpletree_width = get(g:, 'simpletree_width', 45)
+g:simpletree_persist_width = get(g:, 'simpletree_persist_width', 1)
+g:simpletree_width_state_file = get(g:, 'simpletree_width_state_file', DefaultWidthStateFile())
+g:simpletree_width = LoadPersistedWidth(get(g:, 'simpletree_width', 45))
+s_last_persisted_width = g:simpletree_width
 g:simpletree_hide_dotfiles = get(g:, 'simpletree_hide_dotfiles', 1)
 # 是否启用 gitignore 过滤（默认开启；关闭后可看到被 git 忽略的文件）
 g:simpletree_git_ignore = get(g:, 'simpletree_git_ignore', 1)
@@ -66,7 +148,18 @@ nnoremap <silent> <leader>e <Cmd>SimpleTree<CR>
 # ---------------- 自动命令 ----------------
 augroup SimpleTreeBackend
   autocmd!
-  autocmd VimLeavePre * try | call simpletree#Stop() | catch | endtry
+  autocmd VimLeavePre * try | call g:SimpleTreeCaptureWidth() | call simpletree#Stop() | catch | endtry
+augroup END
+
+augroup SimpleTreeWidthPersistence
+  autocmd!
+  autocmd FileType simpletree call g:SimpleTreeInstallWidthMappings()
+  if exists('##WinResized')
+    autocmd WinResized * try | call g:SimpleTreeCaptureWidth() | catch | endtry
+  endif
+  autocmd WinLeave * if &filetype ==# 'simpletree' |
+        \ try | call g:SimpleTreeCaptureWidth() | catch | endtry |
+        \ endif
 augroup END
 
 augroup SimpleTreeAutoFollow
