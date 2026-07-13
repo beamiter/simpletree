@@ -68,6 +68,7 @@ Plug 'your-name/simpletree'
 
 ```vim
 let g:simpletree_width = 45
+let g:simpletree_persist_width = 1
 let g:simpletree_show_root = 1
 let g:simpletree_auto_follow = 1
 let g:simpletree_auto_refresh = 1
@@ -79,6 +80,15 @@ let g:simpletree_open_on_create = 1
 let g:simpletree_use_trash = 1
 let g:simpletree_use_nerdfont = 1
 let g:simpletree_show_file_icons = 1
+```
+
+启用宽度持久化后，使用 `<C-w><`、`<C-w>>` 或鼠标调整文件树宽度，后续刷新、重新打开文件树以及重启 Vim 都会恢复该宽度。默认状态文件为 `$XDG_STATE_HOME/simpletree/width`；未设置 `XDG_STATE_HOME` 时，Unix 使用 `~/.local/state/simpletree/width`，Windows 使用 `~/vimfiles/simpletree/width`。
+
+可关闭持久化或自定义状态文件：
+
+```vim
+let g:simpletree_persist_width = 0
+let g:simpletree_width_state_file = expand('~/.vim/simpletree-width')
 ```
 
 回收站支持 Linux 的 `gio trash` / `trash-put` 和 macOS 的 `trash` 命令。不可用时会明确提示永久删除。
