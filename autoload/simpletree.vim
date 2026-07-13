@@ -96,6 +96,10 @@ var s_cache: dict<list<dict<any>>> = {}   # path -> entries[]
 var s_loading: dict<bool> = {}            # path -> true
 var s_pending: dict<number> = {}          # path -> request id
 var s_line_index: list<dict<any>> = []    # 渲染行对应的节点
+var s_active_path: string = ''            # 当前编辑器文件（用于活动项装饰）
+var s_target_winid: number = 0            # 最近使用的编辑窗口，避免反复询问
+var s_active_match_id: number = -1
+var s_buffer_modified: dict<bool> = {}
 
 # 渲染节流
 var s_render_timer: number = 0
@@ -146,7 +150,7 @@ def CandidateWindows(): list<dict<any>>
   return res
 enddef
 
-# 交互式选择目标窗口；返回选中的 winid，返回 0 表示选择“新建分屏”或取消
+# 交互式选择目标窗口；正数为窗口，0 为新建分屏，-1 为取消
 def ChooseTargetWindowId(cands: list<dict<any>>): number
   if len(cands) == 0
     return 0
@@ -159,12 +163,42 @@ def ChooseTargetWindowId(cands: list<dict<any>>): number
     lines->add(printf('%2d) 窗口 #%d  缓冲区 #%d  %s', i + 1, w.winnr, w.bufnr, nm))
     i += 1
   endwhile
-  lines->add('0) 新建右侧分屏')
+  lines->add(printf('%2d) 新建右侧分屏', len(cands) + 1))
   var sel = inputlist(lines)
-  if sel <= 0 || sel > len(cands)
+  if sel == 0
+    return -1
+  endif
+  if sel == len(cands) + 1
     return 0
   endif
+  if sel < 1 || sel > len(cands)
+    return -1
+  endif
   return cands[sel - 1].winid
+enddef
+
+# VS Code 式复用最近活动的编辑器组。只有第一次无法判断目标时才询问。
+def ResolveTargetWindow(): number
+  var cands = CandidateWindows()
+  for w in cands
+    if w.winid == s_target_winid
+      return s_target_winid
+    endif
+  endfor
+  if len(cands) == 0
+    return 0
+  endif
+  if len(cands) == 1
+    s_target_winid = cands[0].winid
+    return s_target_winid
+  endif
+  var chosen = !!get(g:, 'simpletree_choose_window', 1)
+    ? ChooseTargetWindowId(cands)
+    : cands[0].winid
+  if chosen > 0
+    s_target_winid = chosen
+  endif
+  return chosen
 enddef
 
 # 去掉尾部斜杠；保留 Unix 根 "/"；保留 Windows 盘根 "C:/" 的形式
@@ -428,6 +462,10 @@ enddef
 # 返回最终目标路径，或空字符串表示取消
 def ResolveConflict(destDir: string, base: string): string
   var dst = PathJoin(destDir, base)
+  if !IsSubPath(destDir, dst) || PathEq(destDir, dst)
+    echohl ErrorMsg | echom '[SimpleTree] target must stay inside destination directory' | echohl None
+    return ''
+  endif
   if !PathExists(dst)
     return dst
   endif
@@ -451,12 +489,63 @@ def AskUniqueName(destDir: string, base: string): string
   var name = base
   while name !=# ''
     var dst = PathJoin(destDir, name)
+    if !IsSubPath(destDir, dst) || PathEq(destDir, dst)
+      echohl ErrorMsg | echom '[SimpleTree] target must stay inside destination directory' | echohl None
+      return ''
+    endif
     if !PathExists(dst)
       return dst
     endif
     name = input('Exists: ' .. dst .. ' . Input another name (empty to cancel): ', name .. ' copy')
   endwhile
   return ''
+enddef
+
+# VS Code 的新建输入允许 foo/bar.ext；限制为目标目录内的相对路径。
+def SafeRelativeName(name: string): string
+  var rel = substitute(trim(name), '\\', '/', 'g')
+  if rel ==# '' || rel =~# '^/' || rel =~? '^[A-Za-z]:'
+    return ''
+  endif
+  var parts = split(rel, '/', 1)
+  if len(parts) == 0
+    return ''
+  endif
+  for part in parts
+    if part ==# '' || part ==# '.' || part ==# '..'
+      return ''
+    endif
+  endfor
+  return join(parts, '/')
+enddef
+
+def TrashCommand(path: string): list<string>
+  if !get(g:, 'simpletree_use_trash', 1)
+    return []
+  endif
+  if has('unix') && executable('gio')
+    return ['gio', 'trash', path]
+  endif
+  if executable('trash-put')
+    return ['trash-put', path]
+  endif
+  if (has('mac') || has('macunix')) && executable('trash')
+    return ['trash', path]
+  endif
+  return []
+enddef
+
+def MoveToTrash(path: string): bool
+  var cmd = TrashCommand(path)
+  if len(cmd) == 0
+    return false
+  endif
+  try
+    call system(cmd)
+    return v:shell_error == 0
+  catch
+    return false
+  endtry
 enddef
 
 # 只刷新一个目录并在展开时重新扫描
@@ -748,7 +837,9 @@ def ScanDirAsync(path: string)
       ScheduleRender()
     },
     () => {
-      s_loading[p] = false
+      if has_key(s_loading, p)
+        call remove(s_loading, p)
+      endif
       s_cache[p] = acc
       if has_key(s_pending, p) && s_pending[p] == req_id
         call remove(s_pending, p)
@@ -768,7 +859,9 @@ def ScanDirAsync(path: string)
       endif
     },
     (msg) => {
-      s_loading[p] = false
+      if has_key(s_loading, p)
+        call remove(s_loading, p)
+      endif
       if has_key(s_pending, p) && s_pending[p] == req_id
         call remove(s_pending, p)
       endif
@@ -784,7 +877,9 @@ def ScanDirAsync(path: string)
   if req_id > 0
     s_pending[path] = req_id
   else
-    s_loading[path] = false
+    if has_key(s_loading, path)
+      call remove(s_loading, path)
+    endif
   endif
 enddef
 
@@ -831,12 +926,14 @@ def SetupSyntaxTree(): void
   try
     var cmds: list<string> = []
 
-    # 清理语法组
-    cmds->add('silent! syntax clear SimpleTreeIcon SimpleTreeIconDir SimpleTreeIconHidden SimpleTreeDirName SimpleTreeDirSlash SimpleTreeHidden SimpleTreeLoading SimpleTreeIconLang SimpleTreeIconScript SimpleTreeIconWeb SimpleTreeIconData SimpleTreeIconDoc SimpleTreeIconImage SimpleTreeIconArchive SimpleTreeIconFileDefault')
+    # 文件树缓冲区只包含本插件语法，整体清理可避免不存在的组触发 E28。
+    cmds->add('syntax clear')
 
     # 基础匹配
     cmds->add('syntax match SimpleTreeHidden "^\s*.\{-}\s\zs\.\S\+"')
     cmds->add('syntax match SimpleTreeLoading "Loading\.\.\."')
+    var modified_pat = escape(get(g:, 'simpletree_modified_symbol', '●'), '\')
+    cmds->add('syntax match SimpleTreeModified "\V' .. modified_pat .. '\m$"')
 
     # 目录：图标 -> 名称 -> 斜杠（nextgroup + contained）
     var dir1 = s_icons.dir
@@ -897,6 +994,8 @@ def SetupSyntaxTree(): void
     # 其他高亮链接
     cmds->add('highlight default link SimpleTreeHidden Comment')
     cmds->add('highlight default link SimpleTreeLoading WarningMsg')
+    cmds->add('highlight default link SimpleTreeModified WarningMsg')
+    cmds->add('highlight default link SimpleTreeActiveFile CursorLine')
     cmds->add('highlight default link SimpleTreeIconLang Type')
     cmds->add('highlight default link SimpleTreeIconScript Statement')
     cmds->add('highlight default link SimpleTreeIconWeb PreProc')
@@ -906,8 +1005,10 @@ def SetupSyntaxTree(): void
     cmds->add('highlight default link SimpleTreeIconArchive WarningMsg')
     cmds->add('highlight default link SimpleTreeIconFileDefault Special')
 
-    # 一次 win_execute 执行所有命令
-    call win_execute(s_winid, join(cmds, " | "))
+    # :syntax clear 会吞掉命令分隔符后的内容，逐条执行才能可靠建立高亮组。
+    for cmd in cmds
+      call win_execute(s_winid, cmd)
+    endfor
   catch
   endtry
 enddef
@@ -975,8 +1076,12 @@ def EnsureWindowAndBuffer()
   var ca_key = get(g:, 'simpletree_collapse_all_key', 'z')
   var keymaps: list<string> = [
     'nnoremap <silent> <buffer> <CR> :call simpletree#OnEnter()<CR>',
+    'nnoremap <silent> <buffer> o :call simpletree#OnEnter()<CR>',
     'nnoremap <silent> <buffer> l :call simpletree#OnExpand()<CR>',
+    'nnoremap <silent> <buffer> <Right> :call simpletree#OnExpand()<CR>',
     'nnoremap <silent> <buffer> h :call simpletree#OnCollapse()<CR>',
+    'nnoremap <silent> <buffer> <Left> :call simpletree#OnCollapse()<CR>',
+    'nnoremap <silent> <buffer> <BS> :call simpletree#OnCollapse()<CR>',
     'nnoremap <silent> <buffer> R :call simpletree#OnRefresh()<CR>',
     'nnoremap <silent> <buffer> H :call simpletree#OnToggleHidden()<CR>',
     'nnoremap <silent> <buffer> I :call simpletree#OnToggleGitIgnore()<CR>',
@@ -1001,9 +1106,15 @@ def EnsureWindowAndBuffer()
     'nnoremap <silent> <buffer> V :call simpletree#OnOpenVSplit()<CR>',
     'nnoremap <silent> <buffer> S :call simpletree#OnOpenSplit()<CR>',
     'nnoremap <silent> <buffer> t :call simpletree#OnOpenTab()<CR>',
+    'nnoremap <silent> <buffer> <C-v> :call simpletree#OnOpenVSplit()<CR>',
+    'nnoremap <silent> <buffer> <C-x> :call simpletree#OnOpenSplit()<CR>',
+    'nnoremap <silent> <buffer> <C-t> :call simpletree#OnOpenTab()<CR>',
+    'nnoremap <silent> <buffer> P :call simpletree#OnPreview()<CR>',
+    'nnoremap <silent> <buffer> f :call simpletree#OnRevealActive()<CR>',
     'nnoremap <silent> <buffer> y :call simpletree#OnYankPath()<CR>',
     'nnoremap <silent> <buffer> Y :call simpletree#OnYankAbsPath()<CR>',
     'nnoremap <silent> <buffer> gx :call simpletree#OnSystemOpen()<CR>',
+    'nnoremap <silent> <buffer> <2-LeftMouse> :call simpletree#OnEnter()<CR>',
   ]
   call win_execute(s_winid, join(keymaps, " | "))
 
@@ -1045,12 +1156,54 @@ def BuildLines(path: string, depth: number, lines: list<string>, idx: list<dict<
       icon = show_icons ? FileIcon(e.name) : s_icons.file
     endif
     var suffix = (e.is_dir && show_suffix) ? '/' : ''
+    var modified = false
+    if !e.is_dir && !!get(g:, 'simpletree_show_modified', 1)
+      var bnr = bufnr(e.path)
+      modified = bnr > 0 && !!getbufvar(bnr, '&modified')
+    endif
+    var decoration = modified ? (' ' .. get(g:, 'simpletree_modified_symbol', '●')) : ''
 
-    lines->add(indent .. icon .. ' ' .. e.name .. suffix)
-    idx->add({path: e.path, is_dir: e.is_dir, name: e.name, depth: depth})
+    lines->add(indent .. icon .. ' ' .. e.name .. suffix .. decoration)
+    idx->add({path: e.path, is_dir: e.is_dir, name: e.name, depth: depth, modified: modified})
 
     if expanded
       BuildLines(e.path, depth + 1, lines, idx)
+    endif
+  endfor
+enddef
+
+def RootLabel(): string
+  var label = fnamemodify(RStripSlash(s_root), ':t')
+  if label ==# ''
+    label = s_root
+  endif
+  return label
+enddef
+
+def UpdateActiveHighlight()
+  if !WinValid()
+    return
+  endif
+  if s_active_match_id > 0
+    try
+      call matchdelete(s_active_match_id, s_winid)
+    catch
+    endtry
+    s_active_match_id = -1
+  endif
+  if s_active_path ==# ''
+    return
+  endif
+  var active = NormPath(s_active_path)
+  for i in range(len(s_line_index))
+    var p = get(s_line_index[i], 'path', '')
+    if p !=# '' && PathEq(p, active)
+      try
+        s_active_match_id = matchaddpos('SimpleTreeActiveFile', [[i + 1]], 5, -1, {window: s_winid})
+      catch
+        s_active_match_id = -1
+      endtry
+      return
     endif
   endfor
 enddef
@@ -1096,13 +1249,23 @@ def Render()
 
   call EnsureSyntaxTree()
 
+  var selected = CursorNode()
+  var selected_path = get(selected, 'path', '')
   var lines: list<string> = []
   var idx: list<dict<any>> = []
 
   var stroot = GetNodeState(s_root)
-  stroot.expanded = true
-
-  BuildLines(s_root, 0, lines, idx)
+  var show_root = !!get(g:, 'simpletree_show_root', 1)
+  if show_root
+    var root_icon = stroot.expanded ? s_icons.dir_open : s_icons.dir
+    var root_suffix = !!get(g:, 'simpletree_folder_suffix', 1) ? '/' : ''
+    lines->add(root_icon .. ' ' .. RootLabel() .. root_suffix)
+    idx->add({path: s_root, is_dir: true, name: RootLabel(), depth: 0, is_root: true})
+    BuildLines(s_root, 1, lines, idx)
+  else
+    stroot.expanded = true
+    BuildLines(s_root, 0, lines, idx)
+  endif
 
   if len(lines) == 0 && get(s_loading, s_root, v:false)
     lines = [s_icons.loading .. ' Loading...']
@@ -1133,6 +1296,10 @@ def Render()
   endtry
 
   s_line_index = idx
+  if selected_path !=# ''
+    FocusPath(selected_path)
+  endif
+  UpdateActiveHighlight()
 enddef
 
 # =============================================================
@@ -1315,6 +1482,8 @@ export def AutoFollow()
     return
   endif
   var ap = AbsPath(curf)
+  s_active_path = ap
+  s_target_winid = win_getid()
 
   # 若文件在根之下，直接 Reveal
   if IsSubPath(s_root, ap)
@@ -1341,7 +1510,11 @@ export def AutoFollow()
 enddef
 
 def CursorNode(): dict<any>
-  var lnum = line('.')
+  if !WinValid()
+    return {}
+  endif
+  var pos = getcurpos(s_winid)
+  var lnum = len(pos) > 1 ? pos[1] : 0
   if lnum <= 0 || lnum > len(s_line_index)
     return {}
   endif
@@ -1437,20 +1610,9 @@ def OpenFile(p: string)
   # keep_in_file = 1 表示打开后保持在文件窗口
   var keep_in_file = !!get(g:, 'simpletree_keep_focus', 1)
 
-  # 选择目标窗口：当当前 tab 中有两个及以上候选窗口时，弹出选择列表
-  var target_win = 0
-  var cands = CandidateWindows()
-  if len(cands) >= 2
-    if !!get(g:, 'simpletree_choose_window', 1)
-      target_win = ChooseTargetWindowId(cands)
-    else
-      # 未开启选择时，默认使用第一个候选窗口
-      target_win = cands[0].winid
-    endif
-  elseif len(cands) == 1
-    target_win = cands[0].winid
-  else
-    target_win = 0
+  var target_win = ResolveTargetWindow()
+  if target_win < 0
+    return
   endif
 
   if target_win != 0
@@ -1464,7 +1626,9 @@ def OpenFile(p: string)
       execute 'vsplit'
     endif
     execute 'edit ' .. fnameescape(p)
+    s_target_winid = win_getid()
   endif
+  s_active_path = AbsPath(p)
 
   # 只有在不需要保持在文件窗口时，才回到树窗口
   if !keep_in_file && WinValid()
@@ -1571,6 +1735,7 @@ enddef
 export def OnBufWipe()
   s_winid = 0
   s_bufnr = -1
+  s_active_match_id = -1
 enddef
 
 # ===== 文件操作：复制/剪切/粘贴/新建/重命名/删除 =====
@@ -1588,6 +1753,10 @@ export def OnCut()
   var node = CursorNode()
   if empty(node) || get(node, 'loading', v:false)
     echo '[SimpleTree] nothing to cut'
+    return
+  endif
+  if get(node, 'is_root', v:false)
+    echo '[SimpleTree] workspace root cannot be moved'
     return
   endif
   s_clipboard = {mode: 'cut', items: [node.path]}
@@ -1620,7 +1789,21 @@ export def OnPaste()
       continue
     endif
     var base = fnamemodify(src, ':t')
-    var dst = ResolveConflict(destDir, base)
+    if isdirectory(src) && IsSubPath(src, destDir)
+      echohl WarningMsg | echom '[SimpleTree] cannot paste a directory into itself' | echohl None
+      continue
+    endif
+    var proposed = PathJoin(destDir, base)
+    var dst = ''
+    if PathEq(src, proposed)
+      if mode ==# 'cut'
+        echo '[SimpleTree] source is already in the target directory'
+        continue
+      endif
+      dst = AskUniqueName(destDir, base .. ' copy')
+    else
+      dst = ResolveConflict(destDir, base)
+    endif
     if dst ==# ''
       echo '[SimpleTree] skip: ' .. base
       continue
@@ -1672,12 +1855,13 @@ export def OnNewFile()
     echo '[SimpleTree] invalid target directory'
     return
   endif
-  var name = trim(input('New file name:', ''))
-  if name ==# ''
+  var raw_name = input('New file name: ', '')
+  if trim(raw_name) ==# ''
     return
   endif
-  if name =~ '[\/]'
-    echohl ErrorMsg | echom '[SimpleTree] name cannot contain path separator' | echohl None
+  var name = SafeRelativeName(raw_name)
+  if name ==# ''
+    echohl ErrorMsg | echom '[SimpleTree] enter a relative path without . or .. segments' | echohl None
     return
   endif
   var dst = AskUniqueName(destDir, name)
@@ -1685,6 +1869,7 @@ export def OnNewFile()
     return
   endif
   try
+    call mkdir(fnamemodify(dst, ':h'), 'p')
     if writefile([], dst, 'b') != 0
       echohl ErrorMsg | echom '[SimpleTree] create file failed: ' .. dst | echohl None
       return
@@ -1697,6 +1882,9 @@ export def OnNewFile()
   InvalidateAndRescan(destDir)
   Render()
   RevealPath(dst)
+  if !!get(g:, 'simpletree_open_on_create', 1)
+    OpenFile(dst)
+  endif
 enddef
 
 export def OnNewFolder()
@@ -1710,12 +1898,13 @@ export def OnNewFolder()
     echo '[SimpleTree] invalid target directory'
     return
   endif
-  var name = trim(input('New folder name:', ''))
-  if name ==# ''
+  var raw_name = input('New folder name: ', '')
+  if trim(raw_name) ==# ''
     return
   endif
-  if name =~ '[\/]'
-    echohl ErrorMsg | echom '[SimpleTree] name cannot contain path separator' | echohl None
+  var name = SafeRelativeName(raw_name)
+  if name ==# ''
+    echohl ErrorMsg | echom '[SimpleTree] enter a relative path without . or .. segments' | echohl None
     return
   endif
   var dst = AskUniqueName(destDir, name)
@@ -1738,6 +1927,10 @@ export def OnRename()
   var node = CursorNode()
   if empty(node) || get(node, 'loading', v:false)
     echo '[SimpleTree] nothing to rename'
+    return
+  endif
+  if get(node, 'is_root', v:false)
+    echo '[SimpleTree] workspace root cannot be renamed here'
     return
   endif
   var src = node.path
@@ -1786,13 +1979,19 @@ export def OnDelete()
     echo '[SimpleTree] nothing to delete'
     return
   endif
+  if get(node, 'is_root', v:false)
+    echohl WarningMsg | echom '[SimpleTree] refusing to delete workspace root' | echohl None
+    return
+  endif
   var p = node.path
   if p ==# '' || !PathExists(p)
     echo '[SimpleTree] path not exists'
     return
   endif
+  var can_trash = len(TrashCommand(p)) > 0
   var ok = 0
-  var msg = 'Delete ' .. (node.is_dir ? 'directory (recursively)' : 'file') .. ' "' .. p .. '" ?'
+  var action = can_trash ? 'Move to trash' : 'Permanently delete'
+  var msg = action .. ' ' .. (node.is_dir ? 'directory' : 'file') .. ' "' .. p .. '" ?'
   if exists('*confirm')
     ok = (confirm(msg, "&Yes\n&No", 2) == 1) ? 1 : 0
   else
@@ -1803,13 +2002,24 @@ export def OnDelete()
     return
   endif
   var parent = fnamemodify(p, ':h')
-  if !DeletePathRecursive(p)
-    echohl ErrorMsg | echom '[SimpleTree] delete failed' | echohl None
-    return
+  var trashed = can_trash && MoveToTrash(p)
+  var removed = trashed
+  if can_trash && !trashed
+    var fallback = confirm('Move to trash failed. Permanently delete instead?', "&Delete\n&Cancel", 2) == 1
+    if !fallback
+      return
+    endif
+  endif
+  if !removed
+    removed = DeletePathRecursive(p)
+    if !removed
+      echohl ErrorMsg | echom '[SimpleTree] delete failed' | echohl None
+      return
+    endif
   endif
   # 清除指向已删除路径的缓冲区
   WipeBuf(p)
-  echo '[SimpleTree] deleted: ' .. p
+  echo '[SimpleTree] ' .. (trashed ? 'moved to trash: ' : 'deleted: ') .. p
   InvalidateAndRescan(parent)
   Render()
   if parent !=# ''
@@ -1823,9 +2033,9 @@ def BuildHelpLines(): list<string>
   return [
     'SimpleTree 快捷键说明',
     '----------------------------------------',
-    '<CR>  打开文件 / 展开或折叠目录',
-    'l     展开目录 / 打开文件',
-    'h     折叠当前目录；若已折叠或在文件上，则折叠最近的已展开祖先',
+    '<CR>/o/双击  打开文件 / 展开或折叠目录',
+    'l/→           展开目录 / 打开文件',
+    'h/←/<BS>      折叠当前目录或最近的已展开祖先',
     'R     刷新树（仅重扫缓存）',
     'H     显示/隐藏点文件',
     'I     切换 gitignore 过滤（显示/隐藏被 git 忽略的文件）',
@@ -1848,13 +2058,15 @@ def BuildHelpLines(): list<string>
     'V     垂直分屏打开文件',
     'S     水平分屏打开文件',
     't     在新标签页打开文件',
+    'P     预览文件并保持树焦点',
+    'f     定位当前编辑文件',
     'y     复制文件名到寄存器',
     'Y     复制完整路径到寄存器',
     'gx    用系统默认程序打开',
-    'Z     一键折叠根下所有目录',
+    ca_key .. '     一键折叠根下所有目录',
     '?     显示/关闭本帮助面板',
     '----------------------------------------',
-    '提示：粘贴/重命名时若存在同名目标：可选择覆盖或重命名；剪切成功后自动清空剪贴板。',
+    '提示：新建支持 foo/bar.ext；删除优先移到系统回收站；剪切成功后自动清空剪贴板。',
   ]
 enddef
 
@@ -2088,10 +2300,15 @@ export def Toggle(root: string = '')
     return
   endif
 
+  var source_winid = win_getid()
+  if &buftype ==# ''
+    s_target_winid = source_winid
+  endif
   var curf0 = expand('%:p')
   var curf_abs = ''
   if curf0 !=# '' && filereadable(curf0)
     curf_abs = fnamemodify(curf0, ':p')
+    s_active_path = curf_abs
   endif
 
   var rootArg = root
@@ -2107,7 +2324,7 @@ export def Toggle(root: string = '')
     endif
   endif
 
-  s_root = AbsPath(rootArg)
+  s_root = CanonDir(rootArg)
   if !IsDir(s_root)
     echohl ErrorMsg
     echom '[SimpleTree] invalid root: ' .. s_root
@@ -2157,9 +2374,9 @@ export def Refresh()
   endif
   Render()
 
-  # 恢复光标位置
+  # 异步扫描期间目标行暂时不存在，用 Reveal 在扫描完成后恢复。
   if current_path !=# ''
-    FocusPath(current_path)
+    RevealPath(current_path)
   endif
 enddef
 
@@ -2286,9 +2503,9 @@ def SmartRefresh()
   # 重新渲染
   Render()
 
-  # 恢复光标位置
+  # 异步扫描完成后恢复光标位置
   if current_path !=# ''
-    FocusPath(current_path)
+    RevealPath(current_path)
   endif
 enddef
 
@@ -2331,6 +2548,7 @@ export def Close()
   endif
   s_winid = 0
   s_bufnr = -1
+  s_active_match_id = -1
 enddef
 
 export def Stop()
@@ -2343,6 +2561,18 @@ export def DebugStatus()
   echo '  buf_valid: ' .. (BufValid() ? 'yes' : 'no')
   echo '  root: ' .. s_root
   echo '  root_locked: ' .. (s_root_locked ? 'yes' : 'no')
+  echo '  active_path: ' .. s_active_path
+  var active_line = 0
+  if s_active_path !=# ''
+    for i in range(len(s_line_index))
+      if PathEq(get(s_line_index[i], 'path', ''), s_active_path)
+        active_line = i + 1
+        break
+      endif
+    endfor
+  endif
+  echo '  active_line: ' .. active_line
+  echo '  target_winid: ' .. s_target_winid
   echo '  backend_running: ' .. (s_brunning ? 'yes' : 'no')
   echo '  pending: ' .. string(items(s_pending))
   echo '  loading: ' .. string(keys(s_loading))
@@ -2350,10 +2580,82 @@ export def DebugStatus()
   Log('DebugStatus logged', 'MoreMsg')
 enddef
 
+# 仅更新缓冲区状态等轻量装饰，不触发目录扫描。
+export def UpdateDecorations()
+  if !WinValid() || &buftype !=# ''
+    return
+  endif
+  var key = string(bufnr())
+  var modified = !!&modified
+  if has_key(s_buffer_modified, key) && s_buffer_modified[key] == modified
+    return
+  endif
+  s_buffer_modified[key] = modified
+  ScheduleRender()
+enddef
+
+export def OnRevealActive()
+  var target = s_active_path
+  if target ==# '' && s_target_winid != 0 && win_id2win(s_target_winid) > 0
+    var bnr = winbufnr(s_target_winid)
+    var name = bufname(bnr)
+    if name !=# ''
+      target = fnamemodify(name, ':p')
+    endif
+  endif
+  if target ==# '' || !PathExists(target)
+    echo '[SimpleTree] no active file to reveal'
+    return
+  endif
+  if !IsSubPath(s_root, target)
+    echo '[SimpleTree] active file is outside the workspace root'
+    return
+  endif
+  RevealPath(target)
+enddef
+
+export def OnPreview()
+  var node = CursorNode()
+  if empty(node) || node.is_dir || get(node, 'loading', v:false)
+    return
+  endif
+  var target_win = ResolveTargetWindow()
+  if target_win < 0
+    return
+  endif
+  if target_win > 0
+    try
+      call win_execute(target_win, 'silent pedit ' .. fnameescape(node.path))
+    catch
+      return
+    endtry
+  else
+    if !!get(g:, 'simpletree_split_force_right', 1)
+      execute 'belowright vsplit'
+    else
+      execute 'vsplit'
+    endif
+    execute 'edit ' .. fnameescape(node.path)
+    s_target_winid = win_getid()
+    if WinValid()
+      call win_gotoid(s_winid)
+    endif
+  endif
+  s_active_path = AbsPath(node.path)
+  UpdateActiveHighlight()
+enddef
+
 export def OnOpenVSplit()
   var node = CursorNode()
   if empty(node) || node.is_dir || get(node, 'loading', v:false)
     return
+  endif
+  var target_win = ResolveTargetWindow()
+  if target_win < 0
+    return
+  endif
+  if target_win > 0
+    call win_gotoid(target_win)
   endif
   if !!get(g:, 'simpletree_split_force_right', 1)
     execute 'belowright vsplit'
@@ -2361,6 +2663,8 @@ export def OnOpenVSplit()
     execute 'vsplit'
   endif
   execute 'edit ' .. fnameescape(node.path)
+  s_target_winid = win_getid()
+  s_active_path = AbsPath(node.path)
   if !get(g:, 'simpletree_keep_focus', 1) && WinValid()
     call win_gotoid(s_winid)
   endif
@@ -2374,19 +2678,9 @@ export def OnOpenSplit()
 
   var keep_in_file = !!get(g:, 'simpletree_keep_focus', 1)
 
-  # 选择目标窗口：与 OpenFile 保持一致逻辑
-  var target_win = 0
-  var cands = CandidateWindows()
-  if len(cands) >= 2
-    if !!get(g:, 'simpletree_choose_window', 1)
-      target_win = ChooseTargetWindowId(cands)
-    else
-      target_win = cands[0].winid
-    endif
-  elseif len(cands) == 1
-    target_win = cands[0].winid
-  else
-    target_win = 0
+  var target_win = ResolveTargetWindow()
+  if target_win < 0
+    return
   endif
 
   if target_win != 0
@@ -2407,6 +2701,8 @@ export def OnOpenSplit()
     endif
     execute 'edit ' .. fnameescape(node.path)
   endif
+  s_target_winid = win_getid()
+  s_active_path = AbsPath(node.path)
 
   if !keep_in_file && WinValid()
     call win_gotoid(s_winid)
@@ -2497,6 +2793,8 @@ export def OnOpenTab()
     return
   endif
   execute 'tabedit ' .. fnameescape(node.path)
+  s_active_path = AbsPath(node.path)
+  s_target_winid = win_getid()
 enddef
 
 # =============================================================
@@ -2523,7 +2821,15 @@ export def StatusLine(): string
   if home !=# '' && stridx(display, home) == 0
     display = '~' .. display[len(home) :]
   endif
-  var lock_icon = s_root_locked ? ' ' : ''
-  var gi_icon = s_git_ignore ? '' : ' '
-  return ' ' .. display .. lock_icon .. gi_icon
+  var flags: list<string> = []
+  if s_root_locked
+    flags->add('locked')
+  endif
+  if !s_git_ignore
+    flags->add('gitignore:off')
+  endif
+  if !s_hide_dotfiles
+    flags->add('hidden:on')
+  endif
+  return ' EXPLORER  ' .. display .. (len(flags) > 0 ? ('  [' .. join(flags, ',') .. ']') : '')
 enddef

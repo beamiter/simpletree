@@ -22,6 +22,15 @@ g:simpletree_root_locked = get(g:, 'simpletree_root_locked', 1)
 g:simpletree_auto_follow = get(g:, 'simpletree_auto_follow', 1)
 # 当当前文件不在根目录下时，是否自动切换根到文件所在目录（默认关闭；尊重根锁）
 g:simpletree_auto_follow_change_root = get(g:, 'simpletree_auto_follow_change_root', 0)
+# 像编辑器侧边栏一样显示可折叠的工作区根节点
+g:simpletree_show_root = get(g:, 'simpletree_show_root', 1)
+# 显示未保存缓冲区标记
+g:simpletree_show_modified = get(g:, 'simpletree_show_modified', 1)
+g:simpletree_modified_symbol = get(g:, 'simpletree_modified_symbol', '●')
+# 新建文件后直接在编辑区打开
+g:simpletree_open_on_create = get(g:, 'simpletree_open_on_create', 1)
+# 删除时优先移到系统回收站（支持 gio/trash-put/trash）
+g:simpletree_use_trash = get(g:, 'simpletree_use_trash', 1)
 
 # =============================================================
 # Nerd Font UI 配置与工具
@@ -50,6 +59,7 @@ command! -nargs=? -complete=dir SimpleTree simpletree#Toggle(<q-args>)
 command! SimpleTreeRefresh simpletree#Refresh()
 command! SimpleTreeClose simpletree#Close()
 command! SimpleTreeDebug call simpletree#DebugStatus()
+command! SimpleTreeReveal simpletree#OnRevealActive()
 
 nnoremap <silent> <leader>e <Cmd>SimpleTree<CR>
 
@@ -65,6 +75,12 @@ augroup SimpleTreeAutoFollow
   autocmd BufEnter * if get(g:, 'simpletree_auto_follow', 1) |
         \ try | call simpletree#AutoFollow() | catch | endtry |
         \ endif
+augroup END
+
+augroup SimpleTreeDecorations
+  autocmd!
+  # 缓冲区脏状态变化时只重绘装饰，不重扫文件系统
+  autocmd TextChanged,TextChangedI,BufWritePost * try | call simpletree#UpdateDecorations() | catch | endtry
 augroup END
 
 # 自动刷新配置（默认启用）
