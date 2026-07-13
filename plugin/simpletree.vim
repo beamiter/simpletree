@@ -79,6 +79,11 @@ def g:SimpleTreeCaptureWidth()
   endtry
 enddef
 
+def g:SimpleTreeInstallWidthMappings()
+  nnoremap <silent> <buffer> <C-W><lt> <C-W><lt><Cmd>call g:SimpleTreeCaptureWidth()<CR>
+  nnoremap <silent> <buffer> <C-W>> <C-W>><Cmd>call g:SimpleTreeCaptureWidth()<CR>
+enddef
+
 # =============================================================
 # 配置
 # =============================================================
@@ -148,6 +153,7 @@ augroup END
 
 augroup SimpleTreeWidthPersistence
   autocmd!
+  autocmd FileType simpletree call g:SimpleTreeInstallWidthMappings()
   if exists('##WinResized')
     autocmd WinResized * try | call g:SimpleTreeCaptureWidth() | catch | endtry
   endif
