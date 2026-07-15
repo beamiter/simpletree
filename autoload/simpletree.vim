@@ -94,6 +94,7 @@ var s_git_ignore: bool = !!get(g:, 'simpletree_git_ignore', 1)
 var s_state: dict<any> = {}               # path -> {expanded: bool}
 var s_cache: dict<list<dict<any>>> = {}   # path -> entries[]
 var s_loading: dict<bool> = {}            # path -> true
+var s_scan_errors: dict<string> = {}      # path -> last error; explicit refresh retries
 var s_pending: dict<number> = {}          # path -> request id
 var s_line_index: list<dict<any>> = []    # 渲染行对应的节点
 var s_active_path: string = ''            # 当前编辑器文件（用于活动项装饰）
@@ -116,6 +117,10 @@ var s_help_popupid: number = 0      # 浮窗 ID
 var s_reveal_target: string = ''
 var s_reveal_timer: number = 0
 
+# 前端窗口生命周期。异步回调必须属于当前打开会话，关闭后的旧回调不能重建窗口。
+var s_open: bool = false
+var s_session_generation: number = 0
+
 # =============================================================
 # 后端状态（合并）
 # =============================================================
@@ -124,6 +129,7 @@ var s_brunning: bool = false
 var s_bbuf: string = ''
 var s_bnext_id = 0
 var s_bcbs: dict<any> = {}   # id -> {OnChunk, OnDone, OnError}
+var s_bgeneration: number = 0
 
 # =============================================================
 # 工具函数
@@ -261,7 +267,13 @@ def PathJoin(a: string, b: string): string
 enddef
 
 def PathExists(p: string): bool
-  return filereadable(p) || isdirectory(p)
+  try
+    # getftype() also sees dangling symlinks, FIFOs and sockets; these must not
+    # be mistaken for a free staging/backup name.
+    return getftype(p) !=# ''
+  catch
+    return filereadable(p) || isdirectory(p)
+  endtry
 enddef
 
 # 统一分隔符为 / 并做绝对化与尾斜杠处理
@@ -274,7 +286,7 @@ enddef
 def PathEq(a: string, b: string): bool
   var x = NormPath(a)
   var y = NormPath(b)
-  if has('win32') || has('win64') || has('win95') || has('win32unix')
+  if &fileignorecase || has('win32') || has('win64') || has('win95') || has('win32unix')
     x = tolower(x)
     y = tolower(y)
   endif
@@ -290,7 +302,7 @@ def IsSubPath(root: string, p: string): bool
   var a = NormPath(p)
 
   # Windows 下不区分大小写
-  if has('win32') || has('win64') || has('win95') || has('win32unix')
+  if &fileignorecase || has('win32') || has('win64') || has('win95') || has('win32unix')
     r = tolower(r)
     a = tolower(a)
   endif
@@ -309,8 +321,74 @@ def IsSubPath(root: string, p: string): bool
   return stridx(a, r_prefix) == 0
 enddef
 
+def ResolvedNormPath(path: string): string
+  try
+    return NormPath(resolve(AbsPath(path)))
+  catch
+    return NormPath(path)
+  endtry
+enddef
+
+# 文件操作以解析后的工作区根为边界。对 symlink 节点本身的重命名/删除/复制
+# 只检查其父目录，因为操作作用于链接对象而非链接目标。
+def WorkspaceContainsOperationPath(path: string, symlink_leaf: bool = false): bool
+  if s_root ==# '' || path ==# ''
+    return false
+  endif
+  var candidate = symlink_leaf && getftype(path) ==# 'link'
+    ? fnamemodify(path, ':h')
+    : path
+  return IsSubPath(ResolvedNormPath(s_root), ResolvedNormPath(candidate))
+enddef
+
+# Create a nested directory one component at a time. Every existing symlink is
+# resolved and checked before it can be traversed, so input such as link/file
+# cannot escape the workspace through an intermediate directory link.
+def EnsureWorkspaceDirectory(path: string): bool
+  if s_root ==# '' || path ==# ''
+    return false
+  endif
+  var root = NormPath(s_root)
+  var target = NormPath(path)
+  if !IsSubPath(root, target) || !isdirectory(root)
+    return false
+  endif
+  if PathEq(root, target)
+    return WorkspaceContainsOperationPath(root)
+  endif
+
+  var relative = strpart(target, strlen(root))
+  relative = substitute(relative, '^/', '', '')
+  var current = root
+  for component in split(relative, '/', 1)
+    if component ==# '' || component ==# '.' || component ==# '..'
+      return false
+    endif
+    current = PathJoin(current, component)
+    var entry_type = getftype(current)
+    if entry_type ==# ''
+      try
+        call mkdir(current)
+      catch
+        return false
+      endtry
+    elseif !isdirectory(current)
+      return false
+    endif
+    if !isdirectory(current) || !WorkspaceContainsOperationPath(current)
+      return false
+    endif
+  endfor
+  return PathEq(current, target)
+enddef
+
 def TrySystemCopy(src: string, dst: string): bool
-  if !get(g:, 'simpletree_use_system_copy', 0)
+  var is_link = getftype(src) ==# 'link'
+  # Vim 没有可移植的 readlink/symlink API；符号链接必须交给能保留链接的系统复制。
+  if !get(g:, 'simpletree_use_system_copy', 0) && !is_link
+    return false
+  endif
+  if is_link && !has('unix')
     return false
   endif
   if has('unix')
@@ -342,13 +420,63 @@ def TrySystemCopy(src: string, dst: string): bool
   return false
 enddef
 
+# 以固定大小的 Blob 分块复制文件，避免把大文件一次性读进 Vim 内存。
+def CopyFilePortable(src: string, dst: string): bool
+  try
+    call mkdir(fnamemodify(dst, ':h'), 'p')
+    if exists('*readblob')
+      var offset = 0
+      var first = true
+      while true
+        var chunk = readblob(src, offset, 1024 * 1024)
+        if len(chunk) == 0
+          if first && writefile(0z, dst, 'b') != 0
+            return false
+          endif
+          break
+        endif
+        if writefile(chunk, dst, first ? 'b' : 'ab') != 0
+          return false
+        endif
+        first = false
+        offset += len(chunk)
+      endwhile
+    elseif writefile(readfile(src, 'b'), dst, 'b') != 0
+      return false
+    endif
+    if exists('*getfperm') && exists('*setfperm')
+      var perms = getfperm(src)
+      if type(perms) == v:t_string && perms !=# ''
+        call setfperm(dst, perms)
+      endif
+    endif
+    return true
+  catch
+    try | call delete(dst) | catch | endtry
+    return false
+  endtry
+enddef
+
 # 递归复制：文件或目录
 def CopyPath(src: string, dst: string): bool
+  var source_type = getftype(src)
+  if index(['file', 'dir', 'link'], source_type) < 0
+    echohl WarningMsg
+    echom '[SimpleTree] refusing to copy unsupported filesystem entry: ' .. src
+    echohl None
+    return false
+  endif
   # 优先尝试系统复制
   if TrySystemCopy(src, dst)
     return true
   endif
-  if isdirectory(src)
+  if getftype(src) ==# 'link'
+    echohl WarningMsg
+    echom '[SimpleTree] cannot safely copy symbolic link without a supported system copy command: ' .. src
+    echohl None
+    return false
+  endif
+  if source_type ==# 'dir'
     if !isdirectory(dst)
       try
         call mkdir(dst, 'p')
@@ -378,27 +506,10 @@ def CopyPath(src: string, dst: string): bool
       return false
     endtry
     return true
-  else
-    try
-      call mkdir(fnamemodify(dst, ':h'), 'p')
-    catch
-      return false
-    endtry
-    try
-      if writefile(readfile(src, 'b'), dst, 'b') != 0
-        return false
-      endif
-      if exists('*getfperm') && exists('*setfperm')
-        var p2 = getfperm(src)
-        if type(p2) == v:t_string && p2 !=# ''
-          call setfperm(dst, p2)
-        endif
-      endif
-      return true
-    catch
-      return false
-    endtry
+  elseif source_type ==# 'file'
+    return CopyFilePortable(src, dst)
   endif
+  return false
 enddef
 
 # 递归删除
@@ -438,24 +549,158 @@ def DeletePathRecursive(p: string): bool
   endif
 enddef
 
-# 移动（剪切）：先尝试 rename；失败则 Copy + Delete
-def MovePath(src: string, dst: string): bool
-  try
-    call mkdir(fnamemodify(dst, ':h'), 'p')
-  catch
-    return false
-  endtry
-  try
-    var rc = rename(src, dst)
-    if rc == 0
+# 生成与目标同目录的唯一暂存路径，使最终安装可以使用原子 rename。
+def UniqueSiblingPath(dst: string, tag: string): string
+  var parent = fnamemodify(dst, ':h')
+  # 不嵌入原始文件名，避免接近 NAME_MAX 的合法目标无法生成暂存名。
+  var seed = printf('.simpletree-%s-%x-%x', tag, getpid(), rand())
+  var candidate = PathJoin(parent, seed)
+  var index = 0
+  while PathExists(candidate)
+    index += 1
+    candidate = PathJoin(parent, seed .. '-' .. index)
+  endwhile
+  return candidate
+enddef
+
+# 复制先写入同目录暂存项，再交换目标。任何复制失败都不会触碰旧目标。
+def CopyPathSafely(src: string, dst: string): dict<any>
+  var result: dict<any> = {installed: false, source_removed: false, backup: ''}
+  var staged = UniqueSiblingPath(dst, 'staged')
+  if !CopyPath(src, staged)
+    call DeletePathRecursive(staged)
+    return result
+  endif
+
+  var backup = ''
+  if PathExists(dst)
+    backup = UniqueSiblingPath(dst, 'backup')
+    if rename(dst, backup) != 0
+      call DeletePathRecursive(staged)
+      return result
+    endif
+    result.backup = backup
+  endif
+
+  if rename(staged, dst) != 0
+    call DeletePathRecursive(staged)
+    if backup !=# '' && rename(backup, dst) != 0
+      echohl ErrorMsg
+      echom '[SimpleTree] rollback failed; original target is preserved at: ' .. backup
+      echohl None
+    endif
+    return result
+  endif
+  result.installed = true
+
+  if backup !=# '' && !DeletePathRecursive(backup)
+    echohl WarningMsg
+    echom '[SimpleTree] operation succeeded; old target backup remains at: ' .. backup
+    echohl None
+  else
+    result.backup = ''
+  endif
+  return result
+enddef
+
+# 剪切优先使用同文件系统 rename，避免复制期间变化后再删除源的数据竞态。
+# rename 不可用（通常是跨文件系统）时只安装安全副本并保留源，由用户确认后另行删除。
+def MovePathSafely(src: string, dst: string): dict<any>
+  var result: dict<any> = {installed: false, source_removed: false, backup: ''}
+  var backup = ''
+  if PathExists(dst)
+    backup = UniqueSiblingPath(dst, 'backup')
+    if rename(dst, backup) != 0
+      return result
+    endif
+  endif
+
+  if rename(src, dst) == 0
+    result.installed = true
+    result.source_removed = true
+    if backup !=# '' && !DeletePathRecursive(backup)
+      result.backup = backup
+      echohl WarningMsg
+      echom '[SimpleTree] move succeeded; old target backup remains at: ' .. backup
+      echohl None
+    endif
+    return result
+  endif
+
+  if backup !=# '' && rename(backup, dst) != 0
+    result.backup = backup
+    echohl ErrorMsg
+    echom '[SimpleTree] move rollback failed; original target is at: ' .. backup
+    echohl None
+    return result
+  endif
+
+  result = CopyPathSafely(src, dst)
+  result.source_removed = false
+  if result.installed
+    echohl WarningMsg
+    echom '[SimpleTree] atomic move unavailable; a complete copy was installed and the source was retained: ' .. src
+    echohl None
+  endif
+  return result
+enddef
+
+# 同目录重命名的安全交换：先备份旧目标，失败时立即还原。
+def RenamePathSafely(src: string, dst: string): bool
+  # 大小写不敏感文件系统上的纯大小写改名需要经过一个中间名。
+  if PathEq(src, dst) && src !=# dst
+    var intermediate = UniqueSiblingPath(src, 'rename')
+    if rename(src, intermediate) != 0
+      return false
+    endif
+    if rename(intermediate, dst) == 0
       return true
     endif
-  catch
-  endtry
-  if !CopyPath(src, dst)
+    if rename(intermediate, src) != 0
+      echohl ErrorMsg
+      echom '[SimpleTree] case-only rename rollback failed; source is at: ' .. intermediate
+      echohl None
+    endif
     return false
   endif
-  return DeletePathRecursive(src)
+
+  var backup = ''
+  if PathExists(dst)
+    backup = UniqueSiblingPath(dst, 'backup')
+    if rename(dst, backup) != 0
+      return false
+    endif
+  endif
+  if rename(src, dst) != 0
+    if backup !=# '' && rename(backup, dst) != 0
+      echohl ErrorMsg
+      echom '[SimpleTree] rename rollback failed; original target is at: ' .. backup
+      echohl None
+    endif
+    return false
+  endif
+  if backup !=# '' && !DeletePathRecursive(backup)
+    echohl WarningMsg
+    echom '[SimpleTree] rename succeeded; old target backup remains at: ' .. backup
+    echohl None
+  endif
+  return true
+enddef
+
+# 重命名/冲突改名只接受一个安全的文件名片段。
+def SafeLeafName(name: string): string
+  if name ==# '' || name ==# '.' || name ==# '..' || name =~# '[\\/\r\n]'
+    return ''
+  endif
+  if has('win32') || has('win64')
+    if name =~# '[<>:"|?*]' || name =~# '[ .]$'
+      return ''
+    endif
+    if name =~? '^\%(CON\|PRN\|AUX\|NUL\|COM[1-9]\|LPT[1-9]\)\%\(\..*\)\?$'
+      return ''
+    endif
+  endif
+  return name
 enddef
 
 # 冲突处理：询问覆盖或改名或放弃
@@ -475,7 +720,8 @@ def ResolveConflict(destDir: string, base: string): string
     return dst
   elseif ans ==# 'r' || ans ==# 'R'
     var newname = input('New name: ', base)
-    if newname ==# ''
+    if SafeLeafName(newname) ==# ''
+      echohl ErrorMsg | echom '[SimpleTree] enter a single safe file name' | echohl None
       return ''
     endif
     return ResolveConflict(destDir, newname)
@@ -519,6 +765,135 @@ def SafeRelativeName(name: string): string
   return join(parts, '/')
 enddef
 
+# 找出与一个文件或目录子树关联的普通 Vim 缓冲区。
+def BuffersForPath(path: string, subtree: bool, match_resolved_identity: bool = true): list<dict<any>>
+  var matches: list<dict<any>> = []
+  if path ==# ''
+    return matches
+  endif
+  var resolved_root = ResolvedNormPath(path)
+  for info in getbufinfo()
+    var buftype = getbufvar(info.bufnr, '&buftype')
+    if (buftype !=# '' && buftype !=# 'acwrite') || get(info, 'name', '') ==# ''
+      continue
+    endif
+    var buffer_path = NormPath(info.name)
+    var resolved_buffer = ResolvedNormPath(info.name)
+    var lexical_match = subtree ? IsSubPath(path, buffer_path) : PathEq(path, buffer_path)
+    var identity_match = match_resolved_identity && (subtree
+      ? IsSubPath(resolved_root, resolved_buffer)
+      : PathEq(resolved_root, resolved_buffer))
+    if lexical_match || identity_match
+      matches->add({
+        bufnr: info.bufnr,
+        path: buffer_path,
+        modified: !!get(info, 'changed', getbufvar(info.bufnr, '&modified')),
+      })
+    endif
+  endfor
+  return matches
+enddef
+
+def RefuseModifiedBuffers(path: string, subtree: bool, action: string,
+    match_resolved_identity: bool = true): bool
+  var modified = BuffersForPath(path, subtree, match_resolved_identity)
+    ->filter((_, item) => item.modified)
+  if len(modified) == 0
+    return false
+  endif
+  var names = modified->mapnew((_, item) => fnamemodify(item.path, ':~:.'))
+  if len(names) > 3
+    names = names[0 : 2]
+  endif
+  echohl ErrorMsg
+  echom printf('[SimpleTree] refusing to %s: save or discard modified buffer(s): %s%s',
+    action, join(names, ', '), len(modified) > 3 ? ', ...' : '')
+  echohl None
+  return true
+enddef
+
+def WipeBuffersForPath(path: string, subtree: bool, match_resolved_identity: bool = true)
+  for item in BuffersForPath(path, subtree, match_resolved_identity)
+    # 调用者已经做过 modified 预检；仍不使用 !，防止竞态时静默丢内容。
+    try
+      execute 'silent bwipeout ' .. item.bufnr
+    catch
+      echohl WarningMsg
+      echom '[SimpleTree] could not close buffer safely: ' .. item.path
+      echohl None
+    endtry
+  endfor
+enddef
+
+def BufferRenamePlan(old_path: string, new_path: string, subtree: bool): list<dict<any>>
+  var plan: list<dict<any>> = []
+  var old_root = NormPath(old_path)
+  var new_root = NormPath(new_path)
+  # A rename migrates a lexical path namespace. Buffers reached through a
+  # different symlink alias may share content identity, but their names do not
+  # live below old_root and must never be rewritten by suffix arithmetic.
+  for item in BuffersForPath(old_root, subtree, false)
+    var destination = new_root
+    if subtree && !PathEq(item.path, old_root)
+      destination = new_root .. strpart(item.path, strlen(old_root))
+    endif
+    plan->add({bufnr: item.bufnr, old_path: item.path, new_path: destination})
+  endfor
+  return plan
+enddef
+
+# :file 是 Vim 唯一可靠的缓冲区改名入口。在可见窗口执行；隐藏缓冲区则借用临时窗口。
+def RenameOneBuffer(bufnr: number, new_path: string): bool
+  var wins = win_findbuf(bufnr)
+  if len(wins) > 0
+    try
+      call win_execute(wins[0], 'silent keepalt file ' .. fnameescape(new_path))
+      return true
+    catch
+      return false
+    endtry
+  endif
+
+  var return_win = win_getid()
+  var temp_win = 0
+  try
+    execute 'noautocmd botright new'
+    temp_win = win_getid()
+    execute 'silent noautocmd buffer ' .. bufnr
+    execute 'silent keepalt file ' .. fnameescape(new_path)
+    execute 'noautocmd close'
+    if win_id2win(return_win) > 0
+      call win_gotoid(return_win)
+    endif
+    return true
+  catch
+    var rename_error = v:exception
+    if temp_win != 0 && win_id2win(temp_win) > 0
+      try | call win_execute(temp_win, 'silent! noautocmd close!') | catch | endtry
+    endif
+    if win_id2win(return_win) > 0
+      call win_gotoid(return_win)
+    endif
+    Log('hidden buffer rename failed: ' .. rename_error, 'WarningMsg')
+    return false
+  endtry
+enddef
+
+def ApplyBufferRenamePlan(plan: list<dict<any>>)
+  for item in plan
+    if !bufexists(item.bufnr)
+      continue
+    endif
+    if !RenameOneBuffer(item.bufnr, item.new_path)
+      echohl WarningMsg
+      echom '[SimpleTree] file moved, but buffer rename failed: ' .. item.old_path
+      echohl None
+      # 旧名缓冲区已通过 modified 预检；安全关闭可避免后续保存时重建旧路径。
+      try | execute 'silent bwipeout ' .. item.bufnr | catch | endtry
+    endif
+  endfor
+enddef
+
 def TrashCommand(path: string): list<string>
   if !get(g:, 'simpletree_use_trash', 1)
     return []
@@ -535,13 +910,17 @@ def TrashCommand(path: string): list<string>
   return []
 enddef
 
+def ShellJoin(command: list<string>): string
+  return command->mapnew((_, argument) => shellescape(argument))->join(' ')
+enddef
+
 def MoveToTrash(path: string): bool
   var cmd = TrashCommand(path)
   if len(cmd) == 0
     return false
   endif
   try
-    call system(cmd)
+    call system(ShellJoin(cmd))
     return v:shell_error == 0
   catch
     return false
@@ -557,14 +936,24 @@ def InvalidateAndRescan(dir_path: string)
   if has_key(s_loading, dir_path)
     call remove(s_loading, dir_path)
   endif
+  if has_key(s_scan_errors, dir_path)
+    call remove(s_scan_errors, dir_path)
+  endif
   if GetNodeState(dir_path).expanded
     ScanDirAsync(dir_path)
   endif
 enddef
 
+def IsActionableNode(node: dict<any>): bool
+  return !empty(node)
+    && get(node, 'path', '') !=# ''
+    && !get(node, 'loading', v:false)
+    && !get(node, 'error', v:false)
+enddef
+
 # 操作目的目录：目录取自身；文件取父目录
 def TargetDirForNode(node: dict<any>): string
-  if empty(node)
+  if !IsActionableNode(node)
     return ''
   endif
   return node.is_dir ? node.path : fnamemodify(node.path, ':h')
@@ -619,10 +1008,13 @@ def BFindBackend(): string
     return override
   endif
   for dir in split(&runtimepath, ',')
-    var p = dir .. '/lib/simpletree-daemon'
-    if executable(p)
-      return p
-    endif
+    var exe = (has('win32') || has('win64')) ? 'simpletree-daemon.exe' : 'simpletree-daemon'
+    for relative in ['/lib/' .. exe, '/target/release/' .. exe, '/target/debug/' .. exe]
+      var p = dir .. relative
+      if executable(p)
+        return p
+      endif
+    endfor
   endfor
   return ''
 enddef
@@ -632,6 +1024,7 @@ def BIsRunning(): bool
 enddef
 
 def BackendCrashed()
+  var failed_paths = keys(s_loading)
   try
     for [p, id] in items(s_pending)
       try | BCancel(id) | catch | endtry
@@ -640,6 +1033,18 @@ def BackendCrashed()
   endtry
   s_pending = {}
   s_loading = {}
+  for path in failed_paths
+    if has_key(s_cache, path)
+      call remove(s_cache, path)
+    endif
+    s_scan_errors[path] = 'backend exited; press R to retry'
+    if isdirectory(path)
+      s_dir_mtimes[path] = GetDirMtime(path)
+    endif
+  endfor
+  if !s_open
+    return
+  endif
   echohl ErrorMsg
   echom '[SimpleTree] backend exited. State cleared. Please retry.'
   echohl None
@@ -659,6 +1064,8 @@ def BEnsureBackend(cmd: string = ''): bool
   endif
 
   s_bbuf = ''
+  s_bgeneration += 1
+  var backend_generation = s_bgeneration
   try
     s_bjob = job_start([cmdExe], {
       in_io: 'pipe',
@@ -708,8 +1115,12 @@ def BEnsureBackend(cmd: string = ''): bool
       err_mode: 'nl',
       err_cb: (ch, line) => {
         # 可选：stderr 日志
-        },
+      },
       exit_cb: (ch, code) => {
+        # BStop() 会推进代际；旧 job 的退出回调不得清理或报错到新 job。
+        if backend_generation != s_bgeneration
+          return
+        endif
         s_brunning = false
         s_bjob = v:null
         s_bbuf = ''
@@ -730,31 +1141,46 @@ def BEnsureBackend(cmd: string = ''): bool
     return false
   endtry
 
-  s_brunning = (s_bjob != v:null)
+  s_brunning = s_bjob != v:null && job_status(s_bjob) ==# 'run'
+  if !s_brunning
+    s_bjob = v:null
+    echohl ErrorMsg
+    echom '[SimpleTree] backend failed to start.'
+    echohl None
+  endif
   return s_brunning
 enddef
 
 def BStop(): void
-  if s_bjob != v:null
-    try
-      call('job_stop', [s_bjob])
-    catch
-    endtry
-  endif
+  var job = s_bjob
+  # 先让当前 job 的 exit_cb 失效，正常停止不应被当成后端崩溃。
+  s_bgeneration += 1
   s_brunning = false
   s_bjob = v:null
   s_bbuf = ''
   s_bcbs = {}
+  if job != v:null
+    try
+      call('job_stop', [job])
+    catch
+    endtry
+  endif
 enddef
 
-def BSend(req: dict<any>): void
-  if !BIsRunning()
-    return
+def BSend(req: dict<any>): bool
+  if !BIsRunning() || s_bjob == v:null
+    return false
   endif
   try
+    if job_status(s_bjob) !=# 'run'
+      s_brunning = false
+      return false
+    endif
     var json = json_encode(req) .. "\n"
     ch_sendraw(s_bjob, json)
+    return true
   catch
+    return false
   endtry
 enddef
 
@@ -768,18 +1194,71 @@ def BList(path: string, show_hidden: bool, git_ignore: bool, max: number, OnChun
   endif
   var id = BNextId()
   s_bcbs[id] = {OnChunk: OnChunk, OnDone: OnDone, OnError: OnError}
-  BSend({type: 'list', id: id, path: path, show_hidden: show_hidden, git_ignore: git_ignore, max: max})
+  if !BSend({type: 'list', id: id, path: path, show_hidden: show_hidden, git_ignore: git_ignore, max: max})
+    call remove(s_bcbs, id)
+    try
+      OnError('failed to send request to backend')
+    catch
+    endtry
+    return 0
+  endif
   return id
 enddef
 
 def BCancel(id: number): void
-  if id <= 0 || !BIsRunning()
+  if id <= 0
     return
   endif
-  BSend({type: 'cancel', id: id})
   if has_key(s_bcbs, id)
     call remove(s_bcbs, id)
   endif
+  if BIsRunning()
+    BSend({type: 'cancel', id: id})
+  endif
+enddef
+
+# 取消所有只属于当前前端会话的异步工作。完整缓存与展开状态保留，便于下次打开复用。
+def CancelFrontendWork()
+  if s_render_timer != 0
+    try
+      call timer_stop(s_render_timer)
+    catch
+    endtry
+    s_render_timer = 0
+  endif
+  if s_reveal_timer != 0
+    try
+      call timer_stop(s_reveal_timer)
+    catch
+    endtry
+    s_reveal_timer = 0
+  endif
+  s_reveal_target = ''
+
+  # 流式列表在 done 前写入的缓存只是半成品；取消后必须失效，避免下次打开当成完整结果。
+  for p in keys(s_loading)
+    if has_key(s_cache, p)
+      call remove(s_cache, p)
+    endif
+  endfor
+  for [p, id] in items(s_pending)
+    try
+      BCancel(id)
+    catch
+    endtry
+  endfor
+  s_pending = {}
+  s_loading = {}
+  # 也清掉尚未进入 s_pending 或已经脱离路径索引的旧请求回调。
+  s_bcbs = {}
+enddef
+
+def EndFrontendSession()
+  if s_open
+    s_open = false
+    s_session_generation += 1
+  endif
+  CancelFrontendWork()
 enddef
 
 # =============================================================
@@ -797,6 +1276,9 @@ def CancelPending(path: string)
 enddef
 
 def ScheduleRender()
+  if !s_open
+    return
+  endif
   if !exists('*timer_start')
     Render()
     return
@@ -805,8 +1287,14 @@ def ScheduleRender()
     return
   endif
   try
-    s_render_timer = timer_start(20, (_) => {
-      s_render_timer = 0
+    var session_generation = s_session_generation
+    s_render_timer = timer_start(20, (id) => {
+      if s_render_timer == id
+        s_render_timer = 0
+      endif
+      if !s_open || session_generation != s_session_generation
+        return
+      endif
       Render()
     })
   catch
@@ -815,7 +1303,10 @@ def ScheduleRender()
 enddef
 
 def ScanDirAsync(path: string)
-  if has_key(s_cache, path) || get(s_loading, path, v:false)
+  if !s_open
+    return
+  endif
+  if has_key(s_cache, path) || has_key(s_scan_errors, path) || get(s_loading, path, v:false)
     return
   endif
 
@@ -825,6 +1316,7 @@ def ScanDirAsync(path: string)
   var acc: list<dict<any>> = []
   var p = path
   var req_id: number = 0
+  var session_generation = s_session_generation
 
   req_id = BList(
     p,
@@ -832,11 +1324,20 @@ def ScanDirAsync(path: string)
     s_git_ignore,
     g:simpletree_page,
     (entries) => {
+      if !s_open || session_generation != s_session_generation
+        return
+      endif
       acc += entries
+      if has_key(s_scan_errors, p)
+        call remove(s_scan_errors, p)
+      endif
       s_cache[p] = acc
       ScheduleRender()
     },
     () => {
+      if !s_open || session_generation != s_session_generation
+        return
+      endif
       if has_key(s_loading, p)
         call remove(s_loading, p)
       endif
@@ -859,11 +1360,21 @@ def ScanDirAsync(path: string)
       endif
     },
     (msg) => {
+      if !s_open || session_generation != s_session_generation
+        return
+      endif
       if has_key(s_loading, p)
         call remove(s_loading, p)
       endif
       if has_key(s_pending, p) && s_pending[p] == req_id
         call remove(s_pending, p)
+      endif
+      if has_key(s_cache, p)
+        call remove(s_cache, p)
+      endif
+      s_scan_errors[p] = type(msg) == v:t_string && msg !=# '' ? msg : 'unknown scan error'
+      if isdirectory(p)
+        s_dir_mtimes[p] = GetDirMtime(p)
       endif
       if type(msg) == v:t_string && msg !=# ''
         echohl WarningMsg
@@ -1036,6 +1547,9 @@ enddef
 # 渲染
 # =============================================================
 def EnsureWindowAndBuffer()
+  if !s_open
+    return
+  endif
   if WinValid()
     try
       call win_execute(s_winid, 'vertical resize ' .. g:simpletree_width)
@@ -1134,6 +1648,12 @@ def BuildLines(path: string, depth: number, lines: list<string>, idx: list<dict<
   var isLoading = get(s_loading, path, v:false)
 
   if !hasCache
+    if has_key(s_scan_errors, path)
+      var message = strcharpart(substitute(s_scan_errors[path], '[\r\n]', ' ', 'g'), 0, 100)
+      lines->add(repeat('  ', depth) .. '! ' .. message)
+      idx->add({path: '', is_dir: false, name: '', depth: depth, error: true})
+      return
+    endif
     if !isLoading
       ScanDirAsync(path)
     endif
@@ -1242,7 +1762,7 @@ def UpdateBufferDiff(out: list<string>)
 enddef
 
 def Render()
-  if s_root ==# ''
+  if !s_open || s_root ==# ''
     return
   endif
   EnsureWindowAndBuffer()
@@ -1338,6 +1858,7 @@ def SetRoot(new_root: string, lock: bool = false)
   s_pending = {}
   s_loading = {}
   s_cache = {}
+  s_scan_errors = {}
   s_dir_mtimes = {}
 
   ScanDirAsync(s_root)
@@ -1362,7 +1883,7 @@ export def OnRootHere()
     return
   endif
   var node = CursorNode()
-  if empty(node) || get(node, 'loading', v:false)
+  if !IsActionableNode(node)
     return
   endif
   var p = node.is_dir ? node.path : fnamemodify(node.path, ':h')
@@ -1638,7 +2159,7 @@ enddef
 
 export def OnEnter()
   var node = CursorNode()
-  if empty(node) || get(node, 'loading', v:false)
+  if !IsActionableNode(node)
     return
   endif
   if node.is_dir
@@ -1651,7 +2172,7 @@ enddef
 # l：目录上展开并定位第一个子项；文件上打开文件
 export def OnExpand()
   var node = CursorNode()
-  if empty(node) || get(node, 'loading', v:false)
+  if !IsActionableNode(node)
     return
   endif
   if node.is_dir
@@ -1667,7 +2188,7 @@ enddef
 # h：目录已展开时折叠当前；目录已折叠或文件时折叠最近的已展开父目录
 export def OnCollapse()
   var node = CursorNode()
-  if empty(node) || get(node, 'loading', v:false)
+  if !IsActionableNode(node)
     return
   endif
   if node.is_dir
@@ -1733,6 +2254,7 @@ export def OnClose()
 enddef
 
 export def OnBufWipe()
+  EndFrontendSession()
   s_winid = 0
   s_bufnr = -1
   s_active_match_id = -1
@@ -1741,7 +2263,7 @@ enddef
 # ===== 文件操作：复制/剪切/粘贴/新建/重命名/删除 =====
 export def OnCopy()
   var node = CursorNode()
-  if empty(node) || get(node, 'loading', v:false)
+  if !IsActionableNode(node)
     echo '[SimpleTree] nothing to copy'
     return
   endif
@@ -1751,7 +2273,7 @@ enddef
 
 export def OnCut()
   var node = CursorNode()
-  if empty(node) || get(node, 'loading', v:false)
+  if !IsActionableNode(node)
     echo '[SimpleTree] nothing to cut'
     return
   endif
@@ -1769,7 +2291,7 @@ export def OnPaste()
     return
   endif
   var node = CursorNode()
-  if empty(node)
+  if !IsActionableNode(node)
     echo '[SimpleTree] no target selected'
     return
   endif
@@ -1778,26 +2300,57 @@ export def OnPaste()
     echo '[SimpleTree] invalid target directory'
     return
   endif
+  if !WorkspaceContainsOperationPath(destDir)
+    echohl ErrorMsg | echom '[SimpleTree] refusing to write through a directory link outside the workspace' | echohl None
+    return
+  endif
 
   var mode = s_clipboard.mode
-  var srcs: list<string> = s_clipboard.items
+  var srcs: list<string> = copy(s_clipboard.items)
   var focused = ''
+  var remaining: list<string> = []
 
   for src in srcs
     if !PathExists(src)
       echo '[SimpleTree] skip missing: ' .. src
+      if mode ==# 'cut'
+        remaining->add(src)
+      endif
       continue
     endif
     var base = fnamemodify(src, ':t')
-    if isdirectory(src) && IsSubPath(src, destDir)
+    var source_type = getftype(src)
+    var source_is_link = source_type ==# 'link'
+    # A directory symlink is still a link object for copy/move semantics.
+    var source_subtree = source_type ==# 'dir'
+    if !WorkspaceContainsOperationPath(src, true)
+      echohl ErrorMsg | echom '[SimpleTree] source resolves outside the workspace' | echohl None
+      if mode ==# 'cut'
+        remaining->add(src)
+      endif
+      continue
+    endif
+    if source_type ==# 'dir'
+      && IsSubPath(ResolvedNormPath(src), ResolvedNormPath(destDir))
       echohl WarningMsg | echom '[SimpleTree] cannot paste a directory into itself' | echohl None
+      if mode ==# 'cut'
+        remaining->add(src)
+      endif
+      continue
+    endif
+    if mode ==# 'cut'
+        && RefuseModifiedBuffers(src, source_subtree, 'move', !source_is_link)
+      remaining->add(src)
       continue
     endif
     var proposed = PathJoin(destDir, base)
     var dst = ''
-    if PathEq(src, proposed)
+    var same_target = PathEq(src, proposed)
+      || PathEq(ResolvedNormPath(src), ResolvedNormPath(proposed))
+    if same_target
       if mode ==# 'cut'
         echo '[SimpleTree] source is already in the target directory'
+        remaining->add(src)
         continue
       endif
       dst = AskUniqueName(destDir, base .. ' copy')
@@ -1806,19 +2359,41 @@ export def OnPaste()
     endif
     if dst ==# ''
       echo '[SimpleTree] skip: ' .. base
+      if mode ==# 'cut'
+        remaining->add(src)
+      endif
       continue
     endif
-    if PathExists(dst) && (mode ==# 'copy' || mode ==# 'cut')
-      call DeletePathRecursive(dst)
+    if !IsSubPath(destDir, dst) || PathEq(destDir, dst)
+      echohl ErrorMsg | echom '[SimpleTree] target must stay inside destination directory' | echohl None
+      if mode ==# 'cut'
+        remaining->add(src)
+      endif
+      continue
     endif
-    var ok = false
-    if mode ==# 'copy'
-      ok = CopyPath(src, dst)
-    else
-      ok = MovePath(src, dst)
+    var target_is_link = getftype(dst) ==# 'link'
+    var target_was_dir = getftype(dst) ==# 'dir'
+    var destination_buffer_subtree = source_subtree || target_was_dir
+    if RefuseModifiedBuffers(dst, destination_buffer_subtree, 'replace', !target_is_link)
+      if mode ==# 'cut'
+        remaining->add(src)
+      endif
+      continue
     endif
-    if ok
-      echo '[SimpleTree] ' .. (mode ==# 'copy' ? 'copied' : 'moved') .. ': ' .. base .. ' -> ' .. destDir
+
+    var rename_plan: list<dict<any>> = mode ==# 'cut'
+      ? BufferRenamePlan(src, dst, source_subtree)
+      : []
+    var transfer = mode ==# 'cut'
+      ? MovePathSafely(src, dst)
+      : CopyPathSafely(src, dst)
+    if transfer.installed
+      # 关闭被替换目标的未修改缓冲区，再把成功移动的源缓冲区改到新路径。
+      WipeBuffersForPath(dst, destination_buffer_subtree,
+        !target_is_link && !source_is_link)
+      if mode ==# 'cut' && transfer.source_removed
+        ApplyBufferRenamePlan(rename_plan)
+      endif
       focused = dst
       InvalidateAndRescan(destDir)
       if mode ==# 'cut'
@@ -1826,11 +2401,24 @@ export def OnPaste()
         if sp !=# destDir
           InvalidateAndRescan(sp)
         endif
+        if transfer.source_removed
+          echo '[SimpleTree] moved: ' .. base .. ' -> ' .. destDir
+        else
+          remaining->add(src)
+          echohl WarningMsg
+          echom '[SimpleTree] copied safely, but source was not fully removed: ' .. src
+          echohl None
+        endif
+      else
+        echo '[SimpleTree] copied: ' .. base .. ' -> ' .. destDir
       endif
     else
       echohl ErrorMsg
       echom '[SimpleTree] failed to ' .. (mode ==# 'copy' ? 'copy' : 'move') .. ': ' .. src
       echohl None
+      if mode ==# 'cut'
+        remaining->add(src)
+      endif
     endif
   endfor
 
@@ -1840,19 +2428,25 @@ export def OnPaste()
   endif
 
   if mode ==# 'cut'
-    s_clipboard = {mode: '', items: []}
+    s_clipboard = len(remaining) == 0
+      ? {mode: '', items: []}
+      : {mode: 'cut', items: remaining}
   endif
 enddef
 
 export def OnNewFile()
   var node = CursorNode()
-  if empty(node)
+  if !IsActionableNode(node)
     echo '[SimpleTree] no target selected'
     return
   endif
   var destDir = TargetDirForNode(node)
   if destDir ==# '' || !isdirectory(destDir)
     echo '[SimpleTree] invalid target directory'
+    return
+  endif
+  if !WorkspaceContainsOperationPath(destDir)
+    echohl ErrorMsg | echom '[SimpleTree] refusing to create through a directory link outside the workspace' | echohl None
     return
   endif
   var raw_name = input('New file name: ', '')
@@ -1868,8 +2462,14 @@ export def OnNewFile()
   if dst ==# ''
     return
   endif
+  var parent = fnamemodify(dst, ':h')
+  if !EnsureWorkspaceDirectory(parent)
+    echohl ErrorMsg
+    echom '[SimpleTree] refusing to create through a path that leaves the workspace'
+    echohl None
+    return
+  endif
   try
-    call mkdir(fnamemodify(dst, ':h'), 'p')
     if writefile([], dst, 'b') != 0
       echohl ErrorMsg | echom '[SimpleTree] create file failed: ' .. dst | echohl None
       return
@@ -1889,13 +2489,17 @@ enddef
 
 export def OnNewFolder()
   var node = CursorNode()
-  if empty(node)
+  if !IsActionableNode(node)
     echo '[SimpleTree] no target selected'
     return
   endif
   var destDir = TargetDirForNode(node)
   if destDir ==# '' || !isdirectory(destDir)
     echo '[SimpleTree] invalid target directory'
+    return
+  endif
+  if !WorkspaceContainsOperationPath(destDir)
+    echohl ErrorMsg | echom '[SimpleTree] refusing to create through a directory link outside the workspace' | echohl None
     return
   endif
   var raw_name = input('New folder name: ', '')
@@ -1911,12 +2515,12 @@ export def OnNewFolder()
   if dst ==# ''
     return
   endif
-  try
-    call mkdir(dst, 'p')
-  catch
-    echohl ErrorMsg | echom '[SimpleTree] create folder exception: ' .. v:exception | echohl None
+  if !EnsureWorkspaceDirectory(dst)
+    echohl ErrorMsg
+    echom '[SimpleTree] refusing to create through a path that leaves the workspace'
+    echohl None
     return
-  endtry
+  endif
   echo '[SimpleTree] created folder: ' .. dst
   InvalidateAndRescan(destDir)
   Render()
@@ -1925,7 +2529,7 @@ enddef
 
 export def OnRename()
   var node = CursorNode()
-  if empty(node) || get(node, 'loading', v:false)
+  if !IsActionableNode(node)
     echo '[SimpleTree] nothing to rename'
     return
   endif
@@ -1934,37 +2538,60 @@ export def OnRename()
     return
   endif
   var src = node.path
+  if !WorkspaceContainsOperationPath(src, true)
+    echohl ErrorMsg | echom '[SimpleTree] refusing to rename a path that resolves outside the workspace' | echohl None
+    return
+  endif
   var parent = fnamemodify(src, ':h')
   var base = fnamemodify(src, ':t')
   var newname = input('Rename to: ', base)
   if newname ==# ''
     return
   endif
-  if newname =~ '[\/]'
-    echohl ErrorMsg | echom '[SimpleTree] name cannot contain path separator' | echohl None
+  if SafeLeafName(newname) ==# ''
+    echohl ErrorMsg | echom '[SimpleTree] enter a single safe file name (not . or ..)' | echohl None
     return
   endif
   var dst = PathJoin(parent, newname)
   if dst ==# src
     return
   endif
+  if !IsSubPath(parent, dst) || PathEq(parent, dst) || !PathEq(fnamemodify(dst, ':h'), parent)
+    echohl ErrorMsg | echom '[SimpleTree] rename target must stay in the same directory' | echohl None
+    return
+  endif
 
-  if PathExists(dst)
+  var source_type = getftype(src)
+  var source_is_link = source_type ==# 'link'
+  var subtree = source_type ==# 'dir'
+  if RefuseModifiedBuffers(src, subtree, 'rename', !source_is_link)
+    return
+  endif
+  var target_is_link = getftype(dst) ==# 'link'
+  var target_was_dir = getftype(dst) ==# 'dir'
+  var destination_buffer_subtree = subtree || target_was_dir
+  if !PathEq(src, dst)
+      && RefuseModifiedBuffers(dst, destination_buffer_subtree, 'replace', !target_is_link)
+    return
+  endif
+  var rename_plan = BufferRenamePlan(src, dst, subtree)
+
+  var replacing = PathExists(dst) && !PathEq(src, dst)
+  if replacing
     var ans = input('Target exists. Overwrite? [y]es/[n]o: ')
     if ans !=# 'y' && ans !=# 'Y'
       echo '[SimpleTree] rename canceled'
       return
     endif
-    if !DeletePathRecursive(dst)
-      echohl ErrorMsg | echom '[SimpleTree] failed to remove existing target' | echohl None
-      return
-    endif
   endif
 
-  if MovePath(src, dst)
+  if RenamePathSafely(src, dst)
     echo '[SimpleTree] renamed: ' .. base .. ' -> ' .. newname
-    # 更新指向旧路径的 Vim 缓冲区
-    RenameBuf(src, dst)
+    if !PathEq(src, dst)
+      WipeBuffersForPath(dst, destination_buffer_subtree,
+        !target_is_link && !source_is_link)
+    endif
+    ApplyBufferRenamePlan(rename_plan)
     InvalidateAndRescan(parent)
     Render()
     RevealPath(dst)
@@ -1975,7 +2602,7 @@ enddef
 
 export def OnDelete()
   var node = CursorNode()
-  if empty(node) || get(node, 'loading', v:false)
+  if !IsActionableNode(node)
     echo '[SimpleTree] nothing to delete'
     return
   endif
@@ -1988,10 +2615,20 @@ export def OnDelete()
     echo '[SimpleTree] path not exists'
     return
   endif
+  if !WorkspaceContainsOperationPath(p, true)
+    echohl ErrorMsg | echom '[SimpleTree] refusing to delete a path that resolves outside the workspace' | echohl None
+    return
+  endif
+  var path_type = getftype(p)
+  var path_is_link = path_type ==# 'link'
+  var subtree = path_type ==# 'dir'
+  if RefuseModifiedBuffers(p, subtree, 'delete', !path_is_link)
+    return
+  endif
   var can_trash = len(TrashCommand(p)) > 0
   var ok = 0
   var action = can_trash ? 'Move to trash' : 'Permanently delete'
-  var msg = action .. ' ' .. (node.is_dir ? 'directory' : 'file') .. ' "' .. p .. '" ?'
+  var msg = action .. ' ' .. (subtree ? 'directory' : 'file') .. ' "' .. p .. '" ?'
   if exists('*confirm')
     ok = (confirm(msg, "&Yes\n&No", 2) == 1) ? 1 : 0
   else
@@ -2001,12 +2638,40 @@ export def OnDelete()
     echo '[SimpleTree] delete canceled'
     return
   endif
+
+  # input()/confirm() may remain open for an arbitrary time. Re-read the live
+  # entry type and repeat all destructive guards after the user answers.
+  if !PathExists(p) || !WorkspaceContainsOperationPath(p, true)
+    echohl ErrorMsg | echom '[SimpleTree] path changed; refusing to delete' | echohl None
+    return
+  endif
+  path_type = getftype(p)
+  path_is_link = path_type ==# 'link'
+  subtree = path_type ==# 'dir'
+  if RefuseModifiedBuffers(p, subtree, 'delete', !path_is_link)
+    return
+  endif
+
   var parent = fnamemodify(p, ':h')
   var trashed = can_trash && MoveToTrash(p)
   var removed = trashed
   if can_trash && !trashed
-    var fallback = confirm('Move to trash failed. Permanently delete instead?', "&Delete\n&Cancel", 2) == 1
+    var fallback = exists('*confirm')
+      ? confirm('Move to trash failed. Permanently delete instead?', "&Delete\n&Cancel", 2) == 1
+      : input('Move to trash failed. Permanently delete? [y/N]: ') =~? '^y'
     if !fallback
+      return
+    endif
+    # The fallback confirmation is another unbounded pause. Do not apply the
+    # earlier decision to a path that was replaced while the prompt was open.
+    if !PathExists(p) || !WorkspaceContainsOperationPath(p, true)
+      echohl ErrorMsg | echom '[SimpleTree] path changed; refusing permanent delete' | echohl None
+      return
+    endif
+    path_type = getftype(p)
+    path_is_link = path_type ==# 'link'
+    subtree = path_type ==# 'dir'
+    if RefuseModifiedBuffers(p, subtree, 'delete', !path_is_link)
       return
     endif
   endif
@@ -2017,8 +2682,8 @@ export def OnDelete()
       return
     endif
   endif
-  # 清除指向已删除路径的缓冲区
-  WipeBuf(p)
+  # 只关闭未修改缓冲区；modified 已在操作前硬性拒绝。
+  WipeBuffersForPath(p, subtree, !path_is_link)
   echo '[SimpleTree] ' .. (trashed ? 'moved to trash: ' : 'deleted: ') .. p
   InvalidateAndRescan(parent)
   Render()
@@ -2210,33 +2875,65 @@ def FocusIfPresent(path: string): bool
   return false
 enddef
 
-def RevealTimerCb(_id: number)
-  if s_reveal_target ==# ''
+def RevealTimerCb(id: number, session_generation: number)
+  if !s_open || session_generation != s_session_generation || s_reveal_target ==# ''
     return
   endif
   if FocusIfPresent(s_reveal_target)
     s_reveal_target = ''
+    if s_reveal_timer == id
+      try
+        call timer_stop(id)
+      catch
+      endtry
+      s_reveal_timer = 0
+    endif
   endif
 enddef
 
+def HasHiddenRelativeComponent(root: string, path: string): bool
+  if !IsSubPath(root, path)
+    return false
+  endif
+  var cur = NormPath(path)
+  var root_path = NormPath(root)
+  var guard = 0
+  while !PathEq(cur, root_path) && guard < 500
+    var base = fnamemodify(cur, ':t')
+    if base =~# '^\.' && base !=# '.' && base !=# '..'
+      return true
+    endif
+    var parent = NormPath(fnamemodify(cur, ':h'))
+    if PathEq(parent, cur)
+      break
+    endif
+    cur = parent
+    guard += 1
+  endwhile
+  return false
+enddef
+
 def RevealPath(path: string)
-  if path ==# '' || s_root ==# ''
+  if !s_open || path ==# '' || s_root ==# ''
     return
   endif
 
   var ap = AbsPath(path)
+  # Reveal 永远受工作区根约束；先拒绝越界，不能启动任何外部目录扫描。
+  if !IsSubPath(s_root, ap)
+    Log('RevealPath: target outside root; skipped: ' .. ap, 'WarningMsg')
+    return
+  endif
   s_reveal_target = ap
 
-  var base = fnamemodify(ap, ':t')
-  if filereadable(ap) && base =~ '^\.'
-    if s_hide_dotfiles
-      s_hide_dotfiles = false
-      g:simpletree_hide_dotfiles = 0
-      echo '[SimpleTree] dotfiles hidden => OFF (auto). Showing hidden to reveal target.'
-      Refresh()
-      RevealPath(ap)
-      return
-    endif
+  # 目标本身或相对根路径中的任一祖先是点目录时，都必须先显示隐藏项。
+  if s_hide_dotfiles && HasHiddenRelativeComponent(s_root, ap)
+    s_hide_dotfiles = false
+    g:simpletree_hide_dotfiles = 0
+    echo '[SimpleTree] dotfiles hidden => OFF (auto). Showing hidden to reveal target.'
+    Refresh()
+    RevealPath(ap)
+    return
   endif
 
   var cur_dir = filereadable(ap) ? fnamemodify(ap, ':h') : ap
@@ -2283,7 +2980,8 @@ def RevealPath(path: string)
     catch
     endtry
     try
-      s_reveal_timer = timer_start(150, (id) => RevealTimerCb(id), {repeat: 5})
+      var session_generation = s_session_generation
+      s_reveal_timer = timer_start(150, (id) => RevealTimerCb(id, session_generation), {repeat: 5})
     catch
       FocusPath(ap)
     endtry
@@ -2332,6 +3030,8 @@ export def Toggle(root: string = '')
     return
   endif
 
+  s_session_generation += 1
+  s_open = true
   EnsureWindowAndBuffer()
   if !BEnsureBackend()
     echohl ErrorMsg
@@ -2344,7 +3044,7 @@ export def Toggle(root: string = '')
   st.expanded = true
 
   # 改动点：如果有当前文件，优先进行 Reveal，避免初始 Render 的闪烁
-  if curf_abs !=# '' && filereadable(curf_abs)
+  if curf_abs !=# '' && filereadable(curf_abs) && IsSubPath(s_root, curf_abs)
     RevealPath(curf_abs)
   else
     # 无当前文件时再正常扫描并渲染
@@ -2367,6 +3067,7 @@ export def Refresh()
   s_pending = {}
   s_loading = {}
   s_cache = {}
+  s_scan_errors = {}
   # 清空修改时间缓存，强制重新检测
   s_dir_mtimes = {}
   if s_root !=# ''
@@ -2486,6 +3187,9 @@ def SmartRefresh()
     if has_key(s_cache, dir_path)
       call remove(s_cache, dir_path)
     endif
+    if has_key(s_scan_errors, dir_path)
+      call remove(s_scan_errors, dir_path)
+    endif
     # 取消该目录的待处理请求
     CancelPending(dir_path)
   endfor
@@ -2540,6 +3244,7 @@ export def AutoRefreshOnIdle()
 enddef
 
 export def Close()
+  EndFrontendSession()
   if WinValid()
     try
       call win_execute(s_winid, 'close')
@@ -2576,8 +3281,63 @@ export def DebugStatus()
   echo '  backend_running: ' .. (s_brunning ? 'yes' : 'no')
   echo '  pending: ' .. string(items(s_pending))
   echo '  loading: ' .. string(keys(s_loading))
+  echo '  scan_errors: ' .. string(s_scan_errors)
   echo '  cache_keys: ' .. string(keys(s_cache))
   Log('DebugStatus logged', 'MoreMsg')
+enddef
+
+def HealthItem(ok: bool, label: string, detail: string = '')
+  echohl ok ? 'MoreMsg' : 'ErrorMsg'
+  echom printf('  %s %s%s', ok ? '[ok]' : '[!!]', label,
+    detail ==# '' ? '' : ': ' .. detail)
+  echohl None
+enddef
+
+export def Health()
+  echohl Title
+  echom '[SimpleTree] health check'
+  echohl None
+
+  var vim_ok = v:version >= 900
+  var float_ok = has('float')
+  var async_ok = has('job') && has('channel')
+    && exists('*job_start') && exists('*ch_sendraw') && exists('*json_decode')
+  var backend = BFindBackend()
+  var backend_ok = backend !=# '' && executable(backend)
+  HealthItem(vim_ok, 'Vim 9+', printf('v%d.%02d', v:version / 100, v:version % 100))
+  HealthItem(async_ok, 'async job/channel/json support')
+  HealthItem(float_ok, 'floating-point support')
+  HealthItem(backend_ok, 'simpletree-daemon', backend_ok ? backend : 'run ./install.sh or set g:simpletree_daemon_path')
+  HealthItem(g:simpletree_page >= 1 && g:simpletree_page <= 1000,
+    'page size', string(g:simpletree_page))
+  HealthItem(g:simpletree_width >= 10 && g:simpletree_width <= 500,
+    'tree width', string(g:simpletree_width))
+
+  var trash = TrashCommand('/tmp/simpletree-health-check')
+  var trash_detail = !get(g:, 'simpletree_use_trash', 1)
+    ? 'disabled'
+    : (len(trash) > 0 ? trash[0] : 'no provider; deletes require permanent-delete confirmation')
+  echom '  [--] trash: ' .. trash_detail
+
+  var clipboard = !get(g:, 'simpletree_use_system_clipboard', 1) ? 'disabled' : ''
+  if clipboard ==# '' && has('clipboard')
+    clipboard = 'Vim + register'
+  endif
+  if clipboard ==# ''
+    for command in ClipboardProviders()
+      if executable(command[0])
+        clipboard = command[0]
+        break
+      endif
+    endfor
+  endif
+  echom '  [--] system clipboard: ' .. (clipboard ==# '' ? 'no provider; unnamed register still works' : clipboard)
+
+  if vim_ok && async_ok && float_ok && backend_ok
+    echohl MoreMsg | echom '[SimpleTree] ready' | echohl None
+  else
+    echohl ErrorMsg | echom '[SimpleTree] not ready; resolve the [!!] item(s) above' | echohl None
+  endif
 enddef
 
 # 仅更新缓冲区状态等轻量装饰，不触发目录扫描。
@@ -2616,7 +3376,7 @@ enddef
 
 export def OnPreview()
   var node = CursorNode()
-  if empty(node) || node.is_dir || get(node, 'loading', v:false)
+  if !IsActionableNode(node) || node.is_dir
     return
   endif
   var target_win = ResolveTargetWindow()
@@ -2647,7 +3407,7 @@ enddef
 
 export def OnOpenVSplit()
   var node = CursorNode()
-  if empty(node) || node.is_dir || get(node, 'loading', v:false)
+  if !IsActionableNode(node) || node.is_dir
     return
   endif
   var target_win = ResolveTargetWindow()
@@ -2672,7 +3432,7 @@ enddef
 
 export def OnOpenSplit()
   var node = CursorNode()
-  if empty(node) || node.is_dir || get(node, 'loading', v:false)
+  if !IsActionableNode(node) || node.is_dir
     return
   endif
 
@@ -2714,82 +3474,102 @@ export def GetRoot(): string
 enddef
 
 # =============================================================
-# 缓冲区同步（重命名/删除后更新 Vim buffers）
-# =============================================================
-def RenameBuf(old_path: string, new_path: string)
-  var bnr = bufnr(old_path)
-  if bnr > 0 && bufexists(bnr)
-    try
-      execute 'silent! buffer ' .. bnr
-      execute 'silent! file ' .. fnameescape(new_path)
-      execute 'silent! edit!'
-    catch
-    endtry
-    if WinValid()
-      call win_gotoid(s_winid)
-    endif
-  endif
-enddef
-
-def WipeBuf(path: string)
-  var bnr = bufnr(path)
-  if bnr > 0 && bufexists(bnr)
-    try
-      execute 'silent! bwipeout! ' .. bnr
-    catch
-    endtry
-  endif
-enddef
-
-# =============================================================
 # Yank / 系统打开 / Tab 打开
 # =============================================================
+def ClipboardProviders(): list<list<string>>
+  if has('mac') || has('macunix')
+    return [['pbcopy']]
+  endif
+  if has('win32') || has('win64')
+    return [['clip.exe']]
+  endif
+  return [
+    ['wl-copy'],
+    ['xclip', '-selection', 'clipboard'],
+    ['xsel', '--clipboard', '--input'],
+  ]
+enddef
+
+def CopyToSystemClipboard(text: string): bool
+  if !get(g:, 'simpletree_use_system_clipboard', 1)
+    return false
+  endif
+  if has('clipboard')
+    try
+      setreg('+', text)
+      return true
+    catch
+    endtry
+  endif
+  for command in ClipboardProviders()
+    if !executable(command[0])
+      continue
+    endif
+    try
+      call system(ShellJoin(command), text)
+      if v:shell_error == 0
+        return true
+      endif
+    catch
+    endtry
+  endfor
+  return false
+enddef
+
 export def OnYankPath()
   var node = CursorNode()
-  if empty(node) || get(node, 'loading', v:false)
+  if !IsActionableNode(node)
     return
   endif
   var name = fnamemodify(node.path, ':t')
   setreg('"', name)
-  simpleclipboard#CopyToSystemClipboard(name)
+  call CopyToSystemClipboard(name)
   echo '[SimpleTree] yanked: ' .. name
 enddef
 
 export def OnYankAbsPath()
   var node = CursorNode()
-  if empty(node) || get(node, 'loading', v:false)
+  if !IsActionableNode(node)
     return
   endif
   setreg('"', node.path)
-  simpleclipboard#CopyToSystemClipboard(node.path)
+  call CopyToSystemClipboard(node.path)
   echo '[SimpleTree] yanked: ' .. node.path
 enddef
 
 export def OnSystemOpen()
   var node = CursorNode()
-  if empty(node) || get(node, 'loading', v:false)
+  if !IsActionableNode(node)
     return
   endif
-  var cmd = ''
+  var command: list<string> = []
   if has('mac') || has('macunix')
-    cmd = 'open'
+    command = ['open', node.path]
   elseif has('unix')
-    cmd = 'xdg-open'
+    command = ['xdg-open', node.path]
   elseif has('win32') || has('win64')
-    cmd = 'start'
+    command = ['cmd.exe', '/c', 'start', '', node.path]
   endif
-  if cmd ==# ''
+  if len(command) == 0 || !executable(command[0])
     echo '[SimpleTree] system open not supported on this platform'
     return
   endif
-  var full = printf('%s %s &', cmd, shellescape(node.path))
-  call system(full)
+  try
+    if exists('*job_start')
+      call job_start(command, {out_io: 'null', err_io: 'null'})
+    else
+      call system(ShellJoin(command))
+    endif
+  catch
+    echohl ErrorMsg | echom '[SimpleTree] system open failed: ' .. v:exception | echohl None
+    return
+  endtry
   echo '[SimpleTree] opened: ' .. fnamemodify(node.path, ':t')
 enddef
 
 export def OnOpenTab()
   var node = CursorNode()
-  if empty(node) || node.is_dir || get(node, 'loading', v:false)
+  if !IsActionableNode(node) || node.is_dir
     return
   endif
   execute 'tabedit ' .. fnameescape(node.path)

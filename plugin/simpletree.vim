@@ -18,6 +18,13 @@ def DefaultWidthStateFile(): string
   return expand('~/.local/state/simpletree/width')
 enddef
 
+def ClampNumber(value: any, fallback: number, minimum: number, maximum: number): number
+  if type(value) != v:t_number
+    return fallback
+  endif
+  return min([maximum, max([minimum, value])])
+enddef
+
 def LoadPersistedWidth(fallback: number): number
   if !get(g:, 'simpletree_persist_width', 1)
     return fallback
@@ -31,7 +38,7 @@ def LoadPersistedWidth(fallback: number): number
     if len(lines) > 0
       var width = str2nr(trim(lines[0]))
       if width > 0
-        return width
+        return ClampNumber(width, fallback, 10, 500)
       endif
     endif
   catch
@@ -89,12 +96,13 @@ enddef
 # =============================================================
 g:simpletree_persist_width = get(g:, 'simpletree_persist_width', 1)
 g:simpletree_width_state_file = get(g:, 'simpletree_width_state_file', DefaultWidthStateFile())
-g:simpletree_width = LoadPersistedWidth(get(g:, 'simpletree_width', 45))
+g:simpletree_width = LoadPersistedWidth(ClampNumber(get(g:, 'simpletree_width', 45), 45, 10, 500))
 s_last_persisted_width = g:simpletree_width
 g:simpletree_hide_dotfiles = get(g:, 'simpletree_hide_dotfiles', 1)
 # 是否启用 gitignore 过滤（默认开启；关闭后可看到被 git 忽略的文件）
 g:simpletree_git_ignore = get(g:, 'simpletree_git_ignore', 1)
-g:simpletree_page = get(g:, 'simpletree_page', 200)
+# 后端也会执行同样的边界检查；前端先钳制可避免无效配置进入协议。
+g:simpletree_page = ClampNumber(get(g:, 'simpletree_page', 200), 200, 1, 1000)
 # 打开文件后保持焦点在文件缓冲区
 g:simpletree_keep_focus = get(g:, 'simpletree_keep_focus', 1)
 g:simpletree_debug = get(g:, 'simpletree_debug', 0)
@@ -133,8 +141,12 @@ g:simpletree_collapse_all_key = get(g:, 'simpletree_collapse_all_key', 'z')
 g:simpletree_choose_window = get(g:, 'simpletree_choose_window', 1)
 g:simpletree_split_force_right = get(g:, 'simpletree_split_force_right', 1)
 g:simpletree_use_system_copy = get(g:, 'simpletree_use_system_copy', 0)
+# y/Y 始终写入 Vim 无名寄存器；开启后还会尝试 + 寄存器或系统剪贴板工具。
+g:simpletree_use_system_clipboard = get(g:, 'simpletree_use_system_clipboard', 1)
 # 在目标窗口做水平分屏时是否放到下方（默认 1）。若为 0 则遵循 &splitbelow 或传统行为。
 g:simpletree_split_below = get(g:, 'simpletree_split_below', 1)
+# 仅在目标按键尚未被用户占用时安装 <leader>e。
+g:simpletree_set_default_mapping = get(g:, 'simpletree_set_default_mapping', 1)
 
 # ---------------- 命令与映射 ----------------
 command! -nargs=? -complete=dir SimpleTree simpletree#Toggle(<q-args>)
@@ -142,8 +154,12 @@ command! SimpleTreeRefresh simpletree#Refresh()
 command! SimpleTreeClose simpletree#Close()
 command! SimpleTreeDebug call simpletree#DebugStatus()
 command! SimpleTreeReveal simpletree#OnRevealActive()
+command! SimpleTreeHealth simpletree#Health()
 
-nnoremap <silent> <leader>e <Cmd>SimpleTree<CR>
+nnoremap <silent> <Plug>(simpletree-toggle) <Cmd>SimpleTree<CR>
+if g:simpletree_set_default_mapping && maparg('<leader>e', 'n') ==# ''
+  nmap <silent> <leader>e <Plug>(simpletree-toggle)
+endif
 
 # ---------------- 自动命令 ----------------
 augroup SimpleTreeBackend

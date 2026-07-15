@@ -1,12 +1,24 @@
-use anyhow::Result;
+use anyhow::{Context, Result, anyhow, bail};
 use ignore::WalkBuilder;
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, path::PathBuf, sync::Arc};
+use std::{
+    cmp::Ordering,
+    collections::HashMap,
+    fs,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
-    sync::Mutex,
+    sync::{Mutex, mpsc},
+    task::{JoinError, JoinSet},
 };
 use tokio_util::sync::CancellationToken;
+
+const DEFAULT_PAGE_SIZE: usize = 200;
+const MAX_PAGE_SIZE: usize = 1_000;
+const MAX_ACTIVE_REQUESTS: usize = 64;
+const OUTPUT_CHANNEL_CAPACITY: usize = 32;
 
 macro_rules! debug_log {
     ($($arg:tt)*) => {
@@ -35,11 +47,15 @@ enum Request {
 }
 
 fn default_page() -> usize {
-    200
+    DEFAULT_PAGE_SIZE
 }
 
 fn default_git_ignore() -> bool {
     true
+}
+
+fn normalize_page(page: usize) -> usize {
+    page.clamp(1, MAX_PAGE_SIZE)
 }
 
 #[derive(Debug, Serialize)]
@@ -62,21 +78,60 @@ struct Entry {
     is_dir: bool,
 }
 
-/// 专用 stdout 写入者：通过 mpsc channel 串行化所有输出，避免 Mutex 争用
-async fn stdout_writer(mut rx: tokio::sync::mpsc::Receiver<String>) {
-    let mut out = tokio::io::stdout();
-    while let Some(line) = rx.recv().await {
-        if out.write_all(line.as_bytes()).await.is_err() {
-            break;
-        }
-        if out.write_all(b"\n").await.is_err() {
-            break;
-        }
-        let _ = out.flush().await;
+#[derive(Clone)]
+struct ActiveRequest {
+    generation: u64,
+    cancel: CancellationToken,
+}
+
+type ActiveRequests = Arc<Mutex<HashMap<u64, ActiveRequest>>>;
+type EventTx = mpsc::Sender<String>;
+
+/// Replace an active request with the same ID and cancel the superseded work.
+/// Returns false only when a new ID would exceed the active-request limit.
+fn activate_request(
+    requests: &mut HashMap<u64, ActiveRequest>,
+    id: u64,
+    generation: u64,
+    cancel: CancellationToken,
+) -> bool {
+    if !requests.contains_key(&id) && requests.len() >= MAX_ACTIVE_REQUESTS {
+        return false;
+    }
+
+    if let Some(previous) = requests.insert(id, ActiveRequest { generation, cancel }) {
+        previous.cancel.cancel();
+    }
+    true
+}
+
+/// A superseded task must not remove the newer request that reused its ID.
+fn remove_active_if_generation(
+    requests: &mut HashMap<u64, ActiveRequest>,
+    id: u64,
+    generation: u64,
+) -> bool {
+    if requests
+        .get(&id)
+        .is_some_and(|active| active.generation == generation)
+    {
+        requests.remove(&id);
+        true
+    } else {
+        false
     }
 }
 
-type EventTx = tokio::sync::mpsc::Sender<String>;
+/// Serialize all stdout writes so protocol records can never interleave.
+async fn stdout_writer(mut rx: mpsc::Receiver<String>) -> std::io::Result<()> {
+    let mut out = tokio::io::stdout();
+    while let Some(line) = rx.recv().await {
+        out.write_all(line.as_bytes()).await?;
+        out.write_all(b"\n").await?;
+        out.flush().await?;
+    }
+    Ok(())
+}
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
@@ -84,86 +139,175 @@ async fn main() -> Result<()> {
     let mut lines = stdin.lines();
     debug_log!("start");
 
-    // stdout 写入 channel（容量足够大避免阻塞扫描任务）
-    let (out_tx, out_rx) = tokio::sync::mpsc::channel::<String>(4096);
-    tokio::spawn(stdout_writer(out_rx));
+    // A small bounded queue provides backpressure when the editor is slow.
+    let (out_tx, out_rx) = mpsc::channel::<String>(OUTPUT_CHANNEL_CAPACITY);
+    let writer = tokio::spawn(stdout_writer(out_rx));
 
-    // 任务取消表：id -> token
-    let cancels: Arc<Mutex<HashMap<u64, CancellationToken>>> =
-        Arc::new(Mutex::new(HashMap::new()));
+    let active: ActiveRequests = Arc::new(Mutex::new(HashMap::new()));
+    let mut tasks: JoinSet<Result<()>> = JoinSet::new();
+    let mut next_generation = 0_u64;
 
-    while let Some(line) = lines.next_line().await? {
-        if line.trim().is_empty() {
-            continue;
-        }
-        debug_log!("REQ LINE: {line}");
-        let req = match serde_json::from_str::<Request>(&line) {
-            Ok(r) => r,
-            Err(e) => {
-                debug_log!("REQ PARSE ERR: {e}");
-                send_event(
-                    &out_tx,
-                    &Event::Error {
-                        id: 0,
-                        message: format!("invalid request: {e}"),
-                    },
-                )
-                .await;
-                continue;
+    loop {
+        tokio::select! {
+            completed = tasks.join_next(), if !tasks.is_empty() => {
+                if let Some(completed) = completed {
+                    finish_request_task(completed)?;
+                }
             }
-        };
-        debug_log!("REQ DECODED: {:?}", req);
-
-        match req {
-            Request::List {
-                id,
-                path,
-                show_hidden,
-                git_ignore,
-                max,
-            } => {
-                let path = PathBuf::from(path);
-                let tx = out_tx.clone();
-                let cancels_clone = cancels.clone();
-
-                // 建立取消 token
-                let token = CancellationToken::new();
-                {
-                    let mut map = cancels.lock().await;
-                    map.insert(id, token.clone());
+            line = lines.next_line() => {
+                let Some(line) = line? else {
+                    break;
+                };
+                if line.trim().is_empty() {
+                    continue;
                 }
 
-                tokio::spawn(async move {
-                    let res =
-                        handle_list(id, path, show_hidden, git_ignore, max, tx.clone(), token.clone()).await;
-                    if let Err(e) = res {
+                debug_log!("REQ LINE: {line}");
+                let req = match serde_json::from_str::<Request>(&line) {
+                    Ok(request) => request,
+                    Err(error) => {
+                        debug_log!("REQ PARSE ERR: {error}");
                         send_event(
-                            &tx,
+                            &out_tx,
                             &Event::Error {
-                                id,
-                                message: e.to_string(),
+                                id: best_effort_request_id(&line),
+                                message: format!("invalid request: {error}"),
                             },
                         )
-                        .await;
+                        .await?;
+                        continue;
                     }
-                    // 结束后移除取消 token
-                    let mut map = cancels_clone.lock().await;
-                    map.remove(&id);
-                });
-            }
-            Request::Cancel { id } => {
-                let maybe = {
-                    let map = cancels.lock().await;
-                    map.get(&id).cloned()
                 };
-                if let Some(tok) = maybe {
-                    tok.cancel();
+                debug_log!("REQ DECODED: {req:?}");
+
+                match req {
+                    Request::List {
+                        id,
+                        path,
+                        show_hidden,
+                        git_ignore,
+                        max,
+                    } => {
+                        next_generation = next_generation.wrapping_add(1);
+                        if next_generation == 0 {
+                            next_generation = 1;
+                        }
+                        let generation = next_generation;
+                        let cancel = CancellationToken::new();
+                        let accepted = {
+                            let mut requests = active.lock().await;
+                            activate_request(
+                                &mut requests,
+                                id,
+                                generation,
+                                cancel.clone(),
+                            )
+                        };
+
+                        if !accepted {
+                            send_event(
+                                &out_tx,
+                                &Event::Error {
+                                    id,
+                                    message: format!(
+                                        "too many active requests (limit {MAX_ACTIVE_REQUESTS})"
+                                    ),
+                                },
+                            )
+                            .await?;
+                            continue;
+                        }
+
+                        tasks.spawn(run_list_request(
+                            id,
+                            generation,
+                            PathBuf::from(path),
+                            show_hidden,
+                            git_ignore,
+                            normalize_page(max),
+                            out_tx.clone(),
+                            cancel,
+                            active.clone(),
+                        ));
+                    }
+                    Request::Cancel { id } => {
+                        let cancel = {
+                            let requests = active.lock().await;
+                            requests.get(&id).map(|request| request.cancel.clone())
+                        };
+                        if let Some(cancel) = cancel {
+                            cancel.cancel();
+                        }
+                    }
                 }
             }
         }
     }
 
+    // EOF means no more requests, but accepted requests and queued protocol
+    // records must finish before the process exits.
+    while let Some(completed) = tasks.join_next().await {
+        finish_request_task(completed)?;
+    }
+    drop(out_tx);
+    writer.await.context("stdout writer task failed")??;
     Ok(())
+}
+
+fn finish_request_task(completed: std::result::Result<Result<()>, JoinError>) -> Result<()> {
+    completed.context("request task failed")??;
+    Ok(())
+}
+
+fn best_effort_request_id(line: &str) -> u64 {
+    serde_json::from_str::<serde_json::Value>(line)
+        .ok()
+        .and_then(|value| value.get("id").and_then(serde_json::Value::as_u64))
+        .unwrap_or(0)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_list_request(
+    id: u64,
+    generation: u64,
+    path: PathBuf,
+    show_hidden: bool,
+    git_ignore: bool,
+    page: usize,
+    out: EventTx,
+    cancel: CancellationToken,
+    active: ActiveRequests,
+) -> Result<()> {
+    let result = handle_list(
+        id,
+        path,
+        show_hidden,
+        git_ignore,
+        page,
+        out.clone(),
+        cancel.clone(),
+    )
+    .await;
+
+    let delivery = match result {
+        Ok(()) => Ok(()),
+        Err(_) if cancel.is_cancelled() => Ok(()),
+        Err(error) => {
+            let event = Event::Error {
+                id,
+                message: error.to_string(),
+            };
+            send_event_unless_cancelled(&out, &event, &cancel)
+                .await
+                .map(|_| ())
+        }
+    };
+
+    {
+        let mut requests = active.lock().await;
+        remove_active_if_generation(&mut requests, id, generation);
+    }
+    delivery
 }
 
 async fn handle_list(
@@ -175,105 +319,199 @@ async fn handle_list(
     out: EventTx,
     cancel: CancellationToken,
 ) -> Result<()> {
-    debug_log!("handle_list start id={id} path={:?}", path);
-    let cancel_clone = cancel.clone();
-    let scan_path = path.clone();
-
-    // 在阻塞线程中完成扫描 + 排序，避免 channel 开销
-    let mut entries: Vec<Entry> = tokio::task::spawn_blocking(move || {
-        let mut wb = WalkBuilder::new(&scan_path);
-        wb.follow_links(false)
-            .hidden(!show_hidden)
-            .git_ignore(git_ignore)
-            .git_global(git_ignore)
-            .git_exclude(git_ignore)
-            .parents(git_ignore)
-            .max_depth(Some(1));
-        let walker = wb.build();
-
-        let mut keyed: Vec<(String, Entry)> = Vec::with_capacity(512);
-        for dent in walker {
-            if cancel_clone.is_cancelled() {
-                return keyed.into_iter().map(|(_, e)| e).collect();
-            }
-            match dent {
-                Ok(d) => {
-                    if d.depth() == 0 {
-                        continue;
-                    }
-                    let p = d.path().to_path_buf();
-                    if let Some(name) = p.file_name().and_then(|s| s.to_str()) {
-                        let is_dir = d
-                            .metadata()
-                            .map(|m| m.is_dir())
-                            .unwrap_or_else(|_| p.is_dir());
-                        let sort_key = name.to_lowercase();
-                        keyed.push((sort_key, Entry {
-                            name: name.to_string(),
-                            path: p.to_string_lossy().into_owned(),
-                            is_dir,
-                        }));
-                    }
-                }
-                Err(_) => {}
-            }
-        }
-
-        // 目录优先 + 名称不区分大小写排序（预计算 sort key，避免重复分配）
-        keyed.sort_by(|a, b| match (a.1.is_dir, b.1.is_dir) {
-            (true, false) => std::cmp::Ordering::Less,
-            (false, true) => std::cmp::Ordering::Greater,
-            _ => a.0.cmp(&b.0),
-        });
-        keyed.into_iter().map(|(_, e)| e).collect()
+    debug_log!("handle_list start id={id} path={path:?}");
+    let scan_cancel = cancel.clone();
+    let entries = tokio::task::spawn_blocking(move || {
+        scan_directory(&path, show_hidden, git_ignore, &scan_cancel)
     })
-    .await?;
+    .await
+    .context("directory scanner task failed")??;
 
     debug_log!("handle_list done id={id} entries={}", entries.len());
-
     if cancel.is_cancelled() {
         return Ok(());
     }
 
-    // 分块输出
+    emit_entries(id, entries, page, &out, &cancel).await
+}
+
+fn scan_directory(
+    path: &Path,
+    show_hidden: bool,
+    git_ignore: bool,
+    cancel: &CancellationToken,
+) -> Result<Vec<Entry>> {
+    let metadata = fs::metadata(path)
+        .with_context(|| format!("failed to inspect directory: {}", path.display()))?;
+    if !metadata.is_dir() {
+        bail!("not a directory: {}", path.display());
+    }
+    fs::read_dir(path).with_context(|| format!("failed to read directory: {}", path.display()))?;
+
+    let mut builder = WalkBuilder::new(path);
+    builder
+        .follow_links(false)
+        .hidden(!show_hidden)
+        .git_ignore(git_ignore)
+        .git_global(git_ignore)
+        .git_exclude(git_ignore)
+        .parents(git_ignore)
+        .max_depth(Some(1));
+
+    let mut entries = Vec::new();
+    for dent in builder.build() {
+        if cancel.is_cancelled() {
+            return Ok(Vec::new());
+        }
+
+        let dent =
+            dent.map_err(|error| anyhow!("failed to scan directory {}: {error}", path.display()))?;
+        if dent.depth() == 0 {
+            continue;
+        }
+
+        let entry_path = dent.path().to_path_buf();
+        let Some(name) = entry_path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        let is_dir = fs::metadata(&entry_path).is_ok_and(|metadata| metadata.is_dir());
+        entries.push(Entry {
+            name: name.to_owned(),
+            path: entry_path.to_string_lossy().into_owned(),
+            is_dir,
+        });
+    }
+
+    Ok(sort_entries(entries))
+}
+
+fn sort_entries(entries: Vec<Entry>) -> Vec<Entry> {
+    let mut keyed: Vec<(String, Entry)> = entries
+        .into_iter()
+        .map(|entry| (entry.name.to_lowercase(), entry))
+        .collect();
+
+    keyed.sort_unstable_by(compare_keyed_entries);
+    keyed.into_iter().map(|(_, entry)| entry).collect()
+}
+
+fn compare_keyed_entries(left: &(String, Entry), right: &(String, Entry)) -> Ordering {
+    right
+        .1
+        .is_dir
+        .cmp(&left.1.is_dir)
+        .then_with(|| left.0.cmp(&right.0))
+        .then_with(|| left.1.name.cmp(&right.1.name))
+        .then_with(|| left.1.path.cmp(&right.1.path))
+}
+
+async fn emit_entries(
+    id: u64,
+    entries: Vec<Entry>,
+    page: usize,
+    out: &EventTx,
+    cancel: &CancellationToken,
+) -> Result<()> {
+    let page = normalize_page(page);
     if entries.is_empty() {
-        send_event(
-            &out,
-            &Event::ListChunk {
-                id,
-                entries: vec![],
-                done: true,
-            },
-        )
-        .await;
+        let event = Event::ListChunk {
+            id,
+            entries: Vec::new(),
+            done: true,
+        };
+        send_event_unless_cancelled(out, &event, cancel).await?;
         return Ok(());
     }
 
-    let total = entries.len();
-    let mut i = 0usize;
-    while i < total {
-        if cancel.is_cancelled() {
+    // Consuming the vector through IntoIter avoids the quadratic prefix shifts
+    // caused by repeatedly draining from the front.
+    let mut entries = entries.into_iter();
+    while !entries.as_slice().is_empty() {
+        let remaining = entries.len();
+        let chunk: Vec<Entry> = entries.by_ref().take(page).collect();
+        let event = Event::ListChunk {
+            id,
+            done: chunk.len() == remaining,
+            entries: chunk,
+        };
+        if !send_event_unless_cancelled(out, &event, cancel).await? {
             break;
         }
-        let end = (i + page).min(total);
-        let done = end >= total;
-        // drain 从前端取走所有权，避免 to_vec() 克隆
-        let chunk: Vec<Entry> = entries.drain(..end - i).collect();
-        i = end;
-        send_event(
-            &out,
-            &Event::ListChunk {
-                id,
-                entries: chunk,
-                done,
-            },
-        )
-        .await;
     }
     Ok(())
 }
 
-async fn send_event(out: &EventTx, evt: &Event) {
-    let line = serde_json::to_string(evt).unwrap();
-    let _ = out.send(line).await;
+async fn send_event_unless_cancelled(
+    out: &EventTx,
+    event: &Event,
+    cancel: &CancellationToken,
+) -> Result<bool> {
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => Ok(false),
+        result = send_event(out, event) => {
+            result?;
+            Ok(true)
+        }
+    }
+}
+
+async fn send_event(out: &EventTx, event: &Event) -> Result<()> {
+    let line = serde_json::to_string(event).context("failed to serialize protocol event")?;
+    out.send(line)
+        .await
+        .map_err(|_| anyhow!("stdout writer stopped"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(name: &str, is_dir: bool) -> Entry {
+        Entry {
+            name: name.to_owned(),
+            path: format!("/tmp/{name}"),
+            is_dir,
+        }
+    }
+
+    #[test]
+    fn page_size_is_always_bounded_and_nonzero() {
+        assert_eq!(normalize_page(0), 1);
+        assert_eq!(normalize_page(1), 1);
+        assert_eq!(normalize_page(DEFAULT_PAGE_SIZE), DEFAULT_PAGE_SIZE);
+        assert_eq!(normalize_page(usize::MAX), MAX_PAGE_SIZE);
+    }
+
+    #[test]
+    fn sorting_is_directory_first_case_insensitive_and_deterministic() {
+        let entries = vec![
+            entry("b", false),
+            entry("a", false),
+            entry("A", false),
+            entry("z", true),
+            entry("Z", true),
+        ];
+        let entries = sort_entries(entries);
+
+        let names: Vec<_> = entries.iter().map(|entry| entry.name.as_str()).collect();
+        assert_eq!(names, ["Z", "z", "A", "a", "b"]);
+    }
+
+    #[test]
+    fn replacing_an_id_cancels_old_work_and_old_cleanup_is_safe() {
+        let mut requests = HashMap::new();
+        let old_cancel = CancellationToken::new();
+        let new_cancel = CancellationToken::new();
+
+        assert!(activate_request(&mut requests, 7, 1, old_cancel.clone()));
+        assert!(activate_request(&mut requests, 7, 2, new_cancel.clone()));
+        assert!(old_cancel.is_cancelled());
+        assert!(!new_cancel.is_cancelled());
+
+        assert!(!remove_active_if_generation(&mut requests, 7, 1));
+        assert_eq!(requests.get(&7).map(|active| active.generation), Some(2));
+        assert!(remove_active_if_generation(&mut requests, 7, 2));
+        assert!(!requests.contains_key(&7));
+    }
 }

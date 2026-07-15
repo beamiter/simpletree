@@ -1,0 +1,464 @@
+*simpletree.txt*        Asynchronous file tree for Vim 9
+
+==============================================================================
+CONTENTS                                                *simpletree-contents*
+
+1. Introduction........................................|simpletree|
+2. Requirements........................................|simpletree-requirements|
+3. Installation........................................|simpletree-install|
+4. Commands............................................|simpletree-commands|
+5. Mappings............................................|simpletree-mappings|
+6. Options.............................................|simpletree-options|
+7. Width persistence...................................|simpletree-width-state|
+8. File-operation semantics............................|simpletree-safety|
+9. Troubleshooting.....................................|simpletree-troubleshooting|
+
+==============================================================================
+1. INTRODUCTION                                             *simpletree*
+
+SimpleTree is a Vim 9 file tree backed by an asynchronous Rust directory
+scanner.  It provides a collapsible workspace root, active-file reveal,
+modified-buffer marks, path-stable selection, editor-window reuse, and file
+operations.
+
+The user interface and messages are currently primarily Chinese.  SimpleTree
+uses Vim9 script and does not support Neovim.
+
+==============================================================================
+2. REQUIREMENTS                              *simpletree-requirements*
+
+- Vim 9.0 or newer.
+- Vim must include +job, +channel, and +float.
+- Rust 1.85 or newer and Cargo are needed to build the backend.
+- install.sh requires Bash and currently targets Bash environments such as
+  Linux and macOS.
+- A Nerd Font is optional.  See |g:simpletree_use_nerdfont|.
+- A trash provider is optional: "gio trash" or "trash-put" on Linux, and
+  "trash" on macOS.
+
+Check the required Vim features with: >
+
+  :echo has('job')
+  :echo has('channel')
+  :echo has('float')
+<
+All three values must be 1.
+
+The native Windows installer is not currently covered.  A manually built
+backend may be selected with |g:simpletree_daemon_path|, but that installation
+path is not currently validated.
+
+==============================================================================
+3. INSTALLATION                                  *simpletree-install*
+
+VIM-PLUG ~
+
+Use the build hook so the Rust backend is compiled after installation and
+updates: >
+
+  call plug#begin()
+  Plug 'beamiter/simpletree', { 'do': './install.sh' }
+  call plug#end()
+<
+Then run: >
+
+  :PlugInstall
+<
+Use :PlugUpdate for later updates.
+
+VIM NATIVE PACKAGE ~
+>
+  git clone https://github.com/beamiter/simpletree.git \
+    ~/.vim/pack/plugins/start/simpletree
+  ~/.vim/pack/plugins/start/simpletree/install.sh
+<
+install.sh resolves the repository from its own location.  It can be invoked
+from any current directory.  It uses the committed Cargo.lock, pins a native
+Rust target and an in-repository target directory, builds a release backend,
+and replaces only lib/simpletree-daemon; it does not remove other contents of
+lib/.
+
+The plugin directory must be on 'runtimepath'.  SimpleTree searches each entry
+under lib/ first, then target/release/ and target/debug/ for development use.
+
+==============================================================================
+4. COMMANDS                                      *simpletree-commands*
+
+                                                    *:SimpleTree*
+:SimpleTree [directory]
+        Open or close the tree.  When opening, an optional directory becomes
+        the root.
+        Without an argument, an existing locked root is reused.  Otherwise the
+        current file's directory is used, falling back to Vim's current
+        working directory.
+
+                                                    *:SimpleTreeRefresh*
+:SimpleTreeRefresh
+        Clear the tree cache and rescan.
+
+                                                    *:SimpleTreeReveal*
+:SimpleTreeReveal
+        Reveal the current active file inside the existing root.
+
+                                                    *:SimpleTreeClose*
+:SimpleTreeClose
+        Close the tree window.
+
+                                                    *:SimpleTreeDebug*
+:SimpleTreeDebug
+        Print the current root, window, backend, pending-request, and cache
+        state.
+
+                                                    *:SimpleTreeHealth*
+:SimpleTreeHealth
+        Check required Vim features, normalized configuration ranges, and the
+        configured or discovered backend executable.  Also report detected
+        trash and system-clipboard providers.
+
+==============================================================================
+5. MAPPINGS                                      *simpletree-mappings*
+
+GLOBAL MAPPING ~
+
+SimpleTree defines:                               *<Plug>(simpletree-toggle)*
+>
+  <Plug>(simpletree-toggle)
+<
+By default <Leader>e maps to this <Plug> target only when the key is currently
+unused and |g:simpletree_set_default_mapping| is enabled.
+
+To choose another mapping: >
+
+  let g:simpletree_set_default_mapping = 0
+  nmap <silent> <leader>n <Plug>(simpletree-toggle)
+<
+TREE-BUFFER MAPPINGS ~
+
+<CR>, o, double-click
+        Open a file or toggle a directory.
+
+l, Right
+        Expand a directory and enter its first child; open a file.
+
+h, Left, <BS>
+        Collapse the current directory or nearest expanded ancestor.
+
+R       Refresh.
+H       Toggle dotfiles.
+I       Toggle Git ignore filtering.
+q       Close the tree.
+
+e       Use the selected directory as root; a file uses its parent.
+U       Move the root up one directory.
+C       Prompt for a root directory.
+.       Use Vim's current working directory as root.
+d       Use the active file's directory as root.
+L       Toggle root locking.
+
+c       Copy the selected path to SimpleTree's file clipboard.
+x       Cut the selected path.
+p       Paste into the selected directory, or a selected file's parent.
+a, n    Create a file.
+A, N    Create a directory.
+r       Rename.
+D       Delete, preferring the system trash when available.
+
+P       Preview while keeping tree focus.
+V, <C-V>
+        Open in a vertical split.
+S, <C-X>
+        Open in a horizontal split.
+t, <C-T>
+        Open in a new tab.
+f       Reveal the active file.
+y       Copy the basename to Vim's unnamed register and optionally the system
+        clipboard.
+Y       Copy the absolute path to Vim's unnamed register and optionally the
+        system clipboard.
+gx      Open with the system default application.
+z       Collapse all directories below the root.  This key is configurable
+        with |g:simpletree_collapse_all_key|.
+?       Toggle the mapping help window.
+
+The root is locked by default.  Press L before e, U, C, . or d when root
+changes are needed.
+
+==============================================================================
+6. OPTIONS                                        *simpletree-options*
+
+Set options before plugin/simpletree.vim is loaded.  Boolean options use 0 or
+1.
+
+TREE, ROOT, AND REFRESH ~
+
+                                            *g:simpletree_width*
+g:simpletree_width
+        Number, default 45.  Requested tree width.  Values are clamped to
+        10..500 when loaded.
+
+                                            *g:simpletree_persist_width*
+g:simpletree_persist_width
+        Boolean, default 1.  Persist manually adjusted tree width.
+
+                                            *g:simpletree_width_state_file*
+g:simpletree_width_state_file
+        String.  Width-state path.  See |simpletree-width-state|.
+
+                                            *g:simpletree_show_root*
+g:simpletree_show_root
+        Boolean, default 1.  Display a collapsible workspace-root row.
+
+                                            *g:simpletree_root_locked*
+g:simpletree_root_locked
+        Boolean, default 1.  Set the initial root-lock state.
+
+                                            *g:simpletree_hide_dotfiles*
+g:simpletree_hide_dotfiles
+        Boolean, default 1.  Hide dotfiles.
+
+                                            *g:simpletree_git_ignore*
+g:simpletree_git_ignore
+        Boolean, default 1.  Follow Git ignore rules.
+
+                                            *g:simpletree_page*
+g:simpletree_page
+        Number, default 200.  Entries per backend response chunk.  Values are
+        clamped to 1..1000 when loaded.
+
+                                            *g:simpletree_auto_follow*
+g:simpletree_auto_follow
+        Boolean, default 1.  Reveal an ordinary file buffer entered in Vim.
+
+                                  *g:simpletree_auto_follow_change_root*
+g:simpletree_auto_follow_change_root
+        Boolean, default 0.  When an active file lies outside the tree root,
+        change the root to that file's directory.  A locked root prevents this.
+
+                                            *g:simpletree_auto_refresh*
+g:simpletree_auto_refresh
+        Boolean, default 1.  Check expanded directories when Vim gains focus
+        or becomes idle.
+
+OPENING FILES AND WINDOWS ~
+
+                                            *g:simpletree_keep_focus*
+g:simpletree_keep_focus
+        Boolean, default 1.  Keep focus in the opened file.  Set to 0 to return
+        focus to the tree.
+
+                                            *g:simpletree_choose_window*
+g:simpletree_choose_window
+        Boolean, default 1.  Prompt when several editor windows are candidates
+        and no recent target can be reused.
+
+                                            *g:simpletree_split_force_right*
+g:simpletree_split_force_right
+        Boolean, default 1.  Put a newly created vertical editor split on the
+        right.
+
+                                            *g:simpletree_split_below*
+g:simpletree_split_below
+        Boolean, default 1.  Put a horizontal split below its target window.
+
+                                            *g:simpletree_open_on_create*
+g:simpletree_open_on_create
+        Boolean, default 1.  Open a newly created file in the editor.
+
+DISPLAY AND ICONS ~
+
+                                            *g:simpletree_show_modified*
+g:simpletree_show_modified
+        Boolean, default 1.  Mark modified, unsaved buffers.
+
+                                            *g:simpletree_modified_symbol*
+g:simpletree_modified_symbol
+        String, default '●'.  Modified-buffer marker.
+
+                                            *g:simpletree_use_nerdfont*
+g:simpletree_use_nerdfont
+        Boolean, default 1.  Use Nerd Font glyphs.
+
+                                            *g:simpletree_show_file_icons*
+g:simpletree_show_file_icons
+        Boolean, default 1.  Display an icon based on file extension.
+
+                                            *g:simpletree_folder_suffix*
+g:simpletree_folder_suffix
+        Boolean, default 1.  Display a slash suffix on directory names.
+
+                                            *g:simpletree_icons*
+g:simpletree_icons
+        Dictionary, default {}.  Override any of: dir, dir_open, file, loading.
+
+                                            *g:simpletree_file_icon_map*
+g:simpletree_file_icon_map
+        Dictionary, default {}.  Override file icons by lowercase extension
+        without a leading dot.
+
+                                            *g:simpletree_collapse_all_key*
+g:simpletree_collapse_all_key
+        String, default 'z'.  Tree-buffer key for collapsing every directory
+        below the root.
+
+FILE OPERATIONS, BACKEND, AND DIAGNOSTICS ~
+
+                                            *g:simpletree_use_trash*
+g:simpletree_use_trash
+        Boolean, default 1.  Prefer a supported system trash command.
+
+                                            *g:simpletree_use_system_copy*
+g:simpletree_use_system_copy
+        Boolean, default 0.  For ordinary files, try an operating-system copy
+        command first, then fall back to Vim.  Symbolic links use the special
+        safety rules in |simpletree-safety|.
+
+                                    *g:simpletree_use_system_clipboard*
+g:simpletree_use_system_clipboard
+        Boolean, default 1.  After y or Y writes Vim's unnamed register, also
+        try the + register or wl-copy, xclip, xsel, pbcopy, or clip.exe.
+
+                                            *g:simpletree_daemon_path*
+g:simpletree_daemon_path
+        String, default ''.  Absolute backend path.  Empty means search
+        runtimepath entries under lib/, target/release/, and target/debug/.
+
+                                            *g:simpletree_debug*
+g:simpletree_debug
+        Boolean, default 0.  Emit additional messages visible through
+        :messages.
+
+                                            *g:simpletree_set_default_mapping*
+g:simpletree_set_default_mapping
+        Boolean, default 1.  Install <Leader>e only when it is unused.
+
+Example: >
+
+  let g:simpletree_width = 36
+  let g:simpletree_use_nerdfont = 0
+  let g:simpletree_root_locked = 0
+  let g:simpletree_set_default_mapping = 0
+<
+==============================================================================
+7. WIDTH PERSISTENCE                       *simpletree-width-state*
+
+When |g:simpletree_persist_width| is enabled, widths adjusted through <C-W><,
+<C-W>>, or the mouse are restored after refresh, reopening the tree, and a Vim
+restart.
+
+Default paths:
+
+- $XDG_STATE_HOME/simpletree/width when $XDG_STATE_HOME is set.
+- ~/.local/state/simpletree/width on Unix otherwise.
+- ~/vimfiles/simpletree/width on Windows otherwise.
+
+To disable persistence or choose another file: >
+
+  let g:simpletree_persist_width = 0
+  let g:simpletree_width_state_file = expand('~/.vim/simpletree-width')
+<
+==============================================================================
+8. FILE-OPERATION SEMANTICS                       *simpletree-safety*
+
+- The workspace root cannot be cut, renamed, or deleted from the tree.
+- Nested create names must remain relative to the selected destination.
+  Rename accepts only one safe leaf name.  Absolute paths, ".", "..", path
+  separators, empty path segments, and traversal are rejected.
+- A directory cannot be pasted into itself or its descendants.  This check
+  uses resolved paths, including symbolic links.
+- Write targets, rename, and delete are constrained by the resolved workspace
+  root.  A directory link outside the root may be displayed, but cannot be a
+  create/paste target and its children cannot be renamed or deleted through
+  SimpleTree.  The link node itself can still be copied, moved, renamed, or
+  deleted.
+- On Unix, copying a symbolic link forces cp -a so the link itself is
+  preserved even when |g:simpletree_use_system_copy| is off.  Without a safe
+  provider the operation is refused instead of dereferencing the link.  FIFO,
+  socket, and other special entries are also refused.
+- Delete always asks for confirmation.  A supported trash command is preferred.
+  If moving to trash fails, SimpleTree asks again before permanent deletion.
+- Copy first writes a sibling staging path.  Overwrite and atomic move first
+  rename the old target to a backup; a failed install attempts restoration and
+  reports any retained recovery path.
+- Cut prefers a same-filesystem atomic rename.  If atomic move is unavailable,
+  a complete copy is installed while the source and cut clipboard are retained
+  so concurrent source changes cannot be deleted.
+- Rename overwrite backs up the old target and attempts restoration on failure.
+  A backup that cannot be cleaned is reported with its retained path.
+- Unsaved buffers associated with the source, target, or directory subtree
+  prevent move, replace, rename, and delete until they are saved or discarded.
+- y and Y always write Vim's unnamed register.  System clipboard failure does
+  not invalidate that register.
+
+WARNING ~
+
+These protections reduce data-loss risk but are not a cross-platform
+transaction or crash-consistency guarantee.  If rollback, source cleanup, or
+backup cleanup fails, inspect the retained path named in the message before
+removing anything.  Run :wall before destructive operations and keep important
+files under version control or backed up.  SimpleTree does not currently
+provide undo for file operations.
+
+==============================================================================
+9. TROUBLESHOOTING                      *simpletree-troubleshooting*
+
+BACKEND NOT FOUND ~
+
+Run install.sh by absolute path; the current directory does not matter: >
+
+  /absolute/path/to/simpletree/install.sh
+<
+Then check: >
+
+  :echo executable('/absolute/path/to/simpletree/lib/simpletree-daemon')
+<
+The result should be 1.  A nonstandard backend can be selected before the
+plugin loads: >
+
+  let g:simpletree_daemon_path = '/absolute/path/to/simpletree-daemon'
+<
+Run |:SimpleTreeHealth| for environment and executable checks.  Use
+|:SimpleTreeDebug| for runtime state and :messages for message history.
+
+INLINE SCAN ERROR ~
+
+An inline "! message" row records a failed scan and pauses immediate retries
+for that directory.  Fix the path, permission, or backend problem, then press R
+or run |:SimpleTreeRefresh|.  A real directory-mtime change may also trigger an
+automatic retry.
+
+MISSING VIM FEATURES ~
+>
+  :echo v:version
+  :echo has('job')
+  :echo has('channel')
+  :echo has('float')
+<
+SimpleTree requires Vim 9, +job, +channel, and +float.  Neovim cannot run this
+Vim9 script plugin.
+
+BROKEN OR SQUARE ICONS ~
+>
+  let g:simpletree_use_nerdfont = 0
+<
+Set the option before the plugin loads.
+
+DELETE DOES NOT USE TRASH ~
+
+Install gio or trash-put on Linux, or trash on macOS.  When no provider exists,
+the confirmation prompt explicitly says that deletion is permanent.
+
+WIDTH IS NOT SAVED ~
+
+Check that the parent directory of |g:simpletree_width_state_file| is writable,
+choose another path, or disable |g:simpletree_persist_width|.
+
+DEFAULT MAPPING IS ABSENT ~
+
+SimpleTree does not replace an existing <Leader>e mapping.  Inspect it with: >
+
+  :nmap <leader>e
+<
+Then map |<Plug>(simpletree-toggle)| to another key if desired.
+
+==============================================================================
+vim:tw=78:ts=8:noet:ft=help:norl:
