@@ -19,8 +19,11 @@ tokio-util = "0.7.16"
 [dev-dependencies]
 tempfile = "3.23.0"
 
-[profile.release]
-opt-level = 3
-lto = true
-codegen-units = 1
-strip = true
+# Keep explicit release tuning disabled until benchmark data justifies it.
+# Cargo's default release profile is intentional; do not re-enable these
+# settings without measured startup, throughput, and binary-size results.
+# [profile.release]
+# opt-level = 3
+# lto = true
+# codegen-units = 1
+# strip = true
