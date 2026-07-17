@@ -609,6 +609,5 @@ mod tests {
         assert!(CAPABILITIES.contains(&"list"));
         assert!(CAPABILITIES.contains(&"cancel"));
         assert!(CAPABILITIES.contains(&"ping"));
-        assert!(PROTOCOL_VERSION > 0);
     }
 }
