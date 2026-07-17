@@ -52,7 +52,20 @@ jobs:
           if-no-files-found: ignore
 
       - name: Lint Rust
-        run: cargo clippy --locked --all-targets -- -D warnings
+        shell: bash
+        run: |
+          set +e
+          cargo clippy --locked --all-targets -- -D warnings 2>&1 | tee clippy.log
+          status=${PIPESTATUS[0]}
+          exit "$status"
+
+      - name: Upload Clippy log
+        if: failure() && hashFiles('clippy.log') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: clippy-log
+          path: clippy.log
+          if-no-files-found: ignore
 
       - name: Test Rust backend
         run: cargo test --locked --all-targets
