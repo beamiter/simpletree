@@ -7,10 +7,11 @@ use std::{
     fs,
     path::{Path, PathBuf},
     sync::Arc,
+    time::Instant,
 };
 use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
-    sync::{Mutex, mpsc},
+    io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter},
+    sync::{Mutex, Semaphore, mpsc},
     task::{JoinError, JoinSet},
 };
 use tokio_util::sync::CancellationToken;
@@ -18,7 +19,17 @@ use tokio_util::sync::CancellationToken;
 const DEFAULT_PAGE_SIZE: usize = 200;
 const MAX_PAGE_SIZE: usize = 1_000;
 const MAX_ACTIVE_REQUESTS: usize = 64;
-const OUTPUT_CHANNEL_CAPACITY: usize = 32;
+const MAX_CONCURRENT_SCANS: usize = 8;
+const OUTPUT_CHANNEL_CAPACITY: usize = 64;
+const PROTOCOL_VERSION: u32 = 1;
+const CAPABILITIES: &[&str] = &[
+    "list",
+    "cancel",
+    "ping",
+    "chunked-results",
+    "git-ignore",
+    "hidden-files",
+];
 
 macro_rules! debug_log {
     ($($arg:tt)*) => {
@@ -44,6 +55,8 @@ enum Request {
     },
     #[serde(rename = "cancel")]
     Cancel { id: u64 },
+    #[serde(rename = "ping")]
+    Ping { id: u64 },
 }
 
 fn default_page() -> usize {
@@ -69,6 +82,13 @@ enum Event {
     },
     #[serde(rename = "error")]
     Error { id: u64, message: String },
+    #[serde(rename = "pong")]
+    Pong {
+        id: u64,
+        protocol_version: u32,
+        daemon_version: &'static str,
+        capabilities: &'static [&'static str],
+    },
 }
 
 #[derive(Debug, Serialize)]
@@ -122,28 +142,64 @@ fn remove_active_if_generation(
     }
 }
 
-/// Serialize all stdout writes so protocol records can never interleave.
+fn handle_cli() -> Result<bool> {
+    let mut args = std::env::args().skip(1);
+    let Some(arg) = args.next() else {
+        return Ok(false);
+    };
+    if args.next().is_some() {
+        bail!("too many command-line arguments");
+    }
+
+    match arg.as_str() {
+        "--version" | "-V" => {
+            println!("simpletree-daemon {}", env!("CARGO_PKG_VERSION"));
+            Ok(true)
+        }
+        "--help" | "-h" => {
+            println!(
+                "simpletree-daemon {}\n\nUSAGE:\n    simpletree-daemon\n    simpletree-daemon --version\n\nThe default mode reads one JSON request per line from stdin and writes one JSON event per line to stdout.",
+                env!("CARGO_PKG_VERSION")
+            );
+            Ok(true)
+        }
+        _ => bail!("unknown command-line argument: {arg}"),
+    }
+}
+
+/// Serialize stdout writes and coalesce queued records into one flush.
 async fn stdout_writer(mut rx: mpsc::Receiver<String>) -> std::io::Result<()> {
-    let mut out = tokio::io::stdout();
+    let mut out = BufWriter::new(tokio::io::stdout());
     while let Some(line) = rx.recv().await {
         out.write_all(line.as_bytes()).await?;
         out.write_all(b"\n").await?;
+
+        while let Ok(line) = rx.try_recv() {
+            out.write_all(line.as_bytes()).await?;
+            out.write_all(b"\n").await?;
+        }
         out.flush().await?;
     }
-    Ok(())
+    out.flush().await
 }
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
+    if handle_cli()? {
+        return Ok(());
+    }
+
     let stdin = BufReader::new(tokio::io::stdin());
     let mut lines = stdin.lines();
     debug_log!("start");
 
-    // A small bounded queue provides backpressure when the editor is slow.
+    // A bounded queue provides backpressure when Vim is slow. The writer drains
+    // bursts before flushing so large directories do not pay one flush per page.
     let (out_tx, out_rx) = mpsc::channel::<String>(OUTPUT_CHANNEL_CAPACITY);
     let writer = tokio::spawn(stdout_writer(out_rx));
 
     let active: ActiveRequests = Arc::new(Mutex::new(HashMap::new()));
+    let scan_slots = Arc::new(Semaphore::new(MAX_CONCURRENT_SCANS));
     let mut tasks: JoinSet<Result<()>> = JoinSet::new();
     let mut next_generation = 0_u64;
 
@@ -181,6 +237,18 @@ async fn main() -> Result<()> {
                 debug_log!("REQ DECODED: {req:?}");
 
                 match req {
+                    Request::Ping { id } => {
+                        send_event(
+                            &out_tx,
+                            &Event::Pong {
+                                id,
+                                protocol_version: PROTOCOL_VERSION,
+                                daemon_version: env!("CARGO_PKG_VERSION"),
+                                capabilities: CAPABILITIES,
+                            },
+                        )
+                        .await?;
+                    }
                     Request::List {
                         id,
                         path,
@@ -228,6 +296,7 @@ async fn main() -> Result<()> {
                             out_tx.clone(),
                             cancel,
                             active.clone(),
+                            scan_slots.clone(),
                         ));
                     }
                     Request::Cancel { id } => {
@@ -244,8 +313,8 @@ async fn main() -> Result<()> {
         }
     }
 
-    // EOF means no more requests, but accepted requests and queued protocol
-    // records must finish before the process exits.
+    // EOF means no more requests, but accepted work and queued protocol records
+    // must finish before the process exits.
     while let Some(completed) = tasks.join_next().await {
         finish_request_task(completed)?;
     }
@@ -277,6 +346,7 @@ async fn run_list_request(
     out: EventTx,
     cancel: CancellationToken,
     active: ActiveRequests,
+    scan_slots: Arc<Semaphore>,
 ) -> Result<()> {
     let result = handle_list(
         id,
@@ -286,6 +356,7 @@ async fn run_list_request(
         page,
         out.clone(),
         cancel.clone(),
+        scan_slots,
     )
     .await;
 
@@ -310,6 +381,7 @@ async fn run_list_request(
     delivery
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_list(
     id: u64,
     path: PathBuf,
@@ -318,8 +390,16 @@ async fn handle_list(
     page: usize,
     out: EventTx,
     cancel: CancellationToken,
+    scan_slots: Arc<Semaphore>,
 ) -> Result<()> {
+    let _permit = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => return Ok(()),
+        permit = scan_slots.acquire_owned() => permit.context("directory scan limiter closed")?,
+    };
+
     debug_log!("handle_list start id={id} path={path:?}");
+    let started = Instant::now();
     let scan_cancel = cancel.clone();
     let entries = tokio::task::spawn_blocking(move || {
         scan_directory(&path, show_hidden, git_ignore, &scan_cancel)
@@ -327,7 +407,11 @@ async fn handle_list(
     .await
     .context("directory scanner task failed")??;
 
-    debug_log!("handle_list done id={id} entries={}", entries.len());
+    debug_log!(
+        "handle_list done id={id} entries={} elapsed_ms={}",
+        entries.len(),
+        started.elapsed().as_millis()
+    );
     if cancel.is_cancelled() {
         return Ok(());
     }
@@ -374,7 +458,14 @@ fn scan_directory(
         let Some(name) = entry_path.file_name().and_then(|name| name.to_str()) else {
             continue;
         };
-        let is_dir = fs::metadata(&entry_path).is_ok_and(|metadata| metadata.is_dir());
+        let is_dir = match dent.file_type() {
+            Some(kind) if kind.is_dir() => true,
+            Some(kind) if kind.is_symlink() => {
+                fs::metadata(&entry_path).is_ok_and(|metadata| metadata.is_dir())
+            }
+            Some(_) => false,
+            None => fs::metadata(&entry_path).is_ok_and(|metadata| metadata.is_dir()),
+        };
         entries.push(Entry {
             name: name.to_owned(),
             path: entry_path.to_string_lossy().into_owned(),
@@ -423,8 +514,6 @@ async fn emit_entries(
         return Ok(());
     }
 
-    // Consuming the vector through IntoIter avoids the quadratic prefix shifts
-    // caused by repeatedly draining from the front.
     let mut entries = entries.into_iter();
     while !entries.as_slice().is_empty() {
         let remaining = entries.len();
@@ -513,5 +602,13 @@ mod tests {
         assert_eq!(requests.get(&7).map(|active| active.generation), Some(2));
         assert!(remove_active_if_generation(&mut requests, 7, 2));
         assert!(!requests.contains_key(&7));
+    }
+
+    #[test]
+    fn capabilities_include_the_core_protocol_operations() {
+        assert!(CAPABILITIES.contains(&"list"));
+        assert!(CAPABILITIES.contains(&"cancel"));
+        assert!(CAPABILITIES.contains(&"ping"));
+        assert!(PROTOCOL_VERSION > 0);
     }
 }
