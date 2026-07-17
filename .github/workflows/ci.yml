@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: simpletree-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust 1.85
+        uses: dtolnay/rust-toolchain@1.85.0
+        with:
+          components: rustfmt, clippy
+
+      - name: Install Vim
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes vim
+
+      - name: Validate shell script
+        run: bash -n install.sh
+
+      - name: Check Rust formatting
+        run: cargo fmt --all -- --check
+
+      - name: Lint Rust
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Test Rust backend
+        run: cargo test --locked --all-targets
+
+      - name: Test Vim plugin load
+        run: vim -Nu NONE -n -es -X -i NONE -S tests/vim_smoke.vim
+
+      - name: Test Vim runtime controls
+        run: vim -Nu NONE -n -es -X -i NONE -S tests/vim_runtime_controls.vim
+
+      - name: Test Vim file operations
+        run: vim -Nu NONE -n -es -X -i NONE -S tests/vim_integration.vim
