@@ -38,6 +38,17 @@ BUILD_OUTPUT="$TARGET_DIR/$rustc_host/release/simpletree-daemon"
 cargo build --manifest-path "$MANIFEST" --release --locked \
   --target-dir "$TARGET_DIR" --target "$rustc_host"
 
+# Refuse to install an executable that cannot identify itself. This catches a
+# stale path or incomplete build before the currently installed daemon changes.
+if ! backend_version="$("$BUILD_OUTPUT" --version)"; then
+  echo "error: built SimpleTree backend failed its version check." >&2
+  exit 1
+fi
+if [[ "$backend_version" != simpletree-daemon* ]]; then
+  echo "error: unexpected backend version output: $backend_version" >&2
+  exit 1
+fi
+
 mkdir -p "$LIB_DIR"
 cleanup() {
   if [[ -n "$TEMP_DESTINATION" ]]; then
@@ -52,5 +63,5 @@ chmod 0755 "$TEMP_DESTINATION"
 mv -f "$TEMP_DESTINATION" "$DESTINATION"
 trap - EXIT
 
-echo "Installed SimpleTree backend to $DESTINATION"
+echo "Installed $backend_version to $DESTINATION"
 echo "Ensure $SCRIPT_DIR is on Vim's 'runtimepath'."
