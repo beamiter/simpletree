@@ -1,0 +1,80 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: simpletree-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust 1.85
+        uses: dtolnay/rust-toolchain@1.85.0
+        with:
+          components: rustfmt, clippy
+
+      - name: Install Vim
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes vim
+
+      - name: Validate shell script
+        run: bash -n install.sh
+
+      - name: Check Rust formatting
+        run: |
+          cargo fmt --all
+          git diff -- src tests > rustfmt.patch
+          if [[ -s rustfmt.patch ]]; then
+            cat rustfmt.patch
+            exit 1
+          fi
+
+      - name: Upload rustfmt patch
+        if: failure() && hashFiles('rustfmt.patch') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: rustfmt-patch
+          path: rustfmt.patch
+          if-no-files-found: ignore
+
+      - name: Lint Rust
+        shell: bash
+        run: |
+          set +e
+          cargo clippy --locked --all-targets -- -D warnings 2>&1 | tee clippy.log
+          status=${PIPESTATUS[0]}
+          exit "$status"
+
+      - name: Upload Clippy log
+        if: failure() && hashFiles('clippy.log') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: clippy-log
+          path: clippy.log
+          if-no-files-found: ignore
+
+      - name: Test Rust backend
+        run: cargo test --locked --all-targets
+
+      - name: Test Vim plugin load
+        run: vim -Nu NONE -n -es -X -i NONE -S tests/vim_smoke.vim
+
+      - name: Test Vim runtime controls
+        run: vim -Nu NONE -n -es -X -i NONE -S tests/vim_runtime_controls.vim
+
+      - name: Test Vim file operations
+        run: vim -Nu NONE -n -es -X -i NONE -S tests/vim_integration.vim

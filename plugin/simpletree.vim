@@ -47,6 +47,9 @@ def LoadPersistedWidth(fallback: number): number
 enddef
 
 var s_last_persisted_width: number = -1
+var s_pending_width: number = -1
+var s_width_persist_timer: number = 0
+var s_last_idle_refresh_time: float = 0.0
 
 def CurrentTreeWidth(): number
   for win in getwininfo()
@@ -57,16 +60,22 @@ def CurrentTreeWidth(): number
   return 0
 enddef
 
-def g:SimpleTreeCaptureWidth()
-  var width = CurrentTreeWidth()
-  if width <= 0
+def StopWidthPersistTimer()
+  if s_width_persist_timer == 0
     return
   endif
+  try
+    timer_stop(s_width_persist_timer)
+  catch
+  endtry
+  s_width_persist_timer = 0
+enddef
 
-  # 先同步运行时配置，避免 Render() 再次把手动宽度改回默认值。
-  g:simpletree_width = width
-
-  if !get(g:, 'simpletree_persist_width', 1) || width == s_last_persisted_width
+def PersistPendingWidth()
+  StopWidthPersistTimer()
+  var width = s_pending_width
+  s_pending_width = -1
+  if width <= 0 || width == s_last_persisted_width
     return
   endif
 
@@ -86,6 +95,51 @@ def g:SimpleTreeCaptureWidth()
   endtry
 enddef
 
+def ScheduleWidthPersist(width: number, force: bool)
+  StopWidthPersistTimer()
+  s_pending_width = width
+  var delay = ClampNumber(get(g:, 'simpletree_width_persist_delay', 250), 250, 0, 5000)
+  if force || delay == 0 || !exists('*timer_start')
+    PersistPendingWidth()
+    return
+  endif
+  try
+    s_width_persist_timer = timer_start(delay, (id) => {
+      if s_width_persist_timer == id
+        s_width_persist_timer = 0
+      endif
+      PersistPendingWidth()
+    })
+  catch
+    PersistPendingWidth()
+  endtry
+enddef
+
+def g:SimpleTreeCaptureWidth(force: bool = false)
+  var width = CurrentTreeWidth()
+  if width <= 0
+    if !force
+      return
+    endif
+    width = ClampNumber(get(g:, 'simpletree_width', 45), 45, 10, 500)
+  endif
+
+  # 先同步运行时配置，避免 Render() 再次把手动宽度改回默认值。
+  g:simpletree_width = width
+
+  if !get(g:, 'simpletree_persist_width', 1)
+    StopWidthPersistTimer()
+    s_pending_width = -1
+    return
+  endif
+  if width == s_last_persisted_width
+    StopWidthPersistTimer()
+    s_pending_width = -1
+    return
+  endif
+  ScheduleWidthPersist(width, force)
+enddef
+
 def g:SimpleTreeInstallWidthMappings()
   nnoremap <silent> <buffer> <C-W><lt> <C-W><lt><Cmd>call g:SimpleTreeCaptureWidth()<CR>
   nnoremap <silent> <buffer> <C-W>> <C-W>><Cmd>call g:SimpleTreeCaptureWidth()<CR>
@@ -96,6 +150,7 @@ enddef
 # =============================================================
 g:simpletree_persist_width = get(g:, 'simpletree_persist_width', 1)
 g:simpletree_width_state_file = get(g:, 'simpletree_width_state_file', DefaultWidthStateFile())
+g:simpletree_width_persist_delay = ClampNumber(get(g:, 'simpletree_width_persist_delay', 250), 250, 0, 5000)
 g:simpletree_width = LoadPersistedWidth(ClampNumber(get(g:, 'simpletree_width', 45), 45, 10, 500))
 s_last_persisted_width = g:simpletree_width
 g:simpletree_hide_dotfiles = get(g:, 'simpletree_hide_dotfiles', 1)
@@ -121,6 +176,11 @@ g:simpletree_modified_symbol = get(g:, 'simpletree_modified_symbol', '●')
 g:simpletree_open_on_create = get(g:, 'simpletree_open_on_create', 1)
 # 删除时优先移到系统回收站（支持 gio/trash-put/trash）
 g:simpletree_use_trash = get(g:, 'simpletree_use_trash', 1)
+# 自动刷新总开关、触发源与空闲触发最小间隔。
+g:simpletree_auto_refresh = get(g:, 'simpletree_auto_refresh', 1)
+g:simpletree_auto_refresh_on_focus = get(g:, 'simpletree_auto_refresh_on_focus', 1)
+g:simpletree_auto_refresh_on_idle = get(g:, 'simpletree_auto_refresh_on_idle', 1)
+g:simpletree_auto_refresh_interval = ClampNumber(get(g:, 'simpletree_auto_refresh_interval', 3000), 3000, 3000, 600000)
 
 # =============================================================
 # Nerd Font UI 配置与工具
@@ -148,13 +208,91 @@ g:simpletree_split_below = get(g:, 'simpletree_split_below', 1)
 # 仅在目标按键尚未被用户占用时安装 <leader>e。
 g:simpletree_set_default_mapping = get(g:, 'simpletree_set_default_mapping', 1)
 
+# =============================================================
+# 运行时控制与诊断
+# =============================================================
+def g:SimpleTreeMaybeAutoRefresh(source: string)
+  if !get(g:, 'simpletree_auto_refresh', 1)
+    return
+  endif
+
+  if source ==# 'focus'
+    if !get(g:, 'simpletree_auto_refresh_on_focus', 1)
+      return
+    endif
+    s_last_idle_refresh_time = reltime()->reltimefloat() * 1000.0
+    simpletree#AutoRefreshOnFocus()
+    return
+  endif
+
+  if !get(g:, 'simpletree_auto_refresh_on_idle', 1)
+    return
+  endif
+  var now = reltime()->reltimefloat() * 1000.0
+  var interval = ClampNumber(get(g:, 'simpletree_auto_refresh_interval', 3000), 3000, 3000, 600000)
+  if s_last_idle_refresh_time > 0.0 && (now - s_last_idle_refresh_time) < interval
+    return
+  endif
+  s_last_idle_refresh_time = now
+  simpletree#AutoRefreshOnIdle()
+enddef
+
+def g:SimpleTreeToggleAutoRefresh()
+  g:simpletree_auto_refresh = get(g:, 'simpletree_auto_refresh', 1) ? 0 : 1
+  echo '[SimpleTree] auto refresh: ' .. (g:simpletree_auto_refresh ? 'on' : 'off')
+enddef
+
+def g:SimpleTreeToggleAutoFollow()
+  g:simpletree_auto_follow = get(g:, 'simpletree_auto_follow', 1) ? 0 : 1
+  echo '[SimpleTree] auto follow: ' .. (g:simpletree_auto_follow ? 'on' : 'off')
+enddef
+
+def FindBackendForVersion(): string
+  var configured = expand(get(g:, 'simpletree_daemon_path', ''))
+  if configured !=# '' && executable(configured)
+    return configured
+  endif
+
+  var binary = (has('win32') || has('win64')) ? 'simpletree-daemon.exe' : 'simpletree-daemon'
+  for relative in ['lib/' .. binary, 'target/release/' .. binary, 'target/debug/' .. binary]
+    for candidate in globpath(&runtimepath, relative, false, true)
+      if executable(candidate)
+        return candidate
+      endif
+    endfor
+  endfor
+  return ''
+enddef
+
+def g:SimpleTreeVersion()
+  var backend = FindBackendForVersion()
+  if backend ==# ''
+    echohl ErrorMsg | echom '[SimpleTree] backend not found; run ./install.sh' | echohl None
+    return
+  endif
+  var output = system(shellescape(backend) .. ' --version')
+  if v:shell_error != 0
+    echohl ErrorMsg | echom '[SimpleTree] version check failed: ' .. trim(output) | echohl None
+    return
+  endif
+  echo '[SimpleTree] ' .. trim(output)
+enddef
+
+def g:SimpleTreeClose()
+  g:SimpleTreeCaptureWidth(true)
+  simpletree#Close()
+enddef
+
 # ---------------- 命令与映射 ----------------
 command! -nargs=? -complete=dir SimpleTree simpletree#Toggle(<q-args>)
 command! SimpleTreeRefresh simpletree#Refresh()
-command! SimpleTreeClose simpletree#Close()
+command! SimpleTreeClose call g:SimpleTreeClose()
 command! SimpleTreeDebug call simpletree#DebugStatus()
 command! SimpleTreeReveal simpletree#OnRevealActive()
 command! SimpleTreeHealth simpletree#Health()
+command! SimpleTreeVersion call g:SimpleTreeVersion()
+command! SimpleTreeToggleAutoRefresh call g:SimpleTreeToggleAutoRefresh()
+command! SimpleTreeToggleAutoFollow call g:SimpleTreeToggleAutoFollow()
 
 nnoremap <silent> <Plug>(simpletree-toggle) <Cmd>SimpleTree<CR>
 if g:simpletree_set_default_mapping && maparg('<leader>e', 'n') ==# ''
@@ -164,7 +302,7 @@ endif
 # ---------------- 自动命令 ----------------
 augroup SimpleTreeBackend
   autocmd!
-  autocmd VimLeavePre * try | call g:SimpleTreeCaptureWidth() | call simpletree#Stop() | catch | endtry
+  autocmd VimLeavePre * try | call g:SimpleTreeCaptureWidth(true) | call simpletree#Stop() | catch | endtry
 augroup END
 
 augroup SimpleTreeWidthPersistence
@@ -192,17 +330,10 @@ augroup SimpleTreeDecorations
   autocmd TextChanged,TextChangedI,BufWritePost * try | call simpletree#UpdateDecorations() | catch | endtry
 augroup END
 
-# 自动刷新配置（默认启用）
-g:simpletree_auto_refresh = get(g:, 'simpletree_auto_refresh', 1)
-
 augroup SimpleTreeAutoRefresh
   autocmd!
-  # 当 Vim 获得焦点时自动刷新（检测外部文件变化）
-  autocmd FocusGained * if get(g:, 'simpletree_auto_refresh', 1) |
-        \ try | call simpletree#AutoRefreshOnFocus() | catch | endtry |
-        \ endif
-  # 当光标停止移动一段时间后刷新（updatetime 控制延迟，默认 4000ms）
-  autocmd CursorHold * if get(g:, 'simpletree_auto_refresh', 1) |
-        \ try | call simpletree#AutoRefreshOnIdle() | catch | endtry |
-        \ endif
+  # 当 Vim 获得焦点时检查外部变化，可独立关闭。
+  autocmd FocusGained * try | call g:SimpleTreeMaybeAutoRefresh('focus') | catch | endtry
+  # CursorHold 只作为触发器，实际最小间隔由 simpletree_auto_refresh_interval 控制。
+  autocmd CursorHold * try | call g:SimpleTreeMaybeAutoRefresh('idle') | catch | endtry
 augroup END
