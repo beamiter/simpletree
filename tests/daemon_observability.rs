@@ -58,9 +58,7 @@ fn ping_reports_protocol_version_and_capabilities() {
     assert!(pong["protocol_version"].as_u64().is_some_and(|v| v > 0));
     assert_eq!(pong["daemon_version"], env!("CARGO_PKG_VERSION"));
 
-    let capabilities = pong["capabilities"]
-        .as_array()
-        .expect("capability array");
+    let capabilities = pong["capabilities"].as_array().expect("capability array");
     for capability in ["list", "cancel", "ping"] {
         assert!(
             capabilities.iter().any(|value| value == capability),
@@ -77,7 +75,5 @@ fn unknown_cli_argument_fails_without_starting_protocol_mode() {
         .expect("run unknown argument");
 
     assert!(!output.status.success());
-    assert!(
-        String::from_utf8_lossy(&output.stderr).contains("unknown command-line argument")
-    );
+    assert!(String::from_utf8_lossy(&output.stderr).contains("unknown command-line argument"));
 }
