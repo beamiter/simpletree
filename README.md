@@ -7,15 +7,22 @@ SimpleTree 使用 Vim9 script，当前不支持 Neovim。
 ## 特性
 
 - Rust 后台异步扫描，目录优先、`.gitignore` 感知，并分块传回大目录结果。
-- 后台限制并发扫描数量、合并协议输出 flush，快速展开大量目录时更稳定。
+- 协议 v2 能力握手：前端按后台宣告的 `capabilities` 启用扩展特性，旧后台自动降级。
+- 文件系统 watch：后台监听已展开目录并推送变更事件，外部改动即时反映到树中；不可用时自动回退 mtime 轮询。
+- git status 标记：逐文件状态（修改/暂存/未跟踪/冲突/删除）与目录聚合标记，含符号与配色，可完全自定义或关闭。
+- 后台递归搜索：`:SimpleTreeSearch` 支持 substring / fuzzy 匹配，结果流式写入 quickfix。
+- 树内过滤（`F`）只显示匹配节点及其祖先；`/` 跳转式查找，`]f` / `[f` 循环匹配。
+- 树缓冲区按键全部可通过 `g:simpletree_mappings` 覆盖或禁用。
+- `User SimpleTree*` 自动命令事件（打开/关闭/换根/展开/文件操作等），便于第三方集成。
+- 后台限制并发扫描数量、合并协议输出 flush，快速展开大量目录时更稳定；watch 下的目录列表带失效信号缓存。
 - 可折叠的工作区根节点；键盘、方向键和鼠标双击均可操作。
 - 自动定位当前编辑文件，并在树中高亮活动项。
 - 异步刷新后按路径恢复选中项，减少插入或删除条目造成的光标漂移。
-- 已修改但未保存的文件可显示 `●`。
+- 已修改但未保存的文件可显示 `●`（事件驱动维护，渲染零开销）。
 - 复用最近活动的编辑窗口；需要时可选择目标窗口。
 - 新建文件和目录支持 `src/components/Button.tsx` 形式的嵌套相对路径。
 - 删除优先使用系统回收站，并阻止删除或重命名工作区根、把目录粘贴到自身等操作。
-- 检测已展开目录的外部变化，并尽量保留展开状态。
+- 单个不可读条目或非 UTF-8 文件名不再导致整目录失败；后台单请求异常不会拖垮 daemon。
 - 后台支持版本输出与 `ping` / `pong` 能力握手，便于安装检查和兼容性诊断。
 
 ## 要求
@@ -91,6 +98,7 @@ git clone https://github.com/beamiter/simpletree.git \
 | `:SimpleTreeVersion` | 输出当前发现的 Rust 后台版本 |
 | `:SimpleTreeToggleAutoRefresh` | 会话内切换自动刷新 |
 | `:SimpleTreeToggleAutoFollow` | 会话内切换活动文件跟随 |
+| `:SimpleTreeSearch <query>` | 后台递归搜索文件名，结果写入 quickfix（需要 v2 后台） |
 
 ## 默认按键
 
@@ -125,7 +133,18 @@ git clone https://github.com/beamiter/simpletree.git \
 | `Y` | 复制绝对路径到 Vim 无名寄存器，并按配置尝试系统剪贴板 |
 | `gx` | 用系统默认程序打开 |
 | `z` | 折叠根节点下所有目录；可配置 |
+| `F` | 过滤已加载节点（空串清除；statusline 显示当前过滤） |
+| `/` | 按名称查找并跳转 |
+| `]f` / `[f` | 跳到下一个 / 上一个查找匹配 |
 | `?` | 显示完整快捷键帮助 |
+
+所有树内按键都可通过 `g:simpletree_mappings` 覆盖，例如：
+
+```vim
+let g:simpletree_mappings = {'X': 'refresh', 'q': ''}
+```
+
+键为按键序列，值为 action 名（见 `:help simpletree-mappings`）；空字符串禁用该键。
 
 根默认锁定；需要使用 `e`、`U`、`C`、`.` 或 `d` 改根时，先按 `L` 解锁。
 
@@ -187,6 +206,25 @@ SimpleTree 不会覆盖已存在的 `<leader>e` 映射。树缓冲区内的按�
 | `g:simpletree_file_icon_map` | `{}` | 按不带点的扩展名覆盖文件图标 |
 | `g:simpletree_collapse_all_key` | `'z'` | 树缓冲区内“折叠全部”的按键 |
 
+### git status、watch 与事件
+
+| 变量 | 默认值 | 说明 |
+|---|---:|---|
+| `g:simpletree_git_status` | `1` | 显示 git 状态标记（需要后台 `git-status` 能力与 git 可执行） |
+| `g:simpletree_git_status_symbols` | `{}` | 覆盖状态符号，键为 `M/S/U/C/D` |
+| `g:simpletree_use_watcher` | `1` | 使用后台文件系统 watch 推送刷新；`0` 回到 mtime 轮询 |
+| `g:simpletree_mappings` | `{}` | 树缓冲区按键覆盖表 `{键: action}`；空字符串禁用 |
+
+git 状态高亮组：`SimpleTreeGitModified`、`SimpleTreeGitStaged`、`SimpleTreeGitUntracked`、`SimpleTreeGitConflict`、`SimpleTreeGitDeleted`，均为 `highlight default link`，可在 colorscheme 中覆盖。
+
+第三方集成可监听 `User` 事件（数据在 `g:simpletree_event`）：
+
+```vim
+autocmd User SimpleTreeFileCreated echom 'created: ' .. g:simpletree_event.path
+```
+
+事件：`SimpleTreeOpen`、`SimpleTreeClose`、`SimpleTreeRootChanged`、`SimpleTreeNodeOpened`、`SimpleTreeDirExpanded`、`SimpleTreeDirCollapsed`、`SimpleTreeFileCreated`、`SimpleTreeFileDeleted`、`SimpleTreeFileRenamed`、`SimpleTreeGitStatusUpdated`、`SimpleTreeFilterChanged`。
+
 ### 文件操作、后台与诊断
 
 | 变量 | 默认值 | 说明 |
@@ -236,7 +274,9 @@ let g:simpletree_width_state_file = expand('~/.vim/simpletree-width')
 {"type":"ping","id":1}
 ```
 
-后台返回 `pong`，其中包含 `protocol_version`、`daemon_version` 和 `capabilities`。现有 `list` / `cancel` 协议保持兼容。
+后台返回 `pong`，其中包含 `protocol_version`（当前为 `2`）、`daemon_version` 和 `capabilities`。
+
+协议 v2 请求：`list`（新增 `meta` 标志返回 size/mtime/is_symlink）、`cancel`、`ping`、`watch` / `unwatch`（目录监听，推送 `fs_event`）、`git_status`（逐文件与目录聚合状态）、`search`（递归文件名搜索，流式 `search_chunk`）。v1 的 `list` / `cancel` 负载保持兼容；旧前端会忽略新事件类型，新前端按 `capabilities` 门控扩展特性，两个方向的滚动升级都安全。
 
 ## 文件操作与安全语义
 

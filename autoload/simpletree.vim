@@ -100,7 +100,6 @@ var s_line_index: list<dict<any>> = []    # 渲染行对应的节点
 var s_active_path: string = ''            # 当前编辑器文件（用于活动项装饰）
 var s_target_winid: number = 0            # 最近使用的编辑窗口，避免反复询问
 var s_active_match_id: number = -1
-var s_buffer_modified: dict<bool> = {}
 
 # 渲染节流
 var s_render_timer: number = 0
@@ -130,6 +129,35 @@ var s_bbuf: string = ''
 var s_bnext_id = 0
 var s_bcbs: dict<any> = {}   # id -> {OnChunk, OnDone, OnError}
 var s_bgeneration: number = 0
+
+# 协议 v2 能力握手：pong 到达前为空 dict，所有扩展能力按不可用降级。
+var s_backend_caps: dict<bool> = {}
+var s_backend_protocol: number = 0
+
+# 文件系统 watch（daemon 推送 fs_event；无能力时回退 mtime 轮询）
+var s_watched: dict<bool> = {}        # dir -> true（已发出 watch 请求）
+var s_watch_failed: dict<bool> = {}   # dir -> true（watch 被拒绝，回退轮询）
+var s_fs_pending_dirs: dict<bool> = {}
+var s_fs_refresh_timer: number = 0
+
+# git status（daemon 查询；path -> 状态码 M/S/U/C/D，目录为聚合码）。
+# json_decode 产物是 dict<any>，保持 any 避免赋值处的类型收窄失败。
+var s_git_status: dict<any> = {}
+var s_git_repo_root: string = ''
+var s_git_timer: number = 0
+
+# 树内过滤：只作用于已加载缓存的节点
+var s_filter_query: string = ''
+var s_filter_memo: dict<bool> = {}    # dir -> 已加载后代中是否有匹配
+
+# 跳转式查找
+var s_find_query: string = ''
+
+# path -> 渲染行号（1-based），reveal/高亮 O(1) 定位
+var s_path_lines: dict<number> = {}
+
+# path -> 未保存标记；由 UpdateDecorations 事件维护，渲染期只查字典
+var s_modified_paths: dict<bool> = {}
 
 # =============================================================
 # 工具函数
@@ -939,9 +967,12 @@ def InvalidateAndRescan(dir_path: string)
   if has_key(s_scan_errors, dir_path)
     call remove(s_scan_errors, dir_path)
   endif
+  s_filter_memo = {}
   if GetNodeState(dir_path).expanded
     ScanDirAsync(dir_path)
   endif
+  # 所有文件操作都会经过这里；git 装饰随之刷新（去抖后合并）。
+  GitStatusRefresh()
 enddef
 
 def IsActionableNode(node: dict<any>): bool
@@ -1023,6 +1054,93 @@ def BIsRunning(): bool
   return s_brunning
 enddef
 
+def HasCap(name: string): bool
+  return get(s_backend_caps, name, false)
+enddef
+
+def ApplyCapabilities(caps: list<any>, protocol: number)
+  s_backend_caps = {}
+  for cap in caps
+    if type(cap) == v:t_string
+      s_backend_caps[cap] = true
+    endif
+  endfor
+  s_backend_protocol = protocol
+  # 能力确认后补挂：已展开目录的 watch 与首次 git 状态查询。
+  WatchExpandedDirs()
+  GitStatusRefresh()
+enddef
+
+# 协议事件统一分发。独立成函数以便 headless 测试直接注入协议行。
+export def DispatchLine(line: string)
+  if line ==# ''
+    return
+  endif
+  var ev: any
+  try
+    ev = json_decode(line)
+  catch
+    return
+  endtry
+  if type(ev) != v:t_dict || !has_key(ev, 'type')
+    return
+  endif
+  if ev.type ==# 'list_chunk' || ev.type ==# 'search_chunk'
+    var id = ev.id
+    if has_key(s_bcbs, id)
+      if has_key(ev, 'entries')
+        try
+          s_bcbs[id].OnChunk(ev.entries)
+        catch
+          Log('chunk callback failed: ' .. v:exception)
+        endtry
+      endif
+      var warnings = get(ev, 'warnings', [])
+      if type(warnings) == v:t_list && len(warnings) > 0
+        Log('backend warnings: ' .. join(warnings[0 : 2], '; '))
+      endif
+      if get(ev, 'done', v:false)
+        try
+          s_bcbs[id].OnDone()
+        catch
+          Log('done callback failed: ' .. v:exception)
+        endtry
+        call remove(s_bcbs, id)
+      endif
+    endif
+  elseif ev.type ==# 'error'
+    var id = get(ev, 'id', 0)
+    var msg2 = get(ev, 'message', '')
+    if id != 0 && has_key(s_bcbs, id)
+      try
+        s_bcbs[id].OnError(msg2)
+      catch
+        Log('error callback failed: ' .. v:exception)
+      endtry
+      call remove(s_bcbs, id)
+    endif
+  elseif ev.type ==# 'ok'
+    var id = get(ev, 'id', 0)
+    if id != 0 && has_key(s_bcbs, id)
+      try
+        s_bcbs[id].OnDone()
+      catch
+        Log('ok callback failed: ' .. v:exception)
+      endtry
+      call remove(s_bcbs, id)
+    endif
+  elseif ev.type ==# 'pong'
+    ApplyCapabilities(get(ev, 'capabilities', []), get(ev, 'protocol_version', 1))
+  elseif ev.type ==# 'fs_event'
+    var dirs = get(ev, 'dirs', [])
+    if type(dirs) == v:t_list
+      OnFsEvent(dirs)
+    endif
+  elseif ev.type ==# 'git_status'
+    OnGitStatusEvent(ev)
+  endif
+enddef
+
 def BackendCrashed()
   var failed_paths = keys(s_loading)
   try
@@ -1071,46 +1189,7 @@ def BEnsureBackend(cmd: string = ''): bool
       in_io: 'pipe',
       out_mode: 'nl',
       out_cb: (ch, line) => {
-        if line ==# ''
-          return
-        endif
-        var ev: any
-        try
-          ev = json_decode(line)
-        catch
-          return
-        endtry
-        if type(ev) != v:t_dict || !has_key(ev, 'type')
-          return
-        endif
-        if ev.type ==# 'list_chunk'
-          var id = ev.id
-          if has_key(s_bcbs, id)
-            if has_key(ev, 'entries')
-              try
-                s_bcbs[id].OnChunk(ev.entries)
-              catch
-              endtry
-            endif
-            if get(ev, 'done', v:false)
-              try
-                s_bcbs[id].OnDone()
-              catch
-              endtry
-              call remove(s_bcbs, id)
-            endif
-          endif
-        elseif ev.type ==# 'error'
-          var id = get(ev, 'id', 0)
-          var msg2 = get(ev, 'message', '')
-          if id != 0 && has_key(s_bcbs, id)
-            try
-              s_bcbs[id].OnError(msg2)
-            catch
-            endtry
-            call remove(s_bcbs, id)
-          endif
-        endif
+        DispatchLine(line)
       },
       err_mode: 'nl',
       err_cb: (ch, line) => {
@@ -1125,6 +1204,7 @@ def BEnsureBackend(cmd: string = ''): bool
         s_bjob = v:null
         s_bbuf = ''
         s_bcbs = {}
+        ResetBackendSessionState()
         try
           BackendCrashed()
         catch
@@ -1147,6 +1227,9 @@ def BEnsureBackend(cmd: string = ''): bool
     echohl ErrorMsg
     echom '[SimpleTree] backend failed to start.'
     echohl None
+  else
+    # 能力握手：pong 到达前扩展能力保持关闭，旧 daemon 自然降级。
+    BSend({type: 'ping', id: BNextId()})
   endif
   return s_brunning
 enddef
@@ -1159,6 +1242,7 @@ def BStop(): void
   s_bjob = v:null
   s_bbuf = ''
   s_bcbs = {}
+  ResetBackendSessionState()
   if job != v:null
     try
       call('job_stop', [job])
@@ -1234,6 +1318,21 @@ def CancelFrontendWork()
     s_reveal_timer = 0
   endif
   s_reveal_target = ''
+  if s_fs_refresh_timer != 0
+    try
+      call timer_stop(s_fs_refresh_timer)
+    catch
+    endtry
+    s_fs_refresh_timer = 0
+  endif
+  s_fs_pending_dirs = {}
+  if s_git_timer != 0
+    try
+      call timer_stop(s_git_timer)
+    catch
+    endtry
+    s_git_timer = 0
+  endif
 
   # 流式列表在 done 前写入的缓存只是半成品；取消后必须失效，避免下次打开当成完整结果。
   for p in keys(s_loading)
@@ -1255,10 +1354,366 @@ enddef
 
 def EndFrontendSession()
   if s_open
+    UnwatchAllDirs()
     s_open = false
     s_session_generation += 1
+    Emit('Close', {root: s_root})
   endif
   CancelFrontendWork()
+enddef
+
+# =============================================================
+# 协议 v2：watch / git status / User 事件 / 过滤
+# =============================================================
+def ResetBackendSessionState()
+  s_backend_caps = {}
+  s_backend_protocol = 0
+  s_watched = {}
+  s_watch_failed = {}
+  s_git_status = {}
+  s_git_repo_root = ''
+enddef
+
+# doautocmd User SimpleTree{name}；无监听零开销。数据经 g:simpletree_event 传递。
+def Emit(name: string, data: dict<any> = {})
+  if !exists('#User#SimpleTree' .. name)
+    return
+  endif
+  g:simpletree_event = data
+  try
+    execute 'doautocmd <nomodeline> User SimpleTree' .. name
+  catch
+    Log('event handler failed for ' .. name .. ': ' .. v:exception)
+  endtry
+enddef
+
+def WatcherEnabled(): bool
+  return !!get(g:, 'simpletree_use_watcher', 1) && HasCap('watch')
+enddef
+
+def WatchDir(path: string)
+  if !WatcherEnabled() || path ==# ''
+    return
+  endif
+  if has_key(s_watched, path) || has_key(s_watch_failed, path)
+    return
+  endif
+  var id = BNextId()
+  s_watched[path] = true
+  var p = path
+  s_bcbs[id] = {
+    OnChunk: (_) => {
+    },
+    OnDone: () => {
+    },
+    OnError: (msg) => {
+      # 该目录 watch 失败（如 inotify 上限），回退 mtime 轮询。
+      if has_key(s_watched, p)
+        call remove(s_watched, p)
+      endif
+      s_watch_failed[p] = true
+      Log('watch failed for ' .. p .. ': ' .. msg)
+    },
+  }
+  if !BSend({type: 'watch', id: id, path: path})
+    if has_key(s_bcbs, id)
+      call remove(s_bcbs, id)
+    endif
+    if has_key(s_watched, path)
+      call remove(s_watched, path)
+    endif
+  endif
+enddef
+
+def UnwatchDir(path: string)
+  if !has_key(s_watched, path)
+    return
+  endif
+  call remove(s_watched, path)
+  if !BIsRunning()
+    return
+  endif
+  var id = BNextId()
+  s_bcbs[id] = {
+    OnChunk: (_) => {
+    },
+    OnDone: () => {
+    },
+    OnError: (_) => {
+    },
+  }
+  if !BSend({type: 'unwatch', id: id, path: path}) && has_key(s_bcbs, id)
+    call remove(s_bcbs, id)
+  endif
+enddef
+
+def WatchExpandedDirs()
+  if !WatcherEnabled() || s_root ==# ''
+    return
+  endif
+  WatchDir(s_root)
+  for [p, st] in items(s_state)
+    if get(st, 'expanded', v:false) && isdirectory(p)
+      WatchDir(p)
+    endif
+  endfor
+enddef
+
+def UnwatchAllDirs()
+  for p in keys(s_watched)
+    UnwatchDir(p)
+  endfor
+  s_watch_failed = {}
+enddef
+
+# fs_event 已在 daemon 侧去抖；这里再合并一拍，处理连续推送与展开状态过滤。
+def OnFsEvent(dirs: list<any>)
+  if !s_open
+    return
+  endif
+  for d in dirs
+    if type(d) == v:t_string && d !=# ''
+      s_fs_pending_dirs[d] = true
+    endif
+  endfor
+  if s_fs_refresh_timer != 0
+    return
+  endif
+  var session_generation = s_session_generation
+  s_fs_refresh_timer = timer_start(50, (id) => {
+    if s_fs_refresh_timer == id
+      s_fs_refresh_timer = 0
+    endif
+    if !s_open || session_generation != s_session_generation
+      s_fs_pending_dirs = {}
+      return
+    endif
+    var pending = keys(s_fs_pending_dirs)
+    s_fs_pending_dirs = {}
+    RefreshDirs(pending)
+  })
+enddef
+
+# 定点失效并重扫一组目录，保持光标所在节点。轮询与 watch 共用此路径。
+def RefreshDirs(dirs: list<string>)
+  if !s_open || len(dirs) == 0
+    return
+  endif
+  var current_node = CursorNode()
+  var current_path = get(current_node, 'path', '')
+  var touched = false
+  for dir_path in dirs
+    if !PathVisibleInTree(dir_path)
+      continue
+    endif
+    touched = true
+    if has_key(s_cache, dir_path)
+      call remove(s_cache, dir_path)
+    endif
+    if has_key(s_scan_errors, dir_path)
+      call remove(s_scan_errors, dir_path)
+    endif
+    CancelPending(dir_path)
+    if get(GetNodeState(dir_path), 'expanded', false)
+      ScanDirAsync(dir_path)
+    endif
+  endfor
+  if !touched
+    return
+  endif
+  s_filter_memo = {}
+  UpdateDirMtimes(dirs)
+  GitStatusRefresh()
+  ScheduleRender()
+  if current_path !=# ''
+    RevealPath(current_path)
+  endif
+enddef
+
+def PathVisibleInTree(path: string): bool
+  if s_root ==# ''
+    return false
+  endif
+  return PathEq(path, s_root) || IsSubPath(s_root, path)
+enddef
+
+# ---------------- git status ----------------
+def GitStatusEnabled(): bool
+  return !!get(g:, 'simpletree_git_status', 1) && HasCap('git-status')
+enddef
+
+def GitStatusRefresh(force: bool = false)
+  if !GitStatusEnabled() || s_root ==# '' || !s_open
+    return
+  endif
+  if s_git_timer != 0
+    try | call timer_stop(s_git_timer) | catch | endtry
+    s_git_timer = 0
+  endif
+  var session_generation = s_session_generation
+  s_git_timer = timer_start(200, (id) => {
+    if s_git_timer == id
+      s_git_timer = 0
+    endif
+    if !s_open || session_generation != s_session_generation
+      return
+    endif
+    BSend({type: 'git_status', id: BNextId(), path: s_root, force: force})
+  })
+enddef
+
+def OnGitStatusEvent(ev: dict<any>)
+  if !s_open
+    return
+  endif
+  var statuses = get(ev, 'statuses', {})
+  if type(statuses) != v:t_dict
+    return
+  endif
+  s_git_status = statuses
+  s_git_repo_root = get(ev, 'repo_root', '')
+  if get(ev, 'truncated', v:false)
+    Log('git status truncated for ' .. s_git_repo_root, 'WarningMsg')
+  endif
+  Emit('GitStatusUpdated', {repo_root: s_git_repo_root, count: len(s_git_status)})
+  ScheduleRender()
+enddef
+
+var s_git_symbols_cache: dict<string> = {}
+var s_git_symbols_sig: string = ''
+
+def GitSymbols(): dict<string>
+  var nerd = NFEnabled()
+  var sig = (nerd ? 'nf' : 'ascii') .. string(get(g:, 'simpletree_git_status_symbols', {}))
+  if sig ==# s_git_symbols_sig && !empty(s_git_symbols_cache)
+    return s_git_symbols_cache
+  endif
+  var defaults = nerd
+    ? {M: '', S: '', U: '', C: '', D: ''}
+    : {M: 'M', S: 'S', U: '?', C: '!', D: 'D'}
+  var override = get(g:, 'simpletree_git_status_symbols', {})
+  if type(override) == v:t_dict
+    defaults->extend(override)
+  endif
+  s_git_symbols_cache = defaults
+  s_git_symbols_sig = sig
+  return defaults
+enddef
+
+def GitCodeFor(path: string): string
+  if empty(s_git_status)
+    return ''
+  endif
+  return get(s_git_status, path, '')
+enddef
+
+# ---------------- 树内过滤 ----------------
+def FilterActive(): bool
+  return s_filter_query !=# ''
+enddef
+
+def NameMatchesFilter(name: string): bool
+  return stridx(tolower(name), tolower(s_filter_query)) >= 0
+enddef
+
+# 只检查已加载缓存中的后代；未加载的目录在过滤态默认隐藏。
+def DirHasFilterMatch(path: string): bool
+  if has_key(s_filter_memo, path)
+    return s_filter_memo[path]
+  endif
+  var found = false
+  if has_key(s_cache, path)
+    for e in s_cache[path]
+      if NameMatchesFilter(e.name)
+        found = true
+        break
+      endif
+      if e.is_dir && DirHasFilterMatch(e.path)
+        found = true
+        break
+      endif
+    endfor
+  endif
+  s_filter_memo[path] = found
+  return found
+enddef
+
+def FilterAllowsEntry(e: dict<any>): bool
+  if !FilterActive()
+    return true
+  endif
+  if NameMatchesFilter(e.name)
+    return true
+  endif
+  return e.is_dir && DirHasFilterMatch(e.path)
+enddef
+
+export def OnFilter()
+  var q = ''
+  try
+    q = input('Filter (empty to clear): ', s_filter_query)
+  catch
+    return
+  endtry
+  s_filter_query = q
+  s_filter_memo = {}
+  Emit('FilterChanged', {query: q})
+  Render()
+  if q ==# ''
+    echo '[SimpleTree] filter cleared'
+  endif
+enddef
+
+# ---------------- 跳转式查找 ----------------
+export def OnFind()
+  var q = ''
+  try
+    q = input('Find: ', s_find_query)
+  catch
+    return
+  endtry
+  if q ==# ''
+    return
+  endif
+  s_find_query = q
+  FindJump(1)
+enddef
+
+export def OnFindNext()
+  if s_find_query ==# ''
+    echo '[SimpleTree] no previous find; press / first'
+    return
+  endif
+  FindJump(1)
+enddef
+
+export def OnFindPrev()
+  if s_find_query ==# ''
+    echo '[SimpleTree] no previous find; press / first'
+    return
+  endif
+  FindJump(-1)
+enddef
+
+def FindJump(direction: number)
+  if !WinValid() || len(s_line_index) == 0
+    return
+  endif
+  var total = len(s_line_index)
+  var pos = getcurpos(s_winid)
+  var start = len(pos) > 1 ? pos[1] : 1
+  var needle = tolower(s_find_query)
+  var i = 1
+  while i <= total
+    var lnum = ((start - 1 + direction * i) % total + total) % total + 1
+    var name = get(s_line_index[lnum - 1], 'name', '')
+    if name !=# '' && stridx(tolower(name), needle) >= 0
+      try | call win_execute(s_winid, 'normal! ' .. lnum .. 'G') | catch | endtry
+      return
+    endif
+    i += 1
+  endwhile
+  echo '[SimpleTree] no match: ' .. s_find_query
 enddef
 
 # =============================================================
@@ -1349,6 +1804,9 @@ def ScanDirAsync(path: string)
       if isdirectory(p)
         s_dir_mtimes[p] = GetDirMtime(p)
       endif
+      # 列表成功后订阅该目录的文件系统事件（能力可用时）。
+      WatchDir(p)
+      s_filter_memo = {}
       ScheduleRender()
       # Reveal 回调：扫描完成后尝试定位目标，避免轮询定时器
       if s_reveal_target !=# '' && FocusIfPresent(s_reveal_target)
@@ -1515,6 +1973,11 @@ def SetupSyntaxTree(): void
     cmds->add('highlight default link SimpleTreeIconImage Special')
     cmds->add('highlight default link SimpleTreeIconArchive WarningMsg')
     cmds->add('highlight default link SimpleTreeIconFileDefault Special')
+    cmds->add('highlight default link SimpleTreeGitModified WarningMsg')
+    cmds->add('highlight default link SimpleTreeGitStaged DiffAdd')
+    cmds->add('highlight default link SimpleTreeGitUntracked Comment')
+    cmds->add('highlight default link SimpleTreeGitConflict ErrorMsg')
+    cmds->add('highlight default link SimpleTreeGitDeleted DiffDelete')
 
     # :syntax clear 会吞掉命令分隔符后的内容，逐条执行才能可靠建立高亮组。
     for cmd in cmds
@@ -1546,6 +2009,144 @@ enddef
 # =============================================================
 # 渲染
 # =============================================================
+# action 名 -> autoload 函数名。g:simpletree_mappings 以 {键: action} 覆盖默认表，
+# 值为空字符串表示禁用该键。
+const KEY_ACTIONS: dict<string> = {
+  open: 'OnEnter',
+  expand: 'OnExpand',
+  collapse: 'OnCollapse',
+  collapse_all: 'OnCollapseAll',
+  refresh: 'OnRefresh',
+  toggle_hidden: 'OnToggleHidden',
+  toggle_git_ignore: 'OnToggleGitIgnore',
+  close: 'OnClose',
+  root_here: 'OnRootHere',
+  root_up: 'OnRootUp',
+  root_prompt: 'OnRootPrompt',
+  root_cwd: 'OnRootCwd',
+  root_current: 'OnRootCurrent',
+  toggle_root_lock: 'OnToggleRootLock',
+  copy: 'OnCopy',
+  cut: 'OnCut',
+  paste: 'OnPaste',
+  new_file: 'OnNewFile',
+  new_folder: 'OnNewFolder',
+  rename: 'OnRename',
+  delete: 'OnDelete',
+  help: 'ShowHelp',
+  open_vsplit: 'OnOpenVSplit',
+  open_split: 'OnOpenSplit',
+  open_tab: 'OnOpenTab',
+  preview: 'OnPreview',
+  reveal_active: 'OnRevealActive',
+  yank_name: 'OnYankPath',
+  yank_path: 'OnYankAbsPath',
+  system_open: 'OnSystemOpen',
+  filter: 'OnFilter',
+  find: 'OnFind',
+  find_next: 'OnFindNext',
+  find_prev: 'OnFindPrev',
+}
+
+const DEFAULT_KEYS: dict<string> = {
+  '<CR>': 'open',
+  'o': 'open',
+  '<2-LeftMouse>': 'open',
+  'l': 'expand',
+  '<Right>': 'expand',
+  'h': 'collapse',
+  '<Left>': 'collapse',
+  '<BS>': 'collapse',
+  'R': 'refresh',
+  'H': 'toggle_hidden',
+  'I': 'toggle_git_ignore',
+  'q': 'close',
+  'e': 'root_here',
+  'U': 'root_up',
+  'C': 'root_prompt',
+  '.': 'root_cwd',
+  'd': 'root_current',
+  'L': 'toggle_root_lock',
+  'c': 'copy',
+  'x': 'cut',
+  'p': 'paste',
+  'a': 'new_file',
+  'n': 'new_file',
+  'A': 'new_folder',
+  'N': 'new_folder',
+  'r': 'rename',
+  'D': 'delete',
+  'z': 'collapse_all',
+  '?': 'help',
+  'V': 'open_vsplit',
+  'S': 'open_split',
+  't': 'open_tab',
+  '<C-v>': 'open_vsplit',
+  '<C-x>': 'open_split',
+  '<C-t>': 'open_tab',
+  'P': 'preview',
+  'f': 'reveal_active',
+  'y': 'yank_name',
+  'Y': 'yank_path',
+  'gx': 'system_open',
+  'F': 'filter',
+  '/': 'find',
+  ']f': 'find_next',
+  '[f': 'find_prev',
+}
+
+# 合并默认表、g:simpletree_collapse_all_key 兼容别名与 g:simpletree_mappings。
+export def EffectiveKeymap(): dict<string>
+  var mapped = copy(DEFAULT_KEYS)
+  var ca_key = get(g:, 'simpletree_collapse_all_key', 'z')
+  if type(ca_key) == v:t_string && ca_key !=# '' && ca_key !=# 'z'
+    if get(mapped, 'z', '') ==# 'collapse_all'
+      call remove(mapped, 'z')
+    endif
+    mapped[ca_key] = 'collapse_all'
+  endif
+  var override = get(g:, 'simpletree_mappings', {})
+  if type(override) == v:t_dict
+    for [key, action] in items(override)
+      if type(action) != v:t_string
+        continue
+      endif
+      if action ==# ''
+        if has_key(mapped, key)
+          call remove(mapped, key)
+        endif
+      elseif has_key(KEY_ACTIONS, action)
+        mapped[key] = action
+      else
+        Log('unknown mapping action: ' .. action, 'WarningMsg')
+      endif
+    endfor
+  endif
+  return mapped
+enddef
+
+def InstallKeymaps()
+  var cmds: list<string> = []
+  for [key, action] in items(EffectiveKeymap())
+    var Fn = get(KEY_ACTIONS, action, '')
+    if Fn ==# ''
+      continue
+    endif
+    cmds->add('nnoremap <nowait> <silent> <buffer> ' .. key .. ' <Cmd>call simpletree#' .. Fn .. '()<CR>')
+  endfor
+  call win_execute(s_winid, join(cmds, " | "))
+enddef
+
+def RegisterGitPropTypes()
+  for type_name in ['SimpleTreeGitModified', 'SimpleTreeGitStaged', 'SimpleTreeGitUntracked', 'SimpleTreeGitConflict', 'SimpleTreeGitDeleted']
+    try
+      call prop_type_add(type_name, {bufnr: s_bufnr, highlight: type_name, combine: true})
+    catch
+      # 已注册（重复打开同一 buffer）时忽略。
+    endtry
+  endfor
+enddef
+
 def EnsureWindowAndBuffer()
   if !s_open
     return
@@ -1587,50 +2188,8 @@ def EnsureWindowAndBuffer()
   endfor
   call SetupSyntaxTree()
 
-  var ca_key = get(g:, 'simpletree_collapse_all_key', 'z')
-  var keymaps: list<string> = [
-    'nnoremap <silent> <buffer> <CR> :call simpletree#OnEnter()<CR>',
-    'nnoremap <silent> <buffer> o :call simpletree#OnEnter()<CR>',
-    'nnoremap <silent> <buffer> l :call simpletree#OnExpand()<CR>',
-    'nnoremap <silent> <buffer> <Right> :call simpletree#OnExpand()<CR>',
-    'nnoremap <silent> <buffer> h :call simpletree#OnCollapse()<CR>',
-    'nnoremap <silent> <buffer> <Left> :call simpletree#OnCollapse()<CR>',
-    'nnoremap <silent> <buffer> <BS> :call simpletree#OnCollapse()<CR>',
-    'nnoremap <silent> <buffer> R :call simpletree#OnRefresh()<CR>',
-    'nnoremap <silent> <buffer> H :call simpletree#OnToggleHidden()<CR>',
-    'nnoremap <silent> <buffer> I :call simpletree#OnToggleGitIgnore()<CR>',
-    'nnoremap <silent> <buffer> q :call simpletree#OnClose()<CR>',
-    'nnoremap <silent> <buffer> e :call simpletree#OnRootHere()<CR>',
-    'nnoremap <nowait> <silent> <buffer> U :call simpletree#OnRootUp()<CR>',
-    'nnoremap <silent> <buffer> C :call simpletree#OnRootPrompt()<CR>',
-    'nnoremap <silent> <buffer> . :call simpletree#OnRootCwd()<CR>',
-    'nnoremap <nowait> <silent> <buffer> d :call simpletree#OnRootCurrent()<CR>',
-    'nnoremap <silent> <buffer> L :call simpletree#OnToggleRootLock()<CR>',
-    'nnoremap <silent> <buffer> c :call simpletree#OnCopy()<CR>',
-    'nnoremap <silent> <buffer> x :call simpletree#OnCut()<CR>',
-    'nnoremap <silent> <buffer> p :call simpletree#OnPaste()<CR>',
-    'nnoremap <silent> <buffer> a :call simpletree#OnNewFile()<CR>',
-    'nnoremap <silent> <buffer> n :call simpletree#OnNewFile()<CR>',
-    'nnoremap <silent> <buffer> A :call simpletree#OnNewFolder()<CR>',
-    'nnoremap <silent> <buffer> N :call simpletree#OnNewFolder()<CR>',
-    'nnoremap <silent> <buffer> r :call simpletree#OnRename()<CR>',
-    'nnoremap <silent> <buffer> D :call simpletree#OnDelete()<CR>',
-    'nnoremap <nowait> <silent> <buffer> ' .. ca_key .. ' :call simpletree#OnCollapseAll()<CR>',
-    'nnoremap <silent> <buffer> ? :call simpletree#ShowHelp()<CR>',
-    'nnoremap <silent> <buffer> V :call simpletree#OnOpenVSplit()<CR>',
-    'nnoremap <silent> <buffer> S :call simpletree#OnOpenSplit()<CR>',
-    'nnoremap <silent> <buffer> t :call simpletree#OnOpenTab()<CR>',
-    'nnoremap <silent> <buffer> <C-v> :call simpletree#OnOpenVSplit()<CR>',
-    'nnoremap <silent> <buffer> <C-x> :call simpletree#OnOpenSplit()<CR>',
-    'nnoremap <silent> <buffer> <C-t> :call simpletree#OnOpenTab()<CR>',
-    'nnoremap <silent> <buffer> P :call simpletree#OnPreview()<CR>',
-    'nnoremap <silent> <buffer> f :call simpletree#OnRevealActive()<CR>',
-    'nnoremap <silent> <buffer> y :call simpletree#OnYankPath()<CR>',
-    'nnoremap <silent> <buffer> Y :call simpletree#OnYankAbsPath()<CR>',
-    'nnoremap <silent> <buffer> gx :call simpletree#OnSystemOpen()<CR>',
-    'nnoremap <silent> <buffer> <2-LeftMouse> :call simpletree#OnEnter()<CR>',
-  ]
-  call win_execute(s_winid, join(keymaps, " | "))
+  InstallKeymaps()
+  RegisterGitPropTypes()
 
   call win_execute(s_winid, 'augroup SimpleTreeBuf | autocmd! | autocmd BufWipeout <buffer> ++once call simpletree#OnBufWipe() | autocmd WinClosed <buffer> call simpletree#OnAutoClose() | augroup END')
 
@@ -1665,8 +2224,13 @@ def BuildLines(path: string, depth: number, lines: list<string>, idx: list<dict<
   var entries = s_cache[path]
   var show_icons = !!get(g:, 'simpletree_show_file_icons', 1)
   var show_suffix = !!get(g:, 'simpletree_folder_suffix', 1)
+  var show_modified = !!get(g:, 'simpletree_show_modified', 1)
+  var git_symbols = GitSymbols()
   var indent = repeat('  ', depth)
   for e in entries
+    if !FilterAllowsEntry(e)
+      continue
+    endif
     var expanded = false
     var icon = ''
     if e.is_dir
@@ -1676,15 +2240,16 @@ def BuildLines(path: string, depth: number, lines: list<string>, idx: list<dict<
       icon = show_icons ? FileIcon(e.name) : s_icons.file
     endif
     var suffix = (e.is_dir && show_suffix) ? '/' : ''
-    var modified = false
-    if !e.is_dir && !!get(g:, 'simpletree_show_modified', 1)
-      var bnr = bufnr(e.path)
-      modified = bnr > 0 && !!getbufvar(bnr, '&modified')
-    endif
+    # 未保存标记走事件维护的 path 字典，渲染期零 buffer 查询。
+    var modified = !e.is_dir && show_modified && get(s_modified_paths, e.path, v:false)
     var decoration = modified ? (' ' .. get(g:, 'simpletree_modified_symbol', '●')) : ''
+    var git_code = GitCodeFor(e.path)
+    if git_code !=# ''
+      decoration ..= ' ' .. get(git_symbols, git_code[0], git_code[0])
+    endif
 
     lines->add(indent .. icon .. ' ' .. e.name .. suffix .. decoration)
-    idx->add({path: e.path, is_dir: e.is_dir, name: e.name, depth: depth, modified: modified})
+    idx->add({path: e.path, is_dir: e.is_dir, name: e.name, depth: depth, modified: modified, git: git_code})
 
     if expanded
       BuildLines(e.path, depth + 1, lines, idx)
@@ -1714,18 +2279,81 @@ def UpdateActiveHighlight()
   if s_active_path ==# ''
     return
   endif
-  var active = NormPath(s_active_path)
+  var lnum = PathLine(NormPath(s_active_path))
+  if lnum > 0
+    try
+      s_active_match_id = matchaddpos('SimpleTreeActiveFile', [[lnum]], 5, -1, {window: s_winid})
+    catch
+      s_active_match_id = -1
+    endtry
+  endif
+enddef
+
+# path -> 行号 O(1)；未命中时回退到规范化比较，兼容大小写/斜杠差异。
+def PathLine(path: string): number
+  if path ==# ''
+    return 0
+  endif
+  var lnum = get(s_path_lines, path, 0)
+  if lnum > 0
+    return lnum
+  endif
+  var np = NormPath(path)
+  lnum = get(s_path_lines, np, 0)
+  if lnum > 0
+    return lnum
+  endif
   for i in range(len(s_line_index))
-    var p = get(s_line_index[i], 'path', '')
-    if p !=# '' && PathEq(p, active)
-      try
-        s_active_match_id = matchaddpos('SimpleTreeActiveFile', [[i + 1]], 5, -1, {window: s_winid})
-      catch
-        s_active_match_id = -1
-      endtry
-      return
+    var ep = get(s_line_index[i], 'path', '')
+    if ep !=# '' && (ep ==# np || NormPath(ep) ==# np)
+      return i + 1
     endif
   endfor
+  return 0
+enddef
+
+# git 状态用 text properties 按行染色；随 diff 写入后统一重建，避免错位。
+def ApplyGitHighlights(out: list<string>)
+  if !BufValid()
+    return
+  endif
+  try
+    call prop_clear(1, max([1, len(out)]), {bufnr: s_bufnr})
+  catch
+    return
+  endtry
+  if empty(s_git_status) || !GitStatusEnabled()
+    return
+  endif
+  for i in range(len(s_line_index))
+    var code = get(s_line_index[i], 'git', '')
+    if code ==# ''
+      continue
+    endif
+    var type_name = GitPropType(code[0])
+    if type_name ==# ''
+      continue
+    endif
+    try
+      call prop_add(i + 1, 1, {bufnr: s_bufnr, type: type_name, end_col: strlen(get(out, i, '')) + 1})
+    catch
+    endtry
+  endfor
+enddef
+
+def GitPropType(code: string): string
+  if code ==# 'M'
+    return 'SimpleTreeGitModified'
+  elseif code ==# 'S'
+    return 'SimpleTreeGitStaged'
+  elseif code ==# 'U'
+    return 'SimpleTreeGitUntracked'
+  elseif code ==# 'C'
+    return 'SimpleTreeGitConflict'
+  elseif code ==# 'D'
+    return 'SimpleTreeGitDeleted'
+  endif
+  return ''
 enddef
 
 # Write `out` into the tree buffer touching only the lines that actually
@@ -1816,6 +2444,15 @@ def Render()
   endtry
 
   s_line_index = idx
+  var path_lines: dict<number> = {}
+  for i in range(len(idx))
+    var p = get(idx[i], 'path', '')
+    if p !=# '' && !has_key(path_lines, p)
+      path_lines[p] = i + 1
+    endif
+  endfor
+  s_path_lines = path_lines
+  ApplyGitHighlights(out)
   if selected_path !=# ''
     FocusPath(selected_path)
   endif
@@ -1833,6 +2470,11 @@ def SetRoot(new_root: string, lock: bool = false)
     echohl None
     return
   endif
+  var old_root = s_root
+  UnwatchAllDirs()
+  s_git_status = {}
+  s_git_repo_root = ''
+  s_filter_memo = {}
   s_root = nr
   if lock
     s_root_locked = true
@@ -1862,6 +2504,8 @@ def SetRoot(new_root: string, lock: bool = false)
   s_dir_mtimes = {}
 
   ScanDirAsync(s_root)
+  GitStatusRefresh()
+  Emit('RootChanged', {root: s_root, old_root: old_root})
   Render()
 enddef
 
@@ -2048,16 +2692,7 @@ def FocusPath(path: string): void
   if !WinValid() || path ==# ''
     return
   endif
-  # 预规范化一次，循环内用 ==# 直接比较（路径来自 daemon，已是绝对路径）
-  var np = NormPath(path)
-  var target: number = 0
-  for i in range(len(s_line_index))
-    var ep = get(s_line_index[i], 'path', '')
-    if ep ==# np || (ep !=# '' && NormPath(ep) ==# np)
-      target = i + 1
-      break
-    endif
-  endfor
+  var target = PathLine(path)
   if target > 0
     try | call win_execute(s_winid, 'normal! ' .. target .. 'G') | catch | endtry
   endif
@@ -2118,8 +2753,16 @@ enddef
 def ToggleDir(path: string)
   var st = GetNodeState(path)
   st.expanded = !st.expanded
-  if st.expanded && !has_key(s_cache, path) && !get(s_loading, path, v:false)
-    ScanDirAsync(path)
+  if st.expanded
+    if !has_key(s_cache, path) && !get(s_loading, path, v:false)
+      ScanDirAsync(path)
+    else
+      WatchDir(path)
+    endif
+    Emit('DirExpanded', {path: path})
+  else
+    UnwatchDir(path)
+    Emit('DirCollapsed', {path: path})
   endif
   Render()
 enddef
@@ -2150,6 +2793,7 @@ def OpenFile(p: string)
     s_target_winid = win_getid()
   endif
   s_active_path = AbsPath(p)
+  Emit('NodeOpened', {path: s_active_path})
 
   # 只有在不需要保持在文件窗口时，才回到树窗口
   if !keep_in_file && WinValid()
@@ -2228,6 +2872,11 @@ export def OnCollapseAll()
   endfor
   s_pending = filter(s_pending, (k, _) => k ==# s_root)
   s_loading = filter(s_loading, (k, _) => k ==# s_root)
+  for p in keys(s_watched)
+    if p !=# s_root
+      UnwatchDir(p)
+    endif
+  endfor
 
   Render()
   echo '[SimpleTree] collapsed all under root (' .. count .. ' dirs)'
@@ -2479,6 +3128,7 @@ export def OnNewFile()
     return
   endtry
   echo '[SimpleTree] created file: ' .. dst
+  Emit('FileCreated', {path: dst, is_dir: false})
   InvalidateAndRescan(destDir)
   Render()
   RevealPath(dst)
@@ -2522,6 +3172,7 @@ export def OnNewFolder()
     return
   endif
   echo '[SimpleTree] created folder: ' .. dst
+  Emit('FileCreated', {path: dst, is_dir: true})
   InvalidateAndRescan(destDir)
   Render()
   RevealPath(dst)
@@ -2592,6 +3243,7 @@ export def OnRename()
         !target_is_link && !source_is_link)
     endif
     ApplyBufferRenamePlan(rename_plan)
+    Emit('FileRenamed', {old: src, new: dst})
     InvalidateAndRescan(parent)
     Render()
     RevealPath(dst)
@@ -2685,6 +3337,7 @@ export def OnDelete()
   # 只关闭未修改缓冲区；modified 已在操作前硬性拒绝。
   WipeBuffersForPath(p, subtree, !path_is_link)
   echo '[SimpleTree] ' .. (trashed ? 'moved to trash: ' : 'deleted: ') .. p
+  Emit('FileDeleted', {path: p, trashed: trashed})
   InvalidateAndRescan(parent)
   Render()
   if parent !=# ''
@@ -2729,9 +3382,12 @@ def BuildHelpLines(): list<string>
     'Y     复制完整路径到寄存器',
     'gx    用系统默认程序打开',
     ca_key .. '     一键折叠根下所有目录',
+    'F     过滤已加载节点（空串清除）',
+    '/     按名称查找并跳转；]f/[f 下一个/上一个匹配',
     '?     显示/关闭本帮助面板',
     '----------------------------------------',
     '提示：新建支持 foo/bar.ext；删除优先移到系统回收站；剪切成功后自动清空剪贴板。',
+    '按键可用 g:simpletree_mappings 自定义；此帮助显示默认键位。',
   ]
 enddef
 
@@ -3032,6 +3688,7 @@ export def Toggle(root: string = '')
 
   s_session_generation += 1
   s_open = true
+  SeedModifiedPaths()
   EnsureWindowAndBuffer()
   if !BEnsureBackend()
     echohl ErrorMsg
@@ -3042,6 +3699,9 @@ export def Toggle(root: string = '')
 
   var st = GetNodeState(s_root)
   st.expanded = true
+  WatchExpandedDirs()
+  GitStatusRefresh()
+  Emit('Open', {root: s_root})
 
   # 改动点：如果有当前文件，优先进行 Reveal，避免初始 Render 的闪烁
   if curf_abs !=# '' && filereadable(curf_abs) && IsSubPath(s_root, curf_abs)
@@ -3169,48 +3829,8 @@ def SmartRefresh()
   if !WinValid() || s_root ==# ''
     return
   endif
-
-  # 检测哪些目录有变化
-  var changed_dirs = DetectChangesInExpandedDirs()
-
-  # 如果没有变化，直接返回
-  if len(changed_dirs) == 0
-    return
-  endif
-
-  # 保存当前光标位置的节点路径
-  var current_node = CursorNode()
-  var current_path = get(current_node, 'path', '')
-
-  # 增量刷新：只清除有变化的目录的缓存
-  for dir_path in changed_dirs
-    if has_key(s_cache, dir_path)
-      call remove(s_cache, dir_path)
-    endif
-    if has_key(s_scan_errors, dir_path)
-      call remove(s_scan_errors, dir_path)
-    endif
-    # 取消该目录的待处理请求
-    CancelPending(dir_path)
-  endfor
-
-  # 重新扫描有变化的目录
-  for dir_path in changed_dirs
-    if get(GetNodeState(dir_path), 'expanded', false)
-      ScanDirAsync(dir_path)
-    endif
-  endfor
-
-  # 更新修改时间缓存
-  UpdateDirMtimes(changed_dirs)
-
-  # 重新渲染
-  Render()
-
-  # 异步扫描完成后恢复光标位置
-  if current_path !=# ''
-    RevealPath(current_path)
-  endif
+  # mtime 轮询检测变化，交给与 fs_event 相同的定点刷新路径。
+  RefreshDirs(DetectChangesInExpandedDirs())
 enddef
 
 def DoAutoRefresh()
@@ -3231,6 +3851,12 @@ export def AutoRefreshOnIdle()
   # 当光标停止移动一段时间后刷新
   # 仅当 simpletree 窗口可见时才刷新
   if !WinValid()
+    return
+  endif
+
+  # daemon watch 生效时事件已经推送变更；空闲轮询只在无 watch 时兜底。
+  # FocusGained 路径仍保留轮询，覆盖睡眠或网络盘丢事件的场景。
+  if WatcherEnabled() && !empty(s_watched) && empty(s_watch_failed)
     return
   endif
 
@@ -3333,6 +3959,18 @@ export def Health()
   endif
   echom '  [--] system clipboard: ' .. (clipboard ==# '' ? 'no provider; unnamed register still works' : clipboard)
 
+  var caps_detail = 'not connected yet; open the tree first'
+  if len(s_backend_caps) > 0
+    caps_detail = 'protocol v' .. s_backend_protocol .. ': ' .. join(sort(keys(s_backend_caps)), ', ')
+  endif
+  echom '  [--] backend capabilities: ' .. caps_detail
+  echom '  [--] git status: ' .. (!get(g:, 'simpletree_git_status', 1)
+    ? 'disabled'
+    : (HasCap('git-status') ? 'active' : 'waiting for backend capability'))
+  echom '  [--] fs watch: ' .. (!get(g:, 'simpletree_use_watcher', 1)
+    ? 'disabled (mtime polling)'
+    : (HasCap('watch') ? ('active, ' .. len(s_watched) .. ' dir(s)') : 'waiting for backend capability (mtime polling)'))
+
   if vim_ok && async_ok && float_ok && backend_ok
     echohl MoreMsg | echom '[SimpleTree] ready' | echohl None
   else
@@ -3345,13 +3983,33 @@ export def UpdateDecorations()
   if !WinValid() || &buftype !=# ''
     return
   endif
-  var key = string(bufnr())
-  var modified = !!&modified
-  if has_key(s_buffer_modified, key) && s_buffer_modified[key] == modified
+  var path = expand('%:p')
+  if path ==# ''
     return
   endif
-  s_buffer_modified[key] = modified
+  path = NormPath(path)
+  var modified = !!&modified
+  if get(s_modified_paths, path, v:false) == modified
+    return
+  endif
+  if modified
+    s_modified_paths[path] = true
+  elseif has_key(s_modified_paths, path)
+    call remove(s_modified_paths, path)
+    # modified -> saved 意味着磁盘内容变化；无 watch 时也让 git 装饰跟上。
+    GitStatusRefresh()
+  endif
   ScheduleRender()
+enddef
+
+# 打开树时把当前已修改的 buffer 一次性装载进 path 字典，之后全事件驱动。
+def SeedModifiedPaths()
+  s_modified_paths = {}
+  for info in getbufinfo({bufmodified: 1})
+    if get(info, 'name', '') !=# ''
+      s_modified_paths[NormPath(info.name)] = true
+    endif
+  endfor
 enddef
 
 export def OnRevealActive()
@@ -3611,5 +4269,82 @@ export def StatusLine(): string
   if !s_hide_dotfiles
     flags->add('hidden:on')
   endif
+  if FilterActive()
+    flags->add('filter:' .. s_filter_query)
+  endif
   return ' EXPLORER  ' .. display .. (len(flags) > 0 ? ('  [' .. join(flags, ',') .. ']') : '')
+enddef
+
+# =============================================================
+# 深度搜索（daemon 下沉；结果进 quickfix）
+# =============================================================
+export def Search(query: string, mode: string = 'substring')
+  if query ==# ''
+    echo '[SimpleTree] usage: :SimpleTreeSearch <query>'
+    return
+  endif
+  if s_root ==# ''
+    echo '[SimpleTree] open the tree first to set a root'
+    return
+  endif
+  if !BEnsureBackend()
+    return
+  endif
+  if !HasCap('search')
+    echo '[SimpleTree] backend does not support search; rebuild with install.sh'
+    return
+  endif
+  var results: list<dict<any>> = []
+  var q = query
+  var id = BNextId()
+  s_bcbs[id] = {
+    OnChunk: (entries) => {
+      for e in entries
+        results->add({filename: e.path, lnum: 1, text: (e.is_dir ? '[dir] ' : '') .. e.name})
+      endfor
+    },
+    OnDone: () => {
+      if len(results) == 0
+        echo '[SimpleTree] no matches for: ' .. q
+        return
+      endif
+      call setqflist([], ' ', {title: 'SimpleTree search: ' .. q, items: results})
+      execute 'copen'
+    },
+    OnError: (msg) => {
+      echohl WarningMsg
+      echom '[SimpleTree] search failed: ' .. msg
+      echohl None
+    },
+  }
+  if !BSend({type: 'search', id: id, root: s_root, query: query, mode: mode, show_hidden: !s_hide_dotfiles, git_ignore: s_git_ignore})
+    if has_key(s_bcbs, id)
+      call remove(s_bcbs, id)
+    endif
+    echo '[SimpleTree] failed to send search request'
+  endif
+enddef
+
+# =============================================================
+# 测试钩子（headless 测试注入协议事件用；运行时不应调用）
+# =============================================================
+export def TestSetCaps(caps: list<string>)
+  ApplyCapabilities(caps, 2)
+enddef
+
+export def TestSetFilter(q: string)
+  s_filter_query = q
+  s_filter_memo = {}
+  Emit('FilterChanged', {query: q})
+  Render()
+enddef
+
+export def TestGetState(): dict<any>
+  return {
+    caps: keys(s_backend_caps),
+    watched: keys(s_watched),
+    git_status_count: len(s_git_status),
+    filter: s_filter_query,
+    path_lines: len(s_path_lines),
+  }
 enddef

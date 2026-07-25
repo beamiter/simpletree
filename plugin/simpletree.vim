@@ -209,6 +209,18 @@ g:simpletree_split_below = get(g:, 'simpletree_split_below', 1)
 g:simpletree_set_default_mapping = get(g:, 'simpletree_set_default_mapping', 1)
 
 # =============================================================
+# 协议 v2 特性（能力握手后生效；旧后端自动降级）
+# =============================================================
+# 树中显示 git 状态标记与配色（需要后端 git-status 能力与 git 可执行）
+g:simpletree_git_status = get(g:, 'simpletree_git_status', 1)
+# 覆盖 git 状态符号，如 {'M': '*', 'U': '?'}
+g:simpletree_git_status_symbols = get(g:, 'simpletree_git_status_symbols', {})
+# 使用后端文件系统 watch 推送刷新；关闭后回到 mtime 轮询
+g:simpletree_use_watcher = get(g:, 'simpletree_use_watcher', 1)
+# 树缓冲区按键覆盖表：{键: action}；action 为空字符串表示禁用该键
+g:simpletree_mappings = get(g:, 'simpletree_mappings', {})
+
+# =============================================================
 # 运行时控制与诊断
 # =============================================================
 def g:SimpleTreeMaybeAutoRefresh(source: string)
@@ -293,6 +305,7 @@ command! SimpleTreeHealth simpletree#Health()
 command! SimpleTreeVersion call g:SimpleTreeVersion()
 command! SimpleTreeToggleAutoRefresh call g:SimpleTreeToggleAutoRefresh()
 command! SimpleTreeToggleAutoFollow call g:SimpleTreeToggleAutoFollow()
+command! -nargs=+ SimpleTreeSearch simpletree#Search(<q-args>)
 
 nnoremap <silent> <Plug>(simpletree-toggle) <Cmd>SimpleTree<CR>
 if g:simpletree_set_default_mapping && maparg('<leader>e', 'n') ==# ''

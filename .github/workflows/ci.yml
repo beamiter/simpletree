@@ -78,3 +78,6 @@ jobs:
 
       - name: Test Vim file operations
         run: vim -Nu NONE -n -es -X -i NONE -S tests/vim_integration.vim
+
+      - name: Test Vim protocol v2 features
+        run: vim -Nu NONE -n -es -X -i NONE -S tests/vim_v2_features.vim

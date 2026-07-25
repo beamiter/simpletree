@@ -108,6 +108,14 @@ under lib/ first, then target/release/ and target/debug/ for development use.
 :SimpleTreeToggleAutoFollow
         Toggle |g:simpletree_auto_follow| for the current Vim session.
 
+                                                *:SimpleTreeSearch*
+:SimpleTreeSearch {query}
+        Ask the backend for a recursive filename search below the current
+        root and put the matches into the quickfix list.  Requires a backend
+        that advertises the "search" capability.  Substring matching is the
+        default; call simpletree#Search({query}, 'fuzzy') for ordered
+        subsequence matching.
+
 ==============================================================================
 5. MAPPINGS                                      *simpletree-mappings*
 
@@ -163,10 +171,42 @@ Y       Copy the absolute path to Vim's unnamed register and optionally the
 gx      Open with the system default application.
 z       Collapse all directories below the root.  Configure with
         |g:simpletree_collapse_all_key|.
+F       Filter loaded nodes by name; matching entries and their ancestors
+        stay visible.  An empty query clears the filter.  The filter only
+        applies to directories whose listings are already loaded.
+/       Prompt for a name and jump to the next matching row.
+]f, [f  Jump to the next / previous match of the last / query.
 ?       Toggle the mapping help window.
 
 The root is locked by default.  Press L before e, U, C, . or d when root
 changes are needed.
+
+CUSTOM MAPPINGS ~
+                                                *g:simpletree_mappings*
+Every tree-buffer key can be remapped or disabled through a dictionary of
+{key: action} pairs.  An empty action disables the key: >
+  let g:simpletree_mappings = {'X': 'refresh', 'q': ''}
+<
+Available actions: open, expand, collapse, collapse_all, refresh,
+toggle_hidden, toggle_git_ignore, close, root_here, root_up, root_prompt,
+root_cwd, root_current, toggle_root_lock, copy, cut, paste, new_file,
+new_folder, rename, delete, help, open_vsplit, open_split, open_tab,
+preview, reveal_active, yank_name, yank_path, system_open, filter, find,
+find_next, find_prev.
+
+|g:simpletree_collapse_all_key| is still honored as a compatibility alias
+for the collapse_all action.
+
+USER EVENTS ~
+                                                *simpletree-events*
+SimpleTree fires |User| autocommands around tree lifecycle and file
+operations.  Payload data is passed through g:simpletree_event: >
+  autocmd User SimpleTreeFileCreated echom g:simpletree_event.path
+<
+Events: SimpleTreeOpen, SimpleTreeClose, SimpleTreeRootChanged,
+SimpleTreeNodeOpened, SimpleTreeDirExpanded, SimpleTreeDirCollapsed,
+SimpleTreeFileCreated, SimpleTreeFileDeleted, SimpleTreeFileRenamed,
+SimpleTreeGitStatusUpdated, SimpleTreeFilterChanged.
 
 ==============================================================================
 6. OPTIONS                                        *simpletree-options*
@@ -324,6 +364,30 @@ g:simpletree_debug
 g:simpletree_set_default_mapping
         Boolean, default 1.  Install <Leader>e only when it is unused.
 
+                                             *g:simpletree_git_status*
+g:simpletree_git_status
+        Boolean, default 1.  Show per-file git status marks and colors.
+        Effective only when the backend advertises the "git-status"
+        capability and git is executable; otherwise the tree silently
+        behaves as if this were 0.
+
+                                             *g:simpletree_git_status_symbols*
+g:simpletree_git_status_symbols
+        Dictionary, default {}.  Override status symbols keyed by the codes
+        M (modified), S (staged), U (untracked), C (conflict), D (deleted).
+        Defaults follow |g:simpletree_use_nerdfont|.
+
+        Highlight groups (all `highlight default link`):
+        SimpleTreeGitModified, SimpleTreeGitStaged, SimpleTreeGitUntracked,
+        SimpleTreeGitConflict, SimpleTreeGitDeleted.
+
+                                             *g:simpletree_use_watcher*
+g:simpletree_use_watcher
+        Boolean, default 1.  Subscribe expanded directories to backend
+        filesystem watching and refresh from pushed fs_event records.
+        Directories whose watch registration fails, and backends without
+        the "watch" capability, fall back to mtime polling.
+
 ==============================================================================
 7. WIDTH PERSISTENCE                       *simpletree-width-state*
 
@@ -350,8 +414,14 @@ Protocol mode uses one JSON object per line.  A client may send: >
 
   {"type":"ping","id":1}
 <
-The pong event includes protocol_version, daemon_version, and capabilities.
-Existing list and cancel requests remain compatible.  Use
+The pong event includes protocol_version (currently 2), daemon_version, and
+capabilities.  Protocol v2 adds: a `meta` flag on list requests (size, mtime,
+is_symlink per entry), watch/unwatch requests with pushed fs_event records,
+git_status requests with per-file codes and directory aggregation, and
+streaming search requests.  Unreadable children degrade to warnings on the
+final chunk instead of failing the listing, and non-UTF-8 names are listed
+lossily with a non_utf8 flag.  Existing list and cancel requests remain
+compatible; old clients ignore unknown event types.  Use
 |:SimpleTreeVersion| for the executable discovered by Vim.
 
 The daemon bounds concurrent blocking scans and keeps accepted requests

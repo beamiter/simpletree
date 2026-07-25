@@ -21,12 +21,14 @@ cargo --version
 
 - `plugin/simpletree.vim`：配置、命令、全局映射和自动命令
 - `autoload/simpletree.vim`：树状态、渲染、交互与 Vim/daemon 通信
-- `src/simpletree/simpletree_daemon.rs`：JSON Lines 后台协议和目录扫描
+- `src/simpletree/simpletree_daemon.rs`：后台入口与请求调度（协议实现拆分在同目录 protocol / server / scan / watch / git / search 模块）
 - `install.sh`：构建并安装后台到 `lib/`
 - `doc/simpletree.txt`：Vim 内置帮助
 - `tests/daemon_protocol.rs`：后台协议与目录扫描回归测试
+- `tests/daemon_v2.rs`：协议 v2（meta / warnings / cancel / watch / git status / search）回归测试
 - `tests/vim_smoke.vim`：Vim9 headless 加载与命令 smoke test
 - `tests/vim_integration.vim`：真实 daemon、暂存/备份文件操作、缓冲区安全与关闭竞态回归
+- `tests/vim_v2_features.vim`：能力握手、watch 推送、git 状态、按键覆盖、User 事件与过滤
 
 仓库中还包含 Spacemacs 主题文件；除非改动明确与该主题相关，请不要把主题变化混入 SimpleTree 功能提交。
 
@@ -49,7 +51,9 @@ cargo fmt --all -- --check
 cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked --all-targets
 vim -Nu NONE -n -es -X -i NONE -S tests/vim_smoke.vim
+vim -Nu NONE -n -es -X -i NONE -S tests/vim_runtime_controls.vim
 vim -Nu NONE -n -es -X -i NONE -S tests/vim_integration.vim
+vim -Nu NONE -n -es -X -i NONE -S tests/vim_v2_features.vim
 ```
 
 `Cargo.lock` 是后台可执行程序的发布输入；依赖变更时应明确更新并一并评审。不要仅因为当前没有覆盖某条路径的自动测试，就跳过手动验证。

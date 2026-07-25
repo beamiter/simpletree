@@ -4,6 +4,25 @@
 
 ## Unreleased
 
+### Added (0.2.0 protocol v2)
+
+- 协议 v2（`protocol_version = 2`），能力握手驱动：前端 ping 后按 `capabilities` 启用新特性，旧后端自动降级为 v1 行为。
+- 文件系统 watch：后端基于 notify 非递归监听已展开目录，200ms 去抖后推送 `fs_event`；前端收到后定点失效缓存并重扫，外部变更无需手动刷新。watch 不可用或单目录失败时自动回退 mtime 轮询。
+- git status：后端通过 `git status --porcelain=v2 -z` 返回逐文件状态与目录聚合（优先级 C>M>S>U），带 per-repo 缓存、TTL 与 fs 事件失效。树内以符号加高亮显示（`SimpleTreeGit*` 高亮组、text properties 按行染色），`g:simpletree_git_status`、`g:simpletree_git_status_symbols` 可配。
+- 递归搜索下沉到后端：新增 `search` 请求（substring / fuzzy 子序列），流式返回；`:SimpleTreeSearch <query>` 将结果写入 quickfix。
+- Entry 元数据：`list` 请求新增 `meta` 标志，返回 `size`、`mtime`、`is_symlink`（默认关闭，负载不变）。
+- 树缓冲区按键表驱动：`g:simpletree_mappings` 以 `{键: action}` 覆盖或禁用任意默认键；`g:simpletree_collapse_all_key` 保留为兼容别名。
+- User 自动命令事件：`SimpleTree{Open,Close,RootChanged,NodeOpened,DirExpanded,DirCollapsed,FileCreated,FileDeleted,FileRenamed,GitStatusUpdated,FilterChanged}`，数据经 `g:simpletree_event` 传递。
+- 树内过滤（默认 `F`）：按名称过滤已加载节点并保留祖先链；跳转式查找（默认 `/`，`]f` / `[f` 循环匹配）。
+- 新配置：`g:simpletree_use_watcher`、`g:simpletree_git_status`、`g:simpletree_git_status_symbols`、`g:simpletree_mappings`。
+
+### Changed (0.2.0 protocol v2)
+
+- Rust 后端拆分为 protocol / server / scan / watch / git / search 模块；扫描结果对处于 watch 状态的目录启用带失效信号的缓存。
+- 后端健壮性：单个请求 panic 不再终止 daemon；不可读子项降级为 warnings 并跳过（不再整目录失败）；非 UTF-8 文件名以 lossy 名称显示并携带 `non_utf8` 标记。
+- 渲染性能：未保存标记改为事件驱动的 path 字典（渲染期零 buffer 查询）；reveal 与活动高亮通过 path→行号映射 O(1) 定位；mtime 轮询与 fs 事件共用同一条定点刷新路径。
+- daemon watch 生效时跳过 CursorHold 空闲轮询（FocusGained 兜底保留）。
+
 ### Changed
 
 - 窗口宽度持久化改为可配置防抖写入，退出和显式关闭时仍会强制落盘，避免频繁 `WinResized` 触发同步磁盘写入。
