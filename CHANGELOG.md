@@ -4,6 +4,10 @@
 
 ## Unreleased
 
+### Changed
+
+- 刷新依赖 lockfile 并重建 daemon；行为无变化。
+
 ### Added (0.2.0 protocol v2)
 
 - 协议 v2（`protocol_version = 2`），能力握手驱动：前端 ping 后按 `capabilities` 启用新特性，旧后端自动降级为 v1 行为。
