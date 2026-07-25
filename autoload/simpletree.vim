@@ -1499,23 +1499,28 @@ def RefreshDirs(dirs: list<string>)
   if !s_open || len(dirs) == 0
     return
   endif
-  var current_node = CursorNode()
-  var current_path = get(current_node, 'path', '')
   var touched = false
   for dir_path in dirs
     if !PathVisibleInTree(dir_path)
       continue
     endif
     touched = true
-    if has_key(s_cache, dir_path)
-      call remove(s_cache, dir_path)
-    endif
-    if has_key(s_scan_errors, dir_path)
-      call remove(s_scan_errors, dir_path)
-    endif
-    CancelPending(dir_path)
     if get(GetNodeState(dir_path), 'expanded', false)
-      ScanDirAsync(dir_path)
+      # 展开中的目录：保留旧缓存原地强制重扫。行数不抖动，光标不动，
+      # 无需 RevealPath 拉回（旧实现先清缓存导致树身塌缩、光标来回闪）。
+      ScanDirAsync(dir_path, true)
+    else
+      # 未展开的目录只失效缓存，等下次展开时再扫
+      if has_key(s_cache, dir_path)
+        call remove(s_cache, dir_path)
+      endif
+      if has_key(s_scan_errors, dir_path)
+        call remove(s_scan_errors, dir_path)
+      endif
+      CancelPending(dir_path)
+      if has_key(s_loading, dir_path)
+        call remove(s_loading, dir_path)
+      endif
     endif
   endfor
   if !touched
@@ -1525,9 +1530,6 @@ def RefreshDirs(dirs: list<string>)
   UpdateDirMtimes(dirs)
   GitStatusRefresh()
   ScheduleRender()
-  if current_path !=# ''
-    RevealPath(current_path)
-  endif
 enddef
 
 def PathVisibleInTree(path: string): bool
@@ -1757,17 +1759,27 @@ def ScheduleRender()
   endtry
 enddef
 
-def ScanDirAsync(path: string)
+# force = true：跳过缓存/错误守卫强制重扫。旧缓存保留到本次扫描完成后原子
+# 替换，避免中间 Render 出现子项消失、树身抖动、光标被顶走的闪烁。
+def ScanDirAsync(path: string, force: bool = false)
   if !s_open
     return
   endif
-  if has_key(s_cache, path) || has_key(s_scan_errors, path) || get(s_loading, path, v:false)
+  if force
+    if has_key(s_loading, path)
+      call remove(s_loading, path)
+    endif
+    if has_key(s_scan_errors, path)
+      call remove(s_scan_errors, path)
+    endif
+  elseif has_key(s_cache, path) || has_key(s_scan_errors, path) || get(s_loading, path, v:false)
     return
   endif
 
   CancelPending(path)
 
   s_loading[path] = true
+  var keep_stale = has_key(s_cache, path)
   var acc: list<dict<any>> = []
   var p = path
   var req_id: number = 0
@@ -1786,8 +1798,11 @@ def ScanDirAsync(path: string)
       if has_key(s_scan_errors, p)
         call remove(s_scan_errors, p)
       endif
-      s_cache[p] = acc
-      ScheduleRender()
+      # 刷新已有目录时不发布中间结果，保留旧内容直到 OnDone 一次性替换
+      if !keep_stale
+        s_cache[p] = acc
+        ScheduleRender()
+      endif
     },
     () => {
       if !s_open || session_generation != s_session_generation
