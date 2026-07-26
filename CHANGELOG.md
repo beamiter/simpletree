@@ -6,6 +6,9 @@
 
 ### Changed
 
+- 启用 release 调优（lto、codegen-units=1、strip、panic=abort），依据实测：
+  二进制 3.75 MB → 2.06 MB（-45%），启动+ping 往返不变（约 1.7ms），
+  113k 文件的 search 遍历 21ms → 20ms。
 - 刷新依赖 lockfile 并重建 daemon；行为无变化。
 
 ### Added (0.2.0 protocol v2)
