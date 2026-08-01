@@ -4,6 +4,12 @@
 
 ## Unreleased - 2026-08-01
 
+### 构建与 CI 修复
+
+- `ignore` 锁定回 0.4.27:0.4.30 使用了 let-chains(需要 Rust 1.88),而 CI 与 `rust-version` 都是 1.85,`Lint Rust` 作业自 2026-07-26 起一直失败。
+- 修复 `doc/simpletree.txt` 中重复的 help tag(`:SimpleTreeHealth`)。
+- 新增 CI 的 MSRV 作业。
+
 ### 性能:树渲染
 
 实测环境 19200 个文件、展开到 11700 可见行(每次展开/折叠都会触发一次 Render):

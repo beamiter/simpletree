@@ -2,7 +2,6 @@
 :SimpleTreeClose	simpletree.txt	/*:SimpleTreeClose*
 :SimpleTreeDebug	simpletree.txt	/*:SimpleTreeDebug*
 :SimpleTreeHealth	simpletree.txt	/*:SimpleTreeHealth*
-:SimpleTreeHealth	simpletree.txt	/*:SimpleTreeHealth*
 :SimpleTreeLog	simpletree.txt	/*:SimpleTreeLog*
 :SimpleTreeRefresh	simpletree.txt	/*:SimpleTreeRefresh*
 :SimpleTreeRestart	simpletree.txt	/*:SimpleTreeRestart*
