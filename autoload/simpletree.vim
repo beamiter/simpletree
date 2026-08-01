@@ -123,12 +123,8 @@ var s_session_generation: number = 0
 # =============================================================
 # 后端状态（合并）
 # =============================================================
-var s_bjob: any = v:null
-var s_brunning: bool = false
-var s_bbuf: string = ''
 var s_bnext_id = 0
 var s_bcbs: dict<any> = {}   # id -> {OnChunk, OnDone, OnError}
-var s_bgeneration: number = 0
 
 # 协议 v2 能力握手：pong 到达前为空 dict，所有扩展能力按不可用降级。
 var s_backend_caps: dict<bool> = {}
@@ -155,6 +151,9 @@ var s_find_query: string = ''
 
 # path -> 渲染行号（1-based），reveal/高亮 O(1) 定位
 var s_path_lines: dict<number> = {}
+# s_line_index 每次渲染递增；s_path_lines 落后时按需重建。
+var s_line_index_gen: number = 0
+var s_path_lines_gen: number = -1
 
 # path -> 未保存标记；由 UpdateDecorations 事件维护，渲染期只查字典
 var s_modified_paths: dict<bool> = {}
@@ -968,6 +967,7 @@ def InvalidateAndRescan(dir_path: string)
     call remove(s_scan_errors, dir_path)
   endif
   s_filter_memo = {}
+  BumpRenderEpoch()
   if GetNodeState(dir_path).expanded
     ScanDirAsync(dir_path)
   endif
@@ -1033,25 +1033,47 @@ def BNextId(): number
   return s_bnext_id
 enddef
 
-def BFindBackend(): string
-  var override = get(g:, 'simpletree_daemon_path', '')
-  if type(override) == v:t_string && override !=# '' && executable(override)
-    return override
+# 进程生命周期交给 vendored simplecore supervisor：job_status 真实存活判定、
+# 代际守卫、指数退避自动重启与崩溃循环熔断。协议解码仍留在本文件，
+# DispatchLine() 作为 headless 测试的注入点必须保持按行接收。
+var s_core_ready: bool = false
+
+def SetupCore()
+  if s_core_ready
+    return
   endif
-  for dir in split(&runtimepath, ',')
-    var exe = (has('win32') || has('win64')) ? 'simpletree-daemon.exe' : 'simpletree-daemon'
-    for relative in ['/lib/' .. exe, '/target/release/' .. exe, '/target/debug/' .. exe]
-      var p = dir .. relative
-      if executable(p)
-        return p
-      endif
-    endfor
-  endfor
-  return ''
+  s_core_ready = true
+  simpletree#core#Setup({
+    name: 'SimpleTree',
+    exe: 'simpletree-daemon',
+    path_var: 'simpletree_daemon_path',
+    debug_var: 'simpletree_debug',
+    codec: 'raw',
+    OnLine: DispatchLine,
+    OnStart: OnBackendStart,
+    OnExit: OnBackendExit,
+  })
+enddef
+
+def BFindBackend(): string
+  SetupCore()
+  return simpletree#core#FindExe()
 enddef
 
 def BIsRunning(): bool
-  return s_brunning
+  return simpletree#core#IsRunning()
+enddef
+
+# 新进程没有任何会话状态：重新握手，pong 到达后补挂 watch 与 git 状态。
+def OnBackendStart()
+  ResetBackendSessionState()
+  simpletree#core#Send({type: 'ping', id: BNextId()})
+enddef
+
+def OnBackendExit(code: number, restarting: bool)
+  s_bcbs = {}
+  ResetBackendSessionState()
+  BackendCrashed(restarting)
 enddef
 
 def HasCap(name: string): bool
@@ -1141,7 +1163,7 @@ export def DispatchLine(line: string)
   endif
 enddef
 
-def BackendCrashed()
+def BackendCrashed(restarting: bool = false)
   var failed_paths = keys(s_loading)
   try
     for [p, id] in items(s_pending)
@@ -1155,7 +1177,9 @@ def BackendCrashed()
     if has_key(s_cache, path)
       call remove(s_cache, path)
     endif
-    s_scan_errors[path] = 'backend exited; press R to retry'
+    s_scan_errors[path] = restarting
+      ? 'backend restarting…'
+      : 'backend exited; press R to retry'
     if isdirectory(path)
       s_dir_mtimes[path] = GetDirMtime(path)
     endif
@@ -1163,109 +1187,31 @@ def BackendCrashed()
   if !s_open
     return
   endif
-  echohl ErrorMsg
-  echom '[SimpleTree] backend exited. State cleared. Please retry.'
-  echohl None
+  if !restarting
+    echohl ErrorMsg
+    echom '[SimpleTree] backend exited. State cleared. Please retry.'
+    echohl None
+  endif
   Render()
 enddef
 
 def BEnsureBackend(cmd: string = ''): bool
-  if BIsRunning()
-    return true
+  SetupCore()
+  if cmd !=# ''
+    simpletree#core#Configure('path_var', 'simpletree_daemon_path')
   endif
-  var cmdExe = cmd ==# '' ? BFindBackend() : cmd
-  if cmdExe ==# '' || !executable(cmdExe)
-    echohl ErrorMsg
-    echom '[SimpleTree] backend not found. Set g:simpletree_daemon_path or put simpletree-daemon into runtimepath/lib/.'
-    echohl None
-    return false
-  endif
-
-  s_bbuf = ''
-  s_bgeneration += 1
-  var backend_generation = s_bgeneration
-  try
-    s_bjob = job_start([cmdExe], {
-      in_io: 'pipe',
-      out_mode: 'nl',
-      out_cb: (ch, line) => {
-        DispatchLine(line)
-      },
-      err_mode: 'nl',
-      err_cb: (ch, line) => {
-        # 可选：stderr 日志
-      },
-      exit_cb: (ch, code) => {
-        # BStop() 会推进代际；旧 job 的退出回调不得清理或报错到新 job。
-        if backend_generation != s_bgeneration
-          return
-        endif
-        s_brunning = false
-        s_bjob = v:null
-        s_bbuf = ''
-        s_bcbs = {}
-        ResetBackendSessionState()
-        try
-          BackendCrashed()
-        catch
-        endtry
-      },
-      stoponexit: 'term'
-    })
-  catch
-    s_bjob = v:null
-    s_brunning = false
-    echohl ErrorMsg
-    echom '[SimpleTree] job_start failed: ' .. v:exception
-    echohl None
-    return false
-  endtry
-
-  s_brunning = s_bjob != v:null && job_status(s_bjob) ==# 'run'
-  if !s_brunning
-    s_bjob = v:null
-    echohl ErrorMsg
-    echom '[SimpleTree] backend failed to start.'
-    echohl None
-  else
-    # 能力握手：pong 到达前扩展能力保持关闭，旧 daemon 自然降级。
-    BSend({type: 'ping', id: BNextId()})
-  endif
-  return s_brunning
+  return simpletree#core#Ensure()
 enddef
 
 def BStop(): void
-  var job = s_bjob
-  # 先让当前 job 的 exit_cb 失效，正常停止不应被当成后端崩溃。
-  s_bgeneration += 1
-  s_brunning = false
-  s_bjob = v:null
-  s_bbuf = ''
+  SetupCore()
+  simpletree#core#Stop()
   s_bcbs = {}
   ResetBackendSessionState()
-  if job != v:null
-    try
-      call('job_stop', [job])
-    catch
-    endtry
-  endif
 enddef
 
 def BSend(req: dict<any>): bool
-  if !BIsRunning() || s_bjob == v:null
-    return false
-  endif
-  try
-    if job_status(s_bjob) !=# 'run'
-      s_brunning = false
-      return false
-    endif
-    var json = json_encode(req) .. "\n"
-    ch_sendraw(s_bjob, json)
-    return true
-  catch
-    return false
-  endtry
+  return simpletree#core#Send(req)
 enddef
 
 def BList(path: string, show_hidden: bool, git_ignore: bool, max: number, OnChunk: func, OnDone: func, OnError: func): number
@@ -1371,6 +1317,7 @@ def ResetBackendSessionState()
   s_watched = {}
   s_watch_failed = {}
   s_git_status = {}
+  BumpRenderEpoch()
   s_git_repo_root = ''
 enddef
 
@@ -1527,6 +1474,7 @@ def RefreshDirs(dirs: list<string>)
     return
   endif
   s_filter_memo = {}
+  BumpRenderEpoch()
   UpdateDirMtimes(dirs)
   GitStatusRefresh()
   ScheduleRender()
@@ -1573,6 +1521,7 @@ def OnGitStatusEvent(ev: dict<any>)
     return
   endif
   s_git_status = statuses
+  BumpRenderEpoch()
   s_git_repo_root = get(ev, 'repo_root', '')
   if get(ev, 'truncated', v:false)
     Log('git status truncated for ' .. s_git_repo_root, 'WarningMsg')
@@ -1659,6 +1608,7 @@ export def OnFilter()
   endtry
   s_filter_query = q
   s_filter_memo = {}
+  BumpRenderEpoch()
   Emit('FilterChanged', {query: q})
   Render()
   if q ==# ''
@@ -1822,6 +1772,7 @@ def ScanDirAsync(path: string, force: bool = false)
       # 列表成功后订阅该目录的文件系统事件（能力可用时）。
       WatchDir(p)
       s_filter_memo = {}
+      BumpRenderEpoch()
       ScheduleRender()
       # Reveal 回调：扫描完成后尝试定位目标，避免轮询定时器
       if s_reveal_target !=# '' && FocusIfPresent(s_reveal_target)
@@ -2212,35 +2163,128 @@ def EnsureWindowAndBuffer()
   call win_execute(s_winid, 'setlocal statusline=%{simpletree#StatusLine()}')
 enddef
 
+# ─────────────────── 子树渲染缓存 ───────────────────
+#
+# Render() 过去每次展开/折叠都要把整棵可见树重建一遍：对每个可见节点做字符串
+# 拼接与字典构造，11k 行时约 60ms,而这发生在每一次按键上。现在按目录缓存已
+# 渲染好的切片,只重建真正变化的那部分,其余用 extend() 拼接。
+#
+# 正确性只依赖一条规则:BuildLines 读到的每一样状态,要么进入下面的
+# SubtreeValid() 校验,要么调用 BumpRenderEpoch()。
+# tests/vim_render_cache.vim 通过对比 "走缓存" 与 "禁用缓存" 两种渲染结果来
+# 钉死这条规则。
+#
+# path -> {depth, epoch, entries, count, dirs, lines, idx}
+var s_subtree_cache: dict<dict<any>> = {}
+var s_render_epoch: number = 0
+var s_render_cfg_sig: string = ''
+# 测试用:置 true 后完全绕过缓存,用于产出参照渲染。
+var s_render_cache_off: bool = false
+
+# 任何不由 SubtreeValid() 覆盖的状态变化都必须走这里:git 状态、未保存标记、
+# 过滤条件、根目录切换、整表重置。
+def BumpRenderEpoch()
+  s_render_epoch += 1
+  s_subtree_cache = {}
+enddef
+
+# 影响行内容的配置项。每次 Render() 比对一次,变了就整体失效——O(1) 且不会
+# 因为用户运行时改配置而渲染出陈旧的图标或后缀。
+def RenderConfigSig(): string
+  return string([
+    !!get(g:, 'simpletree_show_file_icons', 1),
+    !!get(g:, 'simpletree_folder_suffix', 1),
+    !!get(g:, 'simpletree_show_modified', 1),
+    get(g:, 'simpletree_modified_symbol', '●'),
+    !!get(g:, 'simpletree_use_nerdfont', 0),
+    GitStatusEnabled(),
+    GitSymbols(),
+    s_icons,
+  ])
+enddef
+
+def SubtreeValidPath(path: string, depth: number): bool
+  # 没有目录缓存时渲染的是 loading/error 占位行,那种情况从不进缓存。
+  if !has_key(s_cache, path)
+    return false
+  endif
+  return SubtreeValid(path, depth, s_cache[path])
+enddef
+
+def SubtreeValid(path: string, depth: number, entries: list<dict<any>>): bool
+  if !has_key(s_subtree_cache, path)
+    return false
+  endif
+  var rec = s_subtree_cache[path]
+  if rec.depth != depth || rec.epoch != s_render_epoch
+    return false
+  endif
+  # 目录列表必须是同一个 list 对象且长度未变:流式扫描是往同一个 list 里追加,
+  # 只比对象身份会漏掉增量到达的条目。
+  if rec.entries isnot entries || rec.count != len(entries)
+    return false
+  endif
+  # 只需要检查目录子节点:文件行的内容完全由 entries 与 epoch 决定。
+  for pair in rec.dirs
+    if GetNodeState(pair[0]).expanded != pair[1]
+      return false
+    endif
+    if pair[1] && !SubtreeValidPath(pair[0], depth + 1)
+      return false
+    endif
+  endfor
+  return true
+enddef
+
 def BuildLines(path: string, depth: number, lines: list<string>, idx: list<dict<any>>)
+  var rec = BuildSubtree(path, depth)
+  if !empty(rec.lines)
+    lines->extend(rec.lines)
+    idx->extend(rec.idx)
+  endif
+enddef
+
+def BuildSubtree(path: string, depth: number): dict<any>
   var want = GetNodeState(path).expanded
   if !want
-    return
+    return {lines: [], idx: []}
   endif
 
   var hasCache = has_key(s_cache, path)
   var isLoading = get(s_loading, path, v:false)
 
   if !hasCache
+    # 占位行随扫描进度频繁变化,不值得缓存,也只有一行。
     if has_key(s_scan_errors, path)
       var message = strcharpart(substitute(s_scan_errors[path], '[\r\n]', ' ', 'g'), 0, 100)
-      lines->add(repeat('  ', depth) .. '! ' .. message)
-      idx->add({path: '', is_dir: false, name: '', depth: depth, error: true})
-      return
+      return {
+        lines: [repeat('  ', depth) .. '! ' .. message],
+        idx: [{path: '', is_dir: false, name: '', depth: depth, error: true}],
+      }
     endif
     if !isLoading
       ScanDirAsync(path)
     endif
-    lines->add(repeat('  ', depth) .. s_icons.loading .. ' Loading...')
-    idx->add({path: '', is_dir: false, name: '', depth: depth, loading: true})
-    return
+    return {
+      lines: [repeat('  ', depth) .. s_icons.loading .. ' Loading...'],
+      idx: [{path: '', is_dir: false, name: '', depth: depth, loading: true}],
+    }
   endif
 
   var entries = s_cache[path]
+  if !s_render_cache_off && SubtreeValid(path, depth, entries)
+    return s_subtree_cache[path]
+  endif
+
+  var lines: list<string> = []
+  var idx: list<dict<any>> = []
+  var dirs: list<list<any>> = []
+
   var show_icons = !!get(g:, 'simpletree_show_file_icons', 1)
   var show_suffix = !!get(g:, 'simpletree_folder_suffix', 1)
   var show_modified = !!get(g:, 'simpletree_show_modified', 1)
   var git_symbols = GitSymbols()
+  var modified_symbol = get(g:, 'simpletree_modified_symbol', '●')
   var indent = repeat('  ', depth)
   for e in entries
     if !FilterAllowsEntry(e)
@@ -2251,13 +2295,14 @@ def BuildLines(path: string, depth: number, lines: list<string>, idx: list<dict<
     if e.is_dir
       expanded = GetNodeState(e.path).expanded
       icon = expanded ? s_icons.dir_open : s_icons.dir
+      dirs->add([e.path, expanded])
     else
       icon = show_icons ? FileIcon(e.name) : s_icons.file
     endif
     var suffix = (e.is_dir && show_suffix) ? '/' : ''
     # 未保存标记走事件维护的 path 字典，渲染期零 buffer 查询。
     var modified = !e.is_dir && show_modified && get(s_modified_paths, e.path, v:false)
-    var decoration = modified ? (' ' .. get(g:, 'simpletree_modified_symbol', '●')) : ''
+    var decoration = modified ? (' ' .. modified_symbol) : ''
     var git_code = GitCodeFor(e.path)
     if git_code !=# ''
       decoration ..= ' ' .. get(git_symbols, git_code[0], git_code[0])
@@ -2267,9 +2312,27 @@ def BuildLines(path: string, depth: number, lines: list<string>, idx: list<dict<
     idx->add({path: e.path, is_dir: e.is_dir, name: e.name, depth: depth, modified: modified, git: git_code})
 
     if expanded
-      BuildLines(e.path, depth + 1, lines, idx)
+      var sub = BuildSubtree(e.path, depth + 1)
+      if !empty(sub.lines)
+        lines->extend(sub.lines)
+        idx->extend(sub.idx)
+      endif
     endif
   endfor
+
+  var rec = {
+    depth: depth,
+    epoch: s_render_epoch,
+    entries: entries,
+    count: len(entries),
+    dirs: dirs,
+    lines: lines,
+    idx: idx,
+  }
+  if !s_render_cache_off
+    s_subtree_cache[path] = rec
+  endif
+  return rec
 enddef
 
 def RootLabel(): string
@@ -2304,11 +2367,29 @@ def UpdateActiveHighlight()
   endif
 enddef
 
+# path -> 行号索引。渲染期不再预先构建，第一次查询时按当前 s_line_index 建好
+# 并缓存，直到下一次渲染换掉索引为止。
+def EnsurePathLines()
+  if s_path_lines_gen == s_line_index_gen
+    return
+  endif
+  var pl: dict<number> = {}
+  for i in range(len(s_line_index))
+    var p = get(s_line_index[i], 'path', '')
+    if p !=# '' && !has_key(pl, p)
+      pl[p] = i + 1
+    endif
+  endfor
+  s_path_lines = pl
+  s_path_lines_gen = s_line_index_gen
+enddef
+
 # path -> 行号 O(1)；未命中时回退到规范化比较，兼容大小写/斜杠差异。
 def PathLine(path: string): number
   if path ==# ''
     return 0
   endif
+  EnsurePathLines()
   var lnum = get(s_path_lines, path, 0)
   if lnum > 0
     return lnum
@@ -2377,8 +2458,24 @@ enddef
 # every expand/collapse — forcing Vim to re-render and re-syntax the whole
 # buffer. Diffing means unchanged rows aren't marked modified, so large trees
 # and streaming updates stay smooth.
+# 上一次写进树 buffer 的内容。buffer 由本插件独占且 nomodifiable，所以可以拿
+# 它当 diff 基准，省掉每次渲染都把上万行读回来的开销；行数对不上就退回真读，
+# 保证外部把 buffer 换掉时不会写错。
+var s_rendered_lines: list<string> = []
+var s_rendered_bufnr: number = -1
+
+def BufferLineCount(): number
+  var info = getbufinfo(s_bufnr)
+  return len(info) > 0 ? get(info[0], 'linecount', -1) : -1
+enddef
+
 def UpdateBufferDiff(out: list<string>)
-  var cur = getbufline(s_bufnr, 1, '$')
+  var cur: list<string>
+  if s_rendered_bufnr == s_bufnr && len(s_rendered_lines) == BufferLineCount()
+    cur = s_rendered_lines
+  else
+    cur = getbufline(s_bufnr, 1, '$')
+  endif
   var n_new = len(out)
   var n_cur = len(cur)
   var i = 0
@@ -2402,6 +2499,9 @@ def UpdateBufferDiff(out: list<string>)
     catch
     endtry
   endif
+  # copy(): 调用方后面还会把 out 交给别的函数，缓存必须是当时的快照。
+  s_rendered_lines = copy(out)
+  s_rendered_bufnr = s_bufnr
 enddef
 
 def Render()
@@ -2412,8 +2512,16 @@ def Render()
 
   call EnsureSyntaxTree()
 
+  # 运行时改了图标/后缀之类的配置,整棵缓存作废。O(1),每次渲染只比一次。
+  var cfg_sig = RenderConfigSig()
+  if cfg_sig !=# s_render_cfg_sig
+    s_render_cfg_sig = cfg_sig
+    BumpRenderEpoch()
+  endif
+
   var selected = CursorNode()
   var selected_path = get(selected, 'path', '')
+  var selected_lnum = CursorLine()
   var lines: list<string> = []
   var idx: list<dict<any>> = []
 
@@ -2459,17 +2567,17 @@ def Render()
   endtry
 
   s_line_index = idx
-  var path_lines: dict<number> = {}
-  for i in range(len(idx))
-    var p = get(idx[i], 'path', '')
-    if p !=# '' && !has_key(path_lines, p)
-      path_lines[p] = i + 1
-    endif
-  endfor
-  s_path_lines = path_lines
+  # path -> 行号的字典按需构建：一次渲染通常只查一次(恢复光标)，为此建一个
+  # 上万条的字典纯属浪费。PathLine() 真要用时才建。
+  s_line_index_gen += 1
   ApplyGitHighlights(out)
   if selected_path !=# ''
-    FocusPath(selected_path)
+    # 展开/折叠光标所在目录时它自己的行号不变，先做 O(1) 校验；命中就完全
+    # 不必构建 path->行号 字典。
+    if selected_lnum <= 0 || selected_lnum > len(idx)
+        || get(idx[selected_lnum - 1], 'path', '') !=# selected_path
+      FocusPath(selected_path)
+    endif
   endif
   UpdateActiveHighlight()
 enddef
@@ -2488,8 +2596,10 @@ def SetRoot(new_root: string, lock: bool = false)
   var old_root = s_root
   UnwatchAllDirs()
   s_git_status = {}
+  BumpRenderEpoch()
   s_git_repo_root = ''
   s_filter_memo = {}
+  BumpRenderEpoch()
   s_root = nr
   if lock
     s_root_locked = true
@@ -2687,6 +2797,14 @@ export def AutoFollow()
     # 不切根时，若文件超出当前根，仅在日志中提示（debug 模式）
     Log('AutoFollow: file outside root; no change', 'Comment')
   endif
+enddef
+
+def CursorLine(): number
+  if !WinValid()
+    return 0
+  endif
+  var pos = getcurpos(s_winid)
+  return len(pos) > 1 ? pos[1] : 0
 enddef
 
 def CursorNode(): dict<any>
@@ -3919,7 +4037,7 @@ export def DebugStatus()
   endif
   echo '  active_line: ' .. active_line
   echo '  target_winid: ' .. s_target_winid
-  echo '  backend_running: ' .. (s_brunning ? 'yes' : 'no')
+  echo '  backend_running: ' .. (BIsRunning() ? 'yes' : 'no')
   echo '  pending: ' .. string(items(s_pending))
   echo '  loading: ' .. string(keys(s_loading))
   echo '  scan_errors: ' .. string(s_scan_errors)
@@ -3932,6 +4050,19 @@ def HealthItem(ok: bool, label: string, detail: string = '')
   echom printf('  %s %s%s', ok ? '[ok]' : '[!!]', label,
     detail ==# '' ? '' : ': ' .. detail)
   echohl None
+enddef
+
+export def Restart()
+  SetupCore()
+  s_bcbs = {}
+  ResetBackendSessionState()
+  if simpletree#core#Restart()
+    echom '[SimpleTree] backend restarted'
+  endif
+enddef
+
+export def ShowLog()
+  simpletree#core#ShowLog()
 enddef
 
 export def Health()
@@ -3979,6 +4110,9 @@ export def Health()
     caps_detail = 'protocol v' .. s_backend_protocol .. ': ' .. join(sort(keys(s_backend_caps)), ', ')
   endif
   echom '  [--] backend capabilities: ' .. caps_detail
+  for line in simpletree#core#HealthLines()
+    echom '  ' .. line
+  endfor
   echom '  [--] git status: ' .. (!get(g:, 'simpletree_git_status', 1)
     ? 'disabled'
     : (HasCap('git-status') ? 'active' : 'waiting for backend capability'))
@@ -4009,8 +4143,10 @@ export def UpdateDecorations()
   endif
   if modified
     s_modified_paths[path] = true
+    BumpRenderEpoch()
   elseif has_key(s_modified_paths, path)
     call remove(s_modified_paths, path)
+    BumpRenderEpoch()
     # modified -> saved 意味着磁盘内容变化；无 watch 时也让 git 装饰跟上。
     GitStatusRefresh()
   endif
@@ -4020,9 +4156,11 @@ enddef
 # 打开树时把当前已修改的 buffer 一次性装载进 path 字典，之后全事件驱动。
 def SeedModifiedPaths()
   s_modified_paths = {}
+  BumpRenderEpoch()
   for info in getbufinfo({bufmodified: 1})
     if get(info, 'name', '') !=# ''
       s_modified_paths[NormPath(info.name)] = true
+      BumpRenderEpoch()
     endif
   endfor
 enddef
@@ -4347,9 +4485,18 @@ export def TestSetCaps(caps: list<string>)
   ApplyCapabilities(caps, 2)
 enddef
 
+# 测试钩子：关掉子树渲染缓存以取得参照渲染。tests/vim_render_cache.vim 用它
+# 比对 "走缓存" 与 "重算" 的结果是否一致。
+export def TestSetRenderCache(enabled: bool)
+  s_render_cache_off = !enabled
+  BumpRenderEpoch()
+  s_render_cfg_sig = ''
+enddef
+
 export def TestSetFilter(q: string)
   s_filter_query = q
   s_filter_memo = {}
+  BumpRenderEpoch()
   Emit('FilterChanged', {query: q})
   Render()
 enddef

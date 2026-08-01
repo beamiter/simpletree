@@ -306,6 +306,8 @@ command! SimpleTreeVersion call g:SimpleTreeVersion()
 command! SimpleTreeToggleAutoRefresh call g:SimpleTreeToggleAutoRefresh()
 command! SimpleTreeToggleAutoFollow call g:SimpleTreeToggleAutoFollow()
 command! -nargs=+ SimpleTreeSearch simpletree#Search(<q-args>)
+command! SimpleTreeRestart call simpletree#Restart()
+command! SimpleTreeLog     call simpletree#ShowLog()
 
 nnoremap <silent> <Plug>(simpletree-toggle) <Cmd>SimpleTree<CR>
 if g:simpletree_set_default_mapping && maparg('<leader>e', 'n') ==# ''

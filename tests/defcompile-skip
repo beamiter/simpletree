@@ -1,0 +1,5 @@
+# The bundled spacemacs colour-scheme helpers deliberately use lowercase
+# function names (spacemacs_theme#set) and are sourced by colors/spacemacs.vim,
+# not as autoload scripts in their own right; :defcompile rejects them on
+# principle rather than because anything is wrong.
+spacemacs_theme*.vim

@@ -81,3 +81,12 @@ jobs:
 
       - name: Test Vim protocol v2 features
         run: vim -Nu NONE -n -es -X -i NONE -S tests/vim_v2_features.vim
+
+      - name: Subtree render cache matches an uncached render
+        run: vim -Nu NONE -n -es -X -i NONE -S tests/vim_render_cache.vim
+
+      - name: Compile every Vim9 def (lazy compilation hides cold-branch errors)
+        run: make defcompile
+
+      - name: simplecore supervisor regression suite
+        run: make vim-core

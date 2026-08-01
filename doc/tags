@@ -2,7 +2,10 @@
 :SimpleTreeClose	simpletree.txt	/*:SimpleTreeClose*
 :SimpleTreeDebug	simpletree.txt	/*:SimpleTreeDebug*
 :SimpleTreeHealth	simpletree.txt	/*:SimpleTreeHealth*
+:SimpleTreeHealth	simpletree.txt	/*:SimpleTreeHealth*
+:SimpleTreeLog	simpletree.txt	/*:SimpleTreeLog*
 :SimpleTreeRefresh	simpletree.txt	/*:SimpleTreeRefresh*
+:SimpleTreeRestart	simpletree.txt	/*:SimpleTreeRestart*
 :SimpleTreeReveal	simpletree.txt	/*:SimpleTreeReveal*
 :SimpleTreeSearch	simpletree.txt	/*:SimpleTreeSearch*
 :SimpleTreeToggleAutoFollow	simpletree.txt	/*:SimpleTreeToggleAutoFollow*
@@ -51,6 +54,7 @@ simpletree	simpletree.txt	/*simpletree*
 simpletree-backend	simpletree.txt	/*simpletree-backend*
 simpletree-commands	simpletree.txt	/*simpletree-commands*
 simpletree-contents	simpletree.txt	/*simpletree-contents*
+simpletree-daemon	simpletree.txt	/*simpletree-daemon*
 simpletree-events	simpletree.txt	/*simpletree-events*
 simpletree-install	simpletree.txt	/*simpletree-install*
 simpletree-mappings	simpletree.txt	/*simpletree-mappings*
