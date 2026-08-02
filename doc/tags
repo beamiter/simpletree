@@ -17,6 +17,8 @@ g:simpletree_auto_refresh	simpletree.txt	/*g:simpletree_auto_refresh*
 g:simpletree_auto_refresh_interval	simpletree.txt	/*g:simpletree_auto_refresh_interval*
 g:simpletree_auto_refresh_on_focus	simpletree.txt	/*g:simpletree_auto_refresh_on_focus*
 g:simpletree_auto_refresh_on_idle	simpletree.txt	/*g:simpletree_auto_refresh_on_idle*
+g:simpletree_bookmark_symbol	simpletree.txt	/*g:simpletree_bookmark_symbol*
+g:simpletree_bookmarks_file	simpletree.txt	/*g:simpletree_bookmarks_file*
 g:simpletree_choose_window	simpletree.txt	/*g:simpletree_choose_window*
 g:simpletree_collapse_all_key	simpletree.txt	/*g:simpletree_collapse_all_key*
 g:simpletree_daemon_path	simpletree.txt	/*g:simpletree_daemon_path*
@@ -36,6 +38,7 @@ g:simpletree_page	simpletree.txt	/*g:simpletree_page*
 g:simpletree_persist_width	simpletree.txt	/*g:simpletree_persist_width*
 g:simpletree_root_locked	simpletree.txt	/*g:simpletree_root_locked*
 g:simpletree_set_default_mapping	simpletree.txt	/*g:simpletree_set_default_mapping*
+g:simpletree_show_bookmarks	simpletree.txt	/*g:simpletree_show_bookmarks*
 g:simpletree_show_file_icons	simpletree.txt	/*g:simpletree_show_file_icons*
 g:simpletree_show_modified	simpletree.txt	/*g:simpletree_show_modified*
 g:simpletree_show_root	simpletree.txt	/*g:simpletree_show_root*

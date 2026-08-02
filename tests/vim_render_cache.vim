@@ -20,6 +20,7 @@ if !executable(g:simpletree_daemon_path)
   let g:simpletree_daemon_path = s:root . '/lib/simpletree-daemon'
 endif
 let g:simpletree_git_status = 0
+let g:simpletree_bookmarks_file = tempname() . '/bookmarks.json'
 
 " ---------------------------------------------------------------- fixture ---
 
@@ -164,6 +165,39 @@ call s:AssertMatchesUncached('after changing the modified symbol')
 call simpletree#Refresh()
 call s:Wait(1200)
 call s:AssertMatchesUncached('after a full refresh')
+
+" -------------------------------------------------------------- 书签 ---
+
+" 书签标记属于行内容,增删书签必须让缓存失效。
+call win_execute(bufwinid(s:Buf()), 'call cursor(2, 1)')
+call simpletree#OnBookmarkToggle()
+call s:Wait(200)
+call assert_true(join(s:Snapshot(), "\n") =~# '★', '书签标记出现在树里')
+call s:AssertMatchesUncached('after adding a bookmark')
+
+call win_execute(bufwinid(s:Buf()), 'call cursor(2, 1)')
+call simpletree#OnBookmarkToggle()
+call s:Wait(200)
+call assert_false(join(s:Snapshot(), "\n") =~# '★', '取消后标记消失')
+call s:AssertMatchesUncached('after removing a bookmark')
+
+" 改书签符号走的是配置签名(O(1) 比对),同样必须整体失效。
+call win_execute(bufwinid(s:Buf()), 'call cursor(2, 1)')
+call simpletree#OnBookmarkToggle()
+call s:Wait(200)
+let g:simpletree_bookmark_symbol = '@@'
+call call(s:P('Render'), [])
+call assert_true(join(s:Snapshot(), "\n") =~# '@@', '改符号后立即生效')
+call s:AssertMatchesUncached('after changing the bookmark symbol')
+unlet g:simpletree_bookmark_symbol
+
+let g:simpletree_show_bookmarks = 0
+call call(s:P('Render'), [])
+call s:AssertMatchesUncached('after turning bookmarks off')
+let g:simpletree_show_bookmarks = 1
+call win_execute(bufwinid(s:Buf()), 'call cursor(2, 1)')
+call simpletree#OnBookmarkToggle()
+call s:Wait(200)
 
 " ------------------------------------------------------------ 新增/删除 ---
 

@@ -158,6 +158,13 @@ var s_path_lines_gen: number = -1
 # path -> 未保存标记；由 UpdateDecorations 事件维护，渲染期只查字典
 var s_modified_paths: dict<bool> = {}
 
+# ─────────────────── 书签 ───────────────────
+#
+# path -> true。持久化到 g:simpletree_bookmarks_file,重启后仍在。
+# 书签会改变行内容(行尾多一个标记),所以每次增删都必须 BumpRenderEpoch()。
+var s_bookmarks: dict<bool> = {}
+var s_bookmarks_loaded: bool = false
+
 # =============================================================
 # 工具函数
 # =============================================================
@@ -1551,6 +1558,190 @@ def GitSymbols(): dict<string>
   return defaults
 enddef
 
+def BookmarksFile(): string
+  var configured = get(g:, 'simpletree_bookmarks_file', '')
+  if type(configured) == v:t_string && configured !=# ''
+    return fnamemodify(expand(configured), ':p')
+  endif
+  # 跟随 XDG,回落到 ~/.cache。
+  var base = exists('$XDG_STATE_HOME') && $XDG_STATE_HOME !=# ''
+    ? $XDG_STATE_HOME : expand('~/.local/state')
+  return base .. '/simpletree/bookmarks.json'
+enddef
+
+def LoadBookmarks()
+  if s_bookmarks_loaded
+    return
+  endif
+  s_bookmarks_loaded = true
+  var file = BookmarksFile()
+  if !filereadable(file)
+    return
+  endif
+  var decoded: any
+  try
+    decoded = json_decode(join(readfile(file), "\n"))
+  catch
+    Log('bookmarks file is not valid JSON: ' .. file)
+    return
+  endtry
+  if type(decoded) != v:t_list
+    return
+  endif
+  for entry in decoded
+    if type(entry) == v:t_string && entry !=# ''
+      s_bookmarks[entry] = true
+    endif
+  endfor
+enddef
+
+def SaveBookmarks()
+  var file = BookmarksFile()
+  var dir = fnamemodify(file, ':h')
+  if !isdirectory(dir)
+    try
+      mkdir(dir, 'p')
+    catch
+      Log('cannot create bookmarks directory: ' .. dir)
+      return
+    endtry
+  endif
+  try
+    writefile([json_encode(sort(keys(s_bookmarks)))], file)
+  catch
+    Log('cannot write bookmarks: ' .. v:exception)
+  endtry
+enddef
+
+def IsBookmarked(path: string): bool
+  return get(s_bookmarks, path, false)
+enddef
+
+export def BookmarkList(): list<string>
+  LoadBookmarks()
+  return sort(keys(s_bookmarks))
+enddef
+
+# 书签只对真实存在的路径有意义;删掉的文件在这里顺手清掉,免得列表越积越多。
+def PruneBookmarks(): number
+  LoadBookmarks()
+  var gone: list<string> = []
+  for path in keys(s_bookmarks)
+    if !filereadable(path) && !isdirectory(path)
+      add(gone, path)
+    endif
+  endfor
+  for path in gone
+    remove(s_bookmarks, path)
+  endfor
+  if !empty(gone)
+    SaveBookmarks()
+    BumpRenderEpoch()
+  endif
+  return len(gone)
+enddef
+
+export def OnBookmarkToggle()
+  LoadBookmarks()
+  var node = CursorNode()
+  var path = get(node, 'path', '')
+  if path ==# '' || get(node, 'loading', false) || get(node, 'error', false)
+    return
+  endif
+  var added = false
+  if has_key(s_bookmarks, path)
+    remove(s_bookmarks, path)
+  else
+    s_bookmarks[path] = true
+    added = true
+  endif
+  SaveBookmarks()
+  # 行尾的书签标记属于行内容,缓存必须整体失效。
+  BumpRenderEpoch()
+  Render()
+  Emit('BookmarkChanged', {path: path, bookmarked: added})
+  echo printf('[SimpleTree] %s bookmark: %s',
+    added ? 'added' : 'removed', fnamemodify(path, ':~'))
+enddef
+
+export def OnBookmarkJump()
+  LoadBookmarks()
+  PruneBookmarks()
+  var marks = BookmarkList()
+  if empty(marks)
+    echo '[SimpleTree] no bookmarks'
+    return
+  endif
+  var items: list<dict<any>> = []
+  for path in marks
+    if isdirectory(path)
+      add(items, {filename: path, lnum: 1, text: 'directory'})
+    else
+      add(items, {filename: path, lnum: 1, text: 'file'})
+    endif
+  endfor
+  call setqflist([], ' ', {title: 'SimpleTree bookmarks', items: items})
+  copen
+enddef
+
+# 在当前树里循环跳到下一个/上一个书签。
+def BookmarkStep(forward: bool)
+  LoadBookmarks()
+  if empty(s_bookmarks)
+    echo '[SimpleTree] no bookmarks'
+    return
+  endif
+  var lines: list<number> = []
+  for i in range(len(s_line_index))
+    if IsBookmarked(get(s_line_index[i], 'path', ''))
+      add(lines, i + 1)
+    endif
+  endfor
+  if empty(lines)
+    echo '[SimpleTree] no bookmarks in the visible tree'
+    return
+  endif
+  var cur = CursorLine()
+  var target = forward ? lines[0] : lines[-1]
+  if forward
+    for l in lines
+      if l > cur
+        target = l
+        break
+      endif
+    endfor
+  else
+    for l in reverse(copy(lines))
+      if l < cur
+        target = l
+        break
+      endif
+    endfor
+  endif
+  if WinValid()
+    win_execute(s_winid, 'call cursor(' .. target .. ', 1)')
+    UpdateActiveHighlight()
+  endif
+enddef
+
+export def OnBookmarkNext()
+  BookmarkStep(true)
+enddef
+
+export def OnBookmarkPrev()
+  BookmarkStep(false)
+enddef
+
+export def BookmarkClear()
+  LoadBookmarks()
+  var n = len(s_bookmarks)
+  s_bookmarks = {}
+  SaveBookmarks()
+  BumpRenderEpoch()
+  Render()
+  echo printf('[SimpleTree] cleared %d bookmark%s', n, n == 1 ? '' : 's')
+enddef
+
 def GitCodeFor(path: string): string
   if empty(s_git_status)
     return ''
@@ -2012,6 +2203,10 @@ const KEY_ACTIONS: dict<string> = {
   find: 'OnFind',
   find_next: 'OnFindNext',
   find_prev: 'OnFindPrev',
+  bookmark_toggle: 'OnBookmarkToggle',
+  bookmark_list: 'OnBookmarkJump',
+  bookmark_next: 'OnBookmarkNext',
+  bookmark_prev: 'OnBookmarkPrev',
 }
 
 const DEFAULT_KEYS: dict<string> = {
@@ -2059,6 +2254,10 @@ const DEFAULT_KEYS: dict<string> = {
   '/': 'find',
   ']f': 'find_next',
   '[f': 'find_prev',
+  'm': 'bookmark_toggle',
+  "'": 'bookmark_list',
+  ']b': 'bookmark_next',
+  '[b': 'bookmark_prev',
 }
 
 # 合并默认表、g:simpletree_collapse_all_key 兼容别名与 g:simpletree_mappings。
@@ -2197,6 +2396,8 @@ def RenderConfigSig(): string
     !!get(g:, 'simpletree_show_modified', 1),
     get(g:, 'simpletree_modified_symbol', '●'),
     !!get(g:, 'simpletree_use_nerdfont', 0),
+    !!get(g:, 'simpletree_show_bookmarks', 1),
+    get(g:, 'simpletree_bookmark_symbol', '★'),
     GitStatusEnabled(),
     GitSymbols(),
     s_icons,
@@ -2285,7 +2486,12 @@ def BuildSubtree(path: string, depth: number): dict<any>
   var show_modified = !!get(g:, 'simpletree_show_modified', 1)
   var git_symbols = GitSymbols()
   var modified_symbol = get(g:, 'simpletree_modified_symbol', '●')
+  var show_bookmarks = !!get(g:, 'simpletree_show_bookmarks', 1)
+  var bookmark_symbol = get(g:, 'simpletree_bookmark_symbol', '★')
   var indent = repeat('  ', depth)
+  if show_bookmarks
+    LoadBookmarks()
+  endif
   for e in entries
     if !FilterAllowsEntry(e)
       continue
@@ -2307,9 +2513,14 @@ def BuildSubtree(path: string, depth: number): dict<any>
     if git_code !=# ''
       decoration ..= ' ' .. get(git_symbols, git_code[0], git_code[0])
     endif
+    var bookmarked = show_bookmarks && IsBookmarked(e.path)
+    if bookmarked
+      decoration ..= ' ' .. bookmark_symbol
+    endif
 
     lines->add(indent .. icon .. ' ' .. e.name .. suffix .. decoration)
-    idx->add({path: e.path, is_dir: e.is_dir, name: e.name, depth: depth, modified: modified, git: git_code})
+    idx->add({path: e.path, is_dir: e.is_dir, name: e.name, depth: depth,
+      modified: modified, git: git_code, bookmarked: bookmarked})
 
     if expanded
       var sub = BuildSubtree(e.path, depth + 1)

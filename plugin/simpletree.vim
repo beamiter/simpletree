@@ -172,6 +172,10 @@ g:simpletree_show_root = get(g:, 'simpletree_show_root', 1)
 # 显示未保存缓冲区标记
 g:simpletree_show_modified = get(g:, 'simpletree_show_modified', 1)
 g:simpletree_modified_symbol = get(g:, 'simpletree_modified_symbol', '●')
+g:simpletree_show_bookmarks = get(g:, 'simpletree_show_bookmarks', 1)
+g:simpletree_bookmark_symbol = get(g:, 'simpletree_bookmark_symbol', '★')
+# Where bookmarks persist; defaults under $XDG_STATE_HOME (or ~/.local/state).
+g:simpletree_bookmarks_file = get(g:, 'simpletree_bookmarks_file', '')
 # 新建文件后直接在编辑区打开
 g:simpletree_open_on_create = get(g:, 'simpletree_open_on_create', 1)
 # 删除时优先移到系统回收站（支持 gio/trash-put/trash）
@@ -308,6 +312,8 @@ command! SimpleTreeToggleAutoFollow call g:SimpleTreeToggleAutoFollow()
 command! -nargs=+ SimpleTreeSearch simpletree#Search(<q-args>)
 command! SimpleTreeRestart call simpletree#Restart()
 command! SimpleTreeLog     call simpletree#ShowLog()
+command! SimpleTreeBookmarks     call simpletree#OnBookmarkJump()
+command! SimpleTreeBookmarkClear call simpletree#BookmarkClear()
 
 nnoremap <silent> <Plug>(simpletree-toggle) <Cmd>SimpleTree<CR>
 if g:simpletree_set_default_mapping && maparg('<leader>e', 'n') ==# ''

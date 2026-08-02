@@ -169,6 +169,12 @@ y       Copy the basename to Vim's unnamed register and optionally the system
 Y       Copy the absolute path to Vim's unnamed register and optionally the
         system clipboard.
 gx      Open with the system default application.
+m       Toggle a bookmark on the node under the cursor.  Bookmarked entries
+        are marked in the tree and persist across sessions.
+'       List all bookmarks in the quickfix window.  Bookmarks pointing at
+        paths that no longer exist are dropped here.
+]b, [b  Jump to the next or previous bookmark visible in the tree, wrapping
+        around.
 z       Collapse all directories below the root.  Configure with
         |g:simpletree_collapse_all_key|.
 F       Filter loaded nodes by name; matching entries and their ancestors
@@ -310,6 +316,18 @@ g:simpletree_show_modified
                                              *g:simpletree_modified_symbol*
 g:simpletree_modified_symbol
         String, default '●'.  Modified-buffer marker.
+
+g:simpletree_show_bookmarks                          *g:simpletree_show_bookmarks*
+  Show the bookmark marker in the tree.  Default 1.
+
+g:simpletree_bookmark_symbol                        *g:simpletree_bookmark_symbol*
+  Marker appended to a bookmarked entry.  Default "★".
+
+g:simpletree_bookmarks_file                          *g:simpletree_bookmarks_file*
+  Where bookmarks are stored.  Empty (the default) uses
+  $XDG_STATE_HOME/simpletree/bookmarks.json, falling back to
+  ~/.local/state/simpletree/bookmarks.json.  The file is a JSON array of
+  absolute paths, so it can be edited or version-controlled by hand.
 
                                              *g:simpletree_use_nerdfont*
 g:simpletree_use_nerdfont

@@ -98,6 +98,9 @@ jobs:
       - name: Subtree render cache matches an uncached render
         run: vim -Nu NONE -n -es -X -i NONE -S tests/vim_render_cache.vim
 
+      - name: Bookmarks
+        run: vim -Nu NONE -n -es -X -i NONE -S tests/vim_bookmarks.vim
+
       - name: Compile every Vim9 def (lazy compilation hides cold-branch errors)
         run: make defcompile
 

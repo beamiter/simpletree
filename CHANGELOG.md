@@ -4,6 +4,22 @@
 
 ## Unreleased - 2026-08-01
 
+### 新增:书签
+
+- `m` 切换光标所在节点的书签,`'` 把全部书签列进 quickfix,`]b` / `[b` 在树内
+  可见的书签之间循环(到头会绕回)。命令:`:SimpleTreeBookmarks`、
+  `:SimpleTreeBookmarkClear`。
+- 书签持久化到 JSON(默认 `$XDG_STATE_HOME/simpletree/bookmarks.json`,可用
+  `g:simpletree_bookmarks_file` 指定),重启后仍在。文件就是一个绝对路径数组,
+  手工编辑或纳入版本管理都可以。
+- 列出书签时会顺手丢掉指向已不存在路径的条目,列表不会越积越多。
+- 书签标记与开关:`g:simpletree_bookmark_symbol`(默认 `★`)、
+  `g:simpletree_show_bookmarks`。
+- 书签标记属于行内容,因此增删书签会 `BumpRenderEpoch()`,符号与开关进入配置
+  签名——`tests/vim_render_cache.vim` 增加了对应断言,确认缓存不会渲染出陈旧标记。
+- 新增 `tests/vim_bookmarks.vim`:切换、落盘与内存一致、跳转与绕回、清空、命令
+  在无书签时不报错。测试使用临时存储文件,不会碰到用户自己的书签。
+
 ### 构建与 CI 修复
 
 - `ignore` 锁定回 0.4.27:0.4.30 使用了 let-chains(需要 Rust 1.88),而 CI 与 `rust-version` 都是 1.85,`Lint Rust` 作业自 2026-07-26 起一直失败。
