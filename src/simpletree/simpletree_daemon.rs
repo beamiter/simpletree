@@ -43,6 +43,33 @@ fn runtime_capabilities(watch_available: bool, git_available: bool) -> Vec<&'sta
     capabilities
 }
 
+/// Scans a real directory in-process and checks the handshake reply.
+///
+/// The installer needs to know that the binary it just built actually works,
+/// and a version string only proves the file is not corrupt.  A scan exercises
+/// the directory walk — the one code path every session starts with, and the
+/// one that depends on the `ignore` crate being linked and functional.
+fn self_test() -> Result<()> {
+    let directory = std::env::temp_dir();
+    let cancel = CancellationToken::new();
+    let options = ScanOptions {
+        show_hidden: false,
+        git_ignore: true,
+        meta: true,
+    };
+    scan_directory(&directory, options, &cancel)
+        .with_context(|| format!("scanning {} failed", directory.display()))?;
+
+    let capabilities = runtime_capabilities(true, true);
+    if !capabilities.contains(&"search") {
+        bail!("handshake omitted the search capability");
+    }
+    if PROTOCOL_VERSION == 0 {
+        bail!("handshake announces protocol 0");
+    }
+    Ok(())
+}
+
 fn handle_cli() -> Result<bool> {
     let mut args = std::env::args().skip(1);
     let Some(arg) = args.next() else {
@@ -59,9 +86,14 @@ fn handle_cli() -> Result<bool> {
         }
         "--help" | "-h" => {
             println!(
-                "simpletree-daemon {}\n\nUSAGE:\n    simpletree-daemon\n    simpletree-daemon --version\n\nThe default mode reads one JSON request per line from stdin and writes one JSON event per line to stdout.",
+                "simpletree-daemon {}\n\nUSAGE:\n    simpletree-daemon\n    simpletree-daemon --version\n    simpletree-daemon --self-test\n\nThe default mode reads one JSON request per line from stdin and writes one JSON event per line to stdout.\n--self-test scans a directory in-process and checks the handshake reply, then exits.",
                 env!("CARGO_PKG_VERSION")
             );
+            Ok(true)
+        }
+        "--self-test" => {
+            self_test()?;
+            println!("ok");
             Ok(true)
         }
         _ => bail!("unknown command-line argument: {arg}"),

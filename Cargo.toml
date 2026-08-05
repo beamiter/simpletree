@@ -2,7 +2,7 @@
 name = "simpletree"
 version = "0.2.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.88"
 
 [[bin]]
 name = "simpletree-daemon"

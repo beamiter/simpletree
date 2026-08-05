@@ -95,14 +95,12 @@ pub async fn repo_status(cache: &GitCache, path: &Path, force: bool) -> Result<R
         bail!("not inside a git repository: {}", path.display());
     };
 
-    if !force {
-        if let Some((statuses, truncated)) = cache.fresh(&repo_root) {
-            return Ok(RepoStatus {
-                repo_root,
-                statuses,
-                truncated,
-            });
-        }
+    if !force && let Some((statuses, truncated)) = cache.fresh(&repo_root) {
+        return Ok(RepoStatus {
+            repo_root,
+            statuses,
+            truncated,
+        });
     }
 
     // --no-optional-locks is a global git option and must precede the

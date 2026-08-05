@@ -31,7 +31,7 @@ script and does not support Neovim.
 2. REQUIREMENTS                              *simpletree-requirements*
 
 - Vim 9.0 or newer with +job, +channel, and +float.
-- Rust 1.85 or newer and Cargo to build the backend.
+- Rust 1.88 or newer and Cargo to build the backend.
 - Bash for install.sh; native Windows installation is not currently covered.
 - A Nerd Font and a system trash provider are optional.
 
@@ -427,7 +427,13 @@ The backend supports: >
 
   simpletree-daemon --version
   simpletree-daemon --help
+  simpletree-daemon --self-test
 <
+--self-test scans a directory in-process and checks the handshake, then prints
+"ok".  install.sh runs it before replacing a working backend, so a build that
+compiles but cannot walk a directory never reaches lib/.  Every daemon in the
+simple* suite answers these three the same way.
+
 Protocol mode uses one JSON object per line.  A client may send: >
 
   {"type":"ping","id":1}

@@ -5,7 +5,7 @@
 ## 开发环境
 
 - Vim 9.0 或更新版本，包含 `+job`、`+channel` 和 `+float`
-- Rust 1.85 或更新版本及 Cargo
+- Rust 1.88 或更新版本及 Cargo
 - Bash
 - 推荐安装 `rustfmt`、Clippy 和 ShellCheck
 

@@ -30,7 +30,7 @@ SimpleTree 使用 Vim9 script，当前不支持 Neovim。
 | 组件 | 要求 |
 |---|---|
 | Vim | Vim 9.0 或更新版本，编译时包含 `+job`、`+channel` 和 `+float` |
-| Rust | Rust 1.85 或更新版本及 Cargo，用于从源码构建后台 |
+| Rust | Rust 1.88 或更新版本及 Cargo，用于从源码构建后台 |
 | 安装脚本 | Bash；`install.sh` 目前面向 Linux、macOS 等 Bash 环境 |
 | 字体 | Nerd Font 可选；未安装时可关闭图标 |
 | 回收站 | Linux 可选 `gio trash` 或 `trash-put`，macOS 可选 `trash` |
