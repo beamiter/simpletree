@@ -509,6 +509,21 @@ The Rust daemon is managed by simplecore, the supervisor shared by the whole
 simple* plugin suite. It is vendored into this repository at
 autoload/simpletree/core.vim; that file is generated, do not edit it in place.
 
+                                                  *simpletree-simplecore*
+The bundle lives at https://github.com/beamiter/simplecore. Each plugin
+carries its own copy so that installing this one alone is enough, and >
+
+  make core-verify
+<
+checks every vendored file against the sha256 recorded in
+.simplecore.manifest, failing the build when one has drifted. `make check`
+depends on it. To change the supervisor, clone the bundle beside the plugins,
+edit it there, and re-vendor: >
+
+  git clone https://github.com/beamiter/simplecore ../.simplecore
+  ../.simplecore/vendor.sh
+<
+
 What it guarantees:
 
 - Liveness is always read from |job_status()|. job_start() returns a job

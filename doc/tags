@@ -63,6 +63,7 @@ simpletree-mappings	simpletree.txt	/*simpletree-mappings*
 simpletree-options	simpletree.txt	/*simpletree-options*
 simpletree-requirements	simpletree.txt	/*simpletree-requirements*
 simpletree-safety	simpletree.txt	/*simpletree-safety*
+simpletree-simplecore	simpletree.txt	/*simpletree-simplecore*
 simpletree-troubleshooting	simpletree.txt	/*simpletree-troubleshooting*
 simpletree-width-state	simpletree.txt	/*simpletree-width-state*
 simpletree.txt	simpletree.txt	/*simpletree.txt*
