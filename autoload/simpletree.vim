@@ -117,6 +117,12 @@ var s_help_popupid: number = 0      # 浮窗 ID
 # Reveal 定位
 var s_reveal_target: string = ''
 var s_reveal_timer: number = 0
+# Monotonic frontend token: an old scan/timer may render cache data, but it
+# must never complete a newer reveal or move its selection.
+var s_reveal_generation: number = 0
+# Directory -> reveal token. A scan that predates the reveal may help only when
+# that reveal explicitly registered the directory as one of its ancestors.
+var s_reveal_waiting: dict<number> = {}
 
 # 前端窗口生命周期。异步回调必须属于当前打开会话，关闭后的旧回调不能重建窗口。
 var s_open: bool = false
@@ -414,7 +420,12 @@ enddef
 # 统一分隔符为 / 并做绝对化与尾斜杠处理
 def NormPath(p: string): string
   var ap = AbsPath(p)
-  ap = substitute(ap, '\\', '/', 'g')
+  # Backslash is a valid Unix filename byte. Treat it as a separator only on
+  # platforms where the filesystem does, otherwise completion/execution of a
+  # fnameescape()'d literal backslash cannot round-trip.
+  if has('win32') || has('win64') || has('win95') || has('win32unix')
+    ap = substitute(ap, '\\', '/', 'g')
+  endif
   return RStripSlash(ap)
 enddef
 
@@ -1380,6 +1391,8 @@ def CancelFrontendWork()
     s_reveal_timer = 0
   endif
   s_reveal_target = ''
+  s_reveal_generation += 1
+  s_reveal_waiting = {}
   if s_fs_refresh_timer != 0
     try
       call timer_stop(s_fs_refresh_timer)
@@ -2095,14 +2108,30 @@ def ScanDirAsync(path: string, force: bool = false)
       WatchDir(p)
       s_filter_memo = {}
       BumpRenderEpoch()
-      ScheduleRender()
-      # Reveal 回调：扫描完成后尝试定位目标，避免轮询定时器
-      if s_reveal_target !=# '' && FocusIfPresent(s_reveal_target)
-        s_reveal_target = ''
-        if s_reveal_timer != 0
-          try | call timer_stop(s_reveal_timer) | catch | endtry
-          s_reveal_timer = 0
+      # A reveal may attach its current token to a scan that was already in
+      # flight. Only that registered token may complete it; unrelated/stale
+      # scans still populate cache but cannot move selection.
+      var reveal_generation = get(s_reveal_waiting, p, 0)
+      if has_key(s_reveal_waiting, p)
+        remove(s_reveal_waiting, p)
+      endif
+      if reveal_generation > 0 && reveal_generation == s_reveal_generation
+          && s_reveal_target !=# ''
+        # Render synchronously for this explicit user action so a slow
+        # pre-existing scan cannot outlive the bounded fallback timer and lose
+        # the reveal. This branch replaces (rather than duplicates) the normal
+        # scheduled render, keeping render statistics honest.
+        Render()
+        if FocusIfPresent(s_reveal_target)
+          s_reveal_target = ''
+          s_reveal_waiting = {}
+          if s_reveal_timer != 0
+            try | call timer_stop(s_reveal_timer) | catch | endtry
+            s_reveal_timer = 0
+          endif
         endif
+      else
+        ScheduleRender()
       endif
     },
     (msg) => {
@@ -2117,6 +2146,9 @@ def ScanDirAsync(path: string, force: bool = false)
       endif
       if has_key(s_pending, p) && s_pending[p] == req_id
         call remove(s_pending, p)
+      endif
+      if has_key(s_reveal_waiting, p)
+        remove(s_reveal_waiting, p)
       endif
       if has_key(s_cache, p)
         call remove(s_cache, p)
@@ -2145,6 +2177,9 @@ def ScanDirAsync(path: string, force: bool = false)
     endif
     if has_key(s_loading_has_metadata, path)
       call remove(s_loading_has_metadata, path)
+    endif
+    if has_key(s_reveal_waiting, path)
+      remove(s_reveal_waiting, path)
     endif
   endif
 enddef
@@ -4167,12 +4202,14 @@ def FocusIfPresent(path: string): bool
   return false
 enddef
 
-def RevealTimerCb(id: number, session_generation: number)
-  if !s_open || session_generation != s_session_generation || s_reveal_target ==# ''
+def RevealTimerCb(id: number, session_generation: number, reveal_generation: number)
+  if !s_open || session_generation != s_session_generation
+      || reveal_generation != s_reveal_generation || s_reveal_target ==# ''
     return
   endif
   if FocusIfPresent(s_reveal_target)
     s_reveal_target = ''
+    s_reveal_waiting = {}
     if s_reveal_timer == id
       try
         call timer_stop(id)
@@ -4205,18 +4242,65 @@ def HasHiddenRelativeComponent(root: string, path: string): bool
   return false
 enddef
 
+def RevealPathIsContained(path: string): bool
+  var root_path = NormPath(s_root)
+  var candidate = NormPath(path)
+  if !IsSubPath(root_path, candidate)
+    return false
+  endif
+
+  # Checking only resolve(candidate) is insufficient: a lexical ancestor may
+  # escape through a symlink and a deeper symlink may re-enter the workspace.
+  # Validate every spelling prefix before any reveal/cache state is touched.
+  var resolved_root = ResolvedNormPath(root_path)
+  var current = candidate
+  var guard = 0
+  while guard < 500
+    if !IsSubPath(resolved_root, ResolvedNormPath(current))
+      return false
+    endif
+    if PathEq(current, root_path)
+      return true
+    endif
+    var parent = NormPath(fnamemodify(current, ':h'))
+    if PathEq(parent, current) || !IsSubPath(root_path, parent)
+      return false
+    endif
+    current = parent
+    guard += 1
+  endwhile
+  return false
+enddef
+
+def AttachRevealScan(path: string, reveal_generation: number)
+  # A streaming scan may already have published a partial cache. Keep its
+  # request intact, but attach the current reveal token so its final chunk can
+  # complete the selection after the bounded fallback timer has expired.
+  if !has_key(s_cache, path) || get(s_loading, path, false)
+    s_reveal_waiting[path] = reveal_generation
+    ScanDirAsync(path)
+  endif
+enddef
+
 def RevealPath(path: string)
   if !s_open || path ==# '' || s_root ==# ''
     return
   endif
 
-  var ap = AbsPath(path)
-  # Reveal 永远受工作区根约束；先拒绝越界，不能启动任何外部目录扫描。
-  if !IsSubPath(s_root, ap)
+  var ap = NormPath(path)
+  # Fail before generation, expansion, cache or pending-request mutation.
+  if !RevealPathIsContained(ap)
     Log('RevealPath: target outside root; skipped: ' .. ap, 'WarningMsg')
     return
   endif
+  s_reveal_generation += 1
+  var reveal_generation = s_reveal_generation
   s_reveal_target = ap
+  s_reveal_waiting = {}
+  if s_reveal_timer != 0
+    try | call timer_stop(s_reveal_timer) | catch | endtry
+    s_reveal_timer = 0
+  endif
 
   # 目标本身或相对根路径中的任一祖先是点目录时，都必须先显示隐藏项。
   if s_hide_dotfiles && HasHiddenRelativeComponent(s_root, ap)
@@ -4228,7 +4312,9 @@ def RevealPath(path: string)
     return
   endif
 
-  var cur_dir = filereadable(ap) ? fnamemodify(ap, ':h') : ap
+  # Symlink leaves are revealed as entries, never traversed. Directories use
+  # their own cache so an explicit directory target can also expand normally.
+  var cur_dir = getftype(ap) ==# 'dir' ? ap : fnamemodify(ap, ':h')
   var r = s_root
   var guard = 0
   var chain: list<string> = []
@@ -4245,21 +4331,25 @@ def RevealPath(path: string)
   for d in chain
     var d_state = GetNodeState(d)
     d_state.expanded = true
-    if !has_key(s_cache, d)
-      ScanDirAsync(d)
-    endif
+    AttachRevealScan(d, reveal_generation)
   endfor
   var r_state = GetNodeState(r)
   r_state.expanded = true
+  # The root is excluded from chain. Attach the token explicitly when its
+  # first scan predates this reveal; otherwise a top-level target could miss
+  # the bounded timer and never be selected after a slow root response.
+  AttachRevealScan(r, reveal_generation)
   var parent = fnamemodify(ap, ':h')
-  if parent !=# '' && !has_key(s_cache, parent)
-    ScanDirAsync(parent)
+  var containing_dir = getftype(ap) ==# 'dir' ? ap : parent
+  if containing_dir !=# '' && IsSubPath(s_root, containing_dir)
+    AttachRevealScan(containing_dir, reveal_generation)
   endif
   Render()
 
   # 改动点：如果目标行已在当前渲染中出现，立刻定位并结束（不给用户可见跳动）
   if FocusIfPresent(ap)
     s_reveal_target = ''
+    s_reveal_waiting = {}
     return
   endif
 
@@ -4273,7 +4363,8 @@ def RevealPath(path: string)
     endtry
     try
       var session_generation = s_session_generation
-      s_reveal_timer = timer_start(150, (id) => RevealTimerCb(id, session_generation), {repeat: 5})
+      s_reveal_timer = timer_start(150,
+        (id) => RevealTimerCb(id, session_generation, reveal_generation), {repeat: 5})
     catch
       FocusPath(ap)
     endtry
@@ -4703,21 +4794,142 @@ def SeedModifiedPaths()
   endfor
 enddef
 
-export def OnRevealActive()
-  var target = s_active_path
-  if target ==# '' && s_target_winid != 0 && win_id2win(s_target_winid) > 0
+def RevealInputPath(path: string): string
+  var candidate = path
+  if candidate !=# '' && candidate[0] ==# '~'
+    candidate = expand(candidate)
+  endif
+  var absolute = candidate =~# '^/'
+    || ((has('win32') || has('win64') || has('win32unix'))
+      && (candidate =~? '^[A-Za-z]:[/\\]' || candidate =~# '^\\\\'))
+  # Command-line relative paths deliberately follow the tree workspace, not
+  # :pwd/:lcd, so the same command means the same thing from every split.
+  return NormPath(absolute ? candidate : PathJoin(s_root, candidate))
+enddef
+
+def RevealCompletionLead(arglead: string): string
+  # customlist candidates are fnameescape()'d so paths with spaces survive
+  # command-line insertion. Undo those escapes before filesystem inspection.
+  if has('win32') || has('win64') || has('win32unix')
+    return substitute(arglead, '\\ ', ' ', 'g')->substitute('\\', '/', 'g')
+  endif
+  return substitute(arglead, '\\\(.\)', '\1', 'g')
+enddef
+
+export def CompleteReveal(arglead: string, _cmdline: string,
+    _cursorpos: number): list<string>
+  if !s_open || s_root ==# ''
+    return []
+  endif
+
+  var lead = RevealCompletionLead(arglead)
+  if lead !=# '' && lead[0] ==# '~'
+    lead = expand(lead)
+  endif
+  var absolute = lead =~# '^/'
+    || ((has('win32') || has('win64') || has('win32unix'))
+      && (lead =~? '^[A-Za-z]:[/\\]' || lead =~# '^\\\\'))
+
+  # Completing the already typed workspace root does not require enumerating
+  # its outside parent. All other parents must pass the same ancestor-by-
+  # ancestor boundary used by Reveal before readdir() can traverse them.
+  var trailing_separator = (has('win32') || has('win64') || has('win32unix'))
+    ? lead =~# '[/\\]$'
+    : lead =~# '/$'
+  if absolute && !trailing_separator && PathEq(lead, s_root)
+      && RevealPathIsContained(lead)
+      && isdirectory(s_root)
+    return [fnameescape(RStripSlash(lead) .. '/')]
+  endif
+
+  var slash = strridx(lead, '/')
+  var parent_fragment = slash >= 0 ? strpart(lead, 0, slash) : ''
+  if absolute && slash == 0
+    parent_fragment = '/'
+  endif
+  if parent_fragment =~? '^[A-Za-z]:$'
+    parent_fragment ..= '/'
+  endif
+  var prefix = strpart(lead, slash + 1)
+  var display_prefix = slash >= 0 ? strpart(lead, 0, slash + 1) : ''
+  var parent = absolute
+    ? NormPath(parent_fragment)
+    : NormPath(PathJoin(s_root, parent_fragment))
+  if !RevealPathIsContained(parent) || !isdirectory(parent)
+    return []
+  endif
+
+  var names: list<string>
+  try
+    names = readdir(parent)
+  catch
+    return []
+  endtry
+  names->sort((left, right) => StringCmp(left, right))
+
+  var matches: list<string> = []
+  var ignore_case = &fileignorecase
+    || has('win32') || has('win64') || has('win32unix')
+  var wanted = ignore_case ? tolower(prefix) : prefix
+  for name in names
+    var comparable = ignore_case ? tolower(name) : name
+    if stridx(comparable, wanted) != 0
+      continue
+    endif
+    var candidate = NormPath(PathJoin(parent, name))
+    if !RevealPathIsContained(candidate)
+      continue
+    endif
+    var display = display_prefix .. name
+    if isdirectory(candidate)
+      display ..= '/'
+    endif
+    matches->add(fnameescape(display))
+  endfor
+  return matches
+enddef
+
+export def OnRevealCommand(path: string = '')
+  # <q-args> gives this boundary the exact command text. Decode the single
+  # fnameescape() layer emitted by CompleteReveal, then keep OnRevealActive()
+  # as the already-decoded programmatic API.
+  OnRevealActive(RevealCompletionLead(path))
+enddef
+
+export def OnRevealActive(path: string = '')
+  if !s_open || s_root ==# '' || !WinValid()
+    echo '[SimpleTree] open the tree before revealing a path'
+    return
+  endif
+
+  var explicit = path !=# ''
+  var target = explicit ? RevealInputPath(path) : s_active_path
+  if !explicit && target ==# '' && s_target_winid != 0 && win_id2win(s_target_winid) > 0
     var bnr = winbufnr(s_target_winid)
     var name = bufname(bnr)
     if name !=# ''
-      target = fnamemodify(name, ':p')
+      target = NormPath(name)
     endif
   endif
   if target ==# '' || !PathExists(target)
-    echo '[SimpleTree] no active file to reveal'
+    if explicit
+      echo '[SimpleTree] reveal target does not exist: ' .. target
+    else
+      echo '[SimpleTree] no active file to reveal'
+    endif
     return
   endif
-  if !IsSubPath(s_root, target)
-    echo '[SimpleTree] active file is outside the workspace root'
+
+  # Both the spelling and its resolved filesystem identity must stay below
+  # the workspace. An in-root symlink is revealable only when its target is
+  # also in-root; an intermediate symlink cannot turn a relative path into an
+  # external scan.
+  if !RevealPathIsContained(target)
+    if explicit
+      echo '[SimpleTree] reveal target is outside the workspace root: ' .. target
+    else
+      echo '[SimpleTree] active file is outside the workspace root'
+    endif
     return
   endif
   RevealPath(target)

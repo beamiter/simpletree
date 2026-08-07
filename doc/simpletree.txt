@@ -80,8 +80,17 @@ under lib/ first, then target/release/ and target/debug/ for development use.
         Clear the tree cache and rescan.
 
                                                      *:SimpleTreeReveal*
-:SimpleTreeReveal
-        Reveal the current active file inside the existing root.
+:SimpleTreeReveal [path]
+        Reveal the current active file, or an explicit file/directory below
+        the existing root. A relative path is always resolved against the tree
+        root, independent of :pwd or :lcd. Required ancestors are expanded
+        asynchronously and only the newest reveal may move the selection.
+        The lexical path and every ancestor after symlink resolution must stay
+        inside the workspace, including paths that escape and later re-enter;
+        missing or escaping paths leave selection, expansion state and render
+        epoch unchanged. Completion enumerates relative paths from the tree
+        root (not :lcd), escapes spaces, and refuses outside/symlink-escaping
+        parents and candidates before directory traversal.
 
                                                      *:SimpleTreeClose*
 :SimpleTreeClose

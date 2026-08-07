@@ -4,6 +4,17 @@
 
 ## Unreleased - 2026-08-05
 
+### 任意路径定位
+
+- `:SimpleTreeReveal [path]` 现在可显式定位根内文件或目录；相对路径固定以 tree root
+  为基准，支持文件补全、空格路径、根节点和根内符号链接，省略参数仍定位活动文件。
+- 定位前检查词法 containment，并逐级验证每个祖先的 `resolve()` 结果；不存在、
+  经符号链接逃逸或先逃逸再重入的路径，在改动选择、展开状态或 render epoch 前
+  即失败。每次定位带单调前端 token，迟到的 scan/timer 只能更新自身缓存，不能
+  完成或移动更新的定位目标；已有 partial cache 的在途 scan 也会安全挂接当前 token。
+- `SimpleTreeReveal` 的补全改为从 tree root 当前层安全枚举并转义空格；绝对路径、
+  父目录和每个候选复用同一 containment 守卫，不会跟随 `:lcd` 或外逸 symlink。
+
 ### 可观测渲染性能
 
 - 新增 `:SimpleTreeStats[!]`，会话内报告 Render 次数与最近/最大/平均耗时、可见

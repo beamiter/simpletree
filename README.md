@@ -92,7 +92,7 @@ git clone https://github.com/beamiter/simpletree.git \
 |---|---|
 | `:SimpleTree [目录]` | 打开或关闭文件树；可选参数指定根目录 |
 | `:SimpleTreeRefresh` | 清空缓存并重新扫描当前树 |
-| `:SimpleTreeReveal` | 定位当前活动文件 |
+| `:SimpleTreeReveal [path]` | 定位活动文件，或显式定位工作区根内的文件/目录 |
 | `:SimpleTreeClose` | 保存当前宽度并关闭树窗口 |
 | `:SimpleTreeDebug` | 输出窗口、根目录、后台和缓存状态 |
 | `:SimpleTreeStats[!]` | 查看渲染耗时、buffer diff 与子树缓存命中；`!` 仅重置计数 |
@@ -109,6 +109,13 @@ git clone https://github.com/beamiter/simpletree.git \
 hit/miss、epoch 失效次数和被丢弃切片数。
 读取统计不会触发渲染；`:SimpleTreeStats!` 也不会清缓存或推进 epoch，因此可在
 性能排查前后安全取样，不会因为观测动作本身制造一次 cache miss。
+
+`:SimpleTreeReveal path` 的相对路径固定相对于当前 tree root，而不是当前窗口的
+`:pwd` / `:lcd`；文件补全与包含空格的路径均可用。定位会异步展开所需祖先，连续
+调用时只有最新目标能移动选择。路径必须真实存在，且词法路径和解析符号链接后的
+路径及其每一级词法祖先的解析结果都要留在工作区根内，避免符号链接先逃逸再重入；
+失败不会改变选择、展开状态或 render epoch。命令补全同样从 tree root 当前层枚举，
+不会因为窗口 `:lcd` 或手工输入的外逸 symlink 路径遍历工作区之外。
 
 ## 默认按键
 
