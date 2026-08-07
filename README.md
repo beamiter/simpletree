@@ -95,6 +95,7 @@ git clone https://github.com/beamiter/simpletree.git \
 | `:SimpleTreeReveal` | 定位当前活动文件 |
 | `:SimpleTreeClose` | 保存当前宽度并关闭树窗口 |
 | `:SimpleTreeDebug` | 输出窗口、根目录、后台和缓存状态 |
+| `:SimpleTreeStats[!]` | 查看渲染耗时、buffer diff 与子树缓存命中；`!` 仅重置计数 |
 | `:SimpleTreeHealth` | 检查 Vim 功能、配置范围、后台路径及系统 provider |
 | `:SimpleTreeVersion` | 输出当前发现的 Rust 后台版本 |
 | `:SimpleTreeToggleAutoRefresh` | 会话内切换自动刷新 |
@@ -102,6 +103,12 @@ git clone https://github.com/beamiter/simpletree.git \
 | `:SimpleTreeSearch <query>` | 后台递归搜索文件名，结果写入 quickfix（需要 v2 后台） |
 | `:SimpleTreeSort [mode]` | 设置或循环 `name` / `extension` / `mtime` / `size` 排序 |
 | `:SimpleTreeSortReverse` | 反转当前排序（目录仍保持在文件前） |
+
+`:SimpleTreeStats` 的统计是会话内轻量计数：总渲染次数、最近/最大/平均耗时、
+可见行数、实际改写行数与成功的 buffer API 写调用数，以及子树缓存
+hit/miss、epoch 失效次数和被丢弃切片数。
+读取统计不会触发渲染；`:SimpleTreeStats!` 也不会清缓存或推进 epoch，因此可在
+性能排查前后安全取样，不会因为观测动作本身制造一次 cache miss。
 
 ## 默认按键
 

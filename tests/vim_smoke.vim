@@ -17,6 +17,7 @@ call assert_equal(2, exists(':SimpleTree'))
 call assert_equal(2, exists(':SimpleTreeRefresh'))
 call assert_equal(2, exists(':SimpleTreeReveal'))
 call assert_equal(2, exists(':SimpleTreeHealth'))
+call assert_equal(2, exists(':SimpleTreeStats'))
 
 " Calling this also compiles the autoload module in a clean, headless Vim.
 silent call simpletree#Health()

@@ -213,6 +213,84 @@ call s:Wait(1200)
 call assert_false(join(s:Snapshot(), "\n") =~# 'zz_new', 'a deleted file disappears')
 call s:AssertMatchesUncached('after deleting a file')
 
+" -------------------------------------------------------- 性能统计旁路 ---
+
+" 查询不能改变任何计数或缓存身份；重置也只清计数，不能 bump epoch 或清掉
+" 已构建子树。重置后的下一次相同 Render 应直接重新累计一次 cache hit。
+let s:stats_before = simpletree#TestGetState().render_stats
+call assert_true(s:stats_before.renders > 0, 'render counter never advanced')
+call assert_true(s:stats_before.cache_hits > 0, 'render cache recorded no hits')
+call assert_true(s:stats_before.cache_misses > 0, 'render cache recorded no misses')
+call assert_true(s:stats_before.max_ms >= s:stats_before.last_ms,
+      \ 'explicit Vim-9.0-compatible Float maximum lost the latest sample')
+silent SimpleTreeStats
+let s:stats_after_query = simpletree#TestGetState().render_stats
+call assert_equal(s:stats_before, s:stats_after_query,
+      \ 'reading render statistics changed counters or cache state')
+
+SimpleTreeStats!
+let s:stats_reset = simpletree#TestGetState().render_stats
+for s:key in ['renders', 'cache_hits', 'cache_misses', 'invalidations',
+      \ 'invalidated_subtrees', 'total_changed_lines', 'buffer_writes']
+  call assert_equal(0, s:stats_reset[s:key], 'stats reset missed ' . s:key)
+endfor
+call assert_equal(s:stats_before.epoch, s:stats_reset.epoch,
+      \ 'stats reset bumped the render epoch')
+call assert_equal(s:stats_before.cache_entries, s:stats_reset.cache_entries,
+      \ 'stats reset discarded subtree cache entries')
+call call(s:P('Render'), [])
+let s:stats_reused = simpletree#TestGetState().render_stats
+call assert_equal(1, s:stats_reused.renders, 'post-reset render was not counted')
+call assert_true(s:stats_reused.cache_hits > 0, 'stats reset invalidated a reusable subtree')
+call assert_equal(0, s:stats_reused.cache_misses, 'unchanged post-reset render rebuilt a subtree')
+call assert_equal(0, s:stats_reused.last_changed_lines,
+      \ 'unchanged render did not reset last_changed_lines to zero')
+call assert_equal(0, s:stats_reused.buffer_writes,
+      \ 'unchanged render reported a successful buffer API write')
+
+" buffer_writes 数的是成功调用次数，而不是有改动的 Render 次数。
+" 两段不相邻的 diff 必须对应两次 setbufline()；缩短一行再对应
+" 一次 deletebufline()。同时用 nomodifiable 钉死失败返回不得计数。
+let s:probe_base = s:Snapshot()
+call assert_true(len(s:probe_base) >= 3, 'buffer-write probe needs three tree lines')
+let s:probe_lines = copy(s:probe_base)
+let s:probe_lines[0] ..= ' [stats-probe-a]'
+let s:probe_lines[2] ..= ' [stats-probe-b]'
+SimpleTreeStats!
+call call(s:P('UpdateBufferDiff'), [s:probe_lines])
+let s:stats_failed_write = simpletree#TestGetState().render_stats
+call assert_equal(0, s:stats_failed_write.buffer_writes,
+      \ 'failed setbufline() was counted as a buffer write')
+call assert_equal(0, s:stats_failed_write.last_changed_lines,
+      \ 'failed setbufline() was counted as changed lines')
+call assert_equal(s:probe_base, s:Snapshot(), 'failed write changed the tree buffer')
+
+call setbufvar(s:Buf(), '&modifiable', 1)
+call call(s:P('UpdateBufferDiff'), [s:probe_lines])
+let s:stats_two_runs = simpletree#TestGetState().render_stats
+call assert_equal(2, s:stats_two_runs.buffer_writes,
+      \ 'two separated diff runs were not counted as two successful API writes')
+call assert_equal(2, s:stats_two_runs.last_changed_lines,
+      \ 'successful changed-line count did not match the two diff runs')
+call call(s:P('UpdateBufferDiff'), [s:probe_lines])
+let s:stats_unchanged_probe = simpletree#TestGetState().render_stats
+call assert_equal(2, s:stats_unchanged_probe.buffer_writes,
+      \ 'unchanged low-level diff added a buffer write')
+call assert_equal(0, s:stats_unchanged_probe.last_changed_lines,
+      \ 'unchanged low-level diff retained the prior changed-line count')
+call call(s:P('UpdateBufferDiff'), [s:probe_lines[0 : -2]])
+let s:stats_delete = simpletree#TestGetState().render_stats
+call assert_equal(3, s:stats_delete.buffer_writes,
+      \ 'successful deletebufline() was not counted as an API write')
+call assert_equal(1, s:stats_delete.last_changed_lines,
+      \ 'successful deletebufline() did not count its removed line')
+let s:stats_output = execute('SimpleTreeStats')
+call assert_match('successful API writes=3', s:stats_output,
+      \ 'stats output does not describe successful API write calls')
+call call(s:P('UpdateBufferDiff'), [s:probe_base])
+call setbufvar(s:Buf(), '&modifiable', 0)
+call assert_equal(s:probe_base, s:Snapshot(), 'buffer-write probe did not restore tree lines')
+
 " ------------------------------------------------------------------ 收尾 ---
 
 call simpletree#Toggle()

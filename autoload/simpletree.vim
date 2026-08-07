@@ -2524,9 +2524,64 @@ var s_render_cfg_sig: string = ''
 # 测试用:置 true 后完全绕过缓存,用于产出参照渲染。
 var s_render_cache_off: bool = false
 
+# 轻量常驻统计只记录已经发生的渲染工作；读取与重置绝不能触碰 epoch 或缓存，
+# 因而 :SimpleTreeStats 本身不会改变下一次渲染的 hit/miss。
+var s_render_stats: dict<any> = {
+  renders: 0,
+  cache_hits: 0,
+  cache_misses: 0,
+  invalidations: 0,
+  invalidated_subtrees: 0,
+  total_ms: 0.0,
+  last_ms: 0.0,
+  max_ms: 0.0,
+  visible_lines: 0,
+  last_changed_lines: 0,
+  total_changed_lines: 0,
+  buffer_writes: 0,
+}
+
+def ResetRenderStats()
+  s_render_stats = {
+    renders: 0,
+    cache_hits: 0,
+    cache_misses: 0,
+    invalidations: 0,
+    invalidated_subtrees: 0,
+    total_ms: 0.0,
+    last_ms: 0.0,
+    max_ms: 0.0,
+    visible_lines: 0,
+    last_changed_lines: 0,
+    total_changed_lines: 0,
+    buffer_writes: 0,
+  }
+enddef
+
+def RenderStatsSnapshot(): dict<any>
+  var snapshot = deepcopy(s_render_stats)
+  # Before Vim 9.0.1108 arithmetic on values read directly from dict<any>
+  # could fail with E1012. Keep the mixed Number/Float storage, but narrow
+  # every operand before doing timing or cache-rate arithmetic.
+  var renders: number = get(snapshot, 'renders', 0)
+  var total_ms: float = get(snapshot, 'total_ms', 0.0)
+  var cache_hits: number = get(snapshot, 'cache_hits', 0)
+  var cache_misses: number = get(snapshot, 'cache_misses', 0)
+  var lookups: number = cache_hits + cache_misses
+  snapshot.avg_ms = renders > 0 ? total_ms / renders : 0.0
+  snapshot.cache_hit_percent = lookups > 0 ? cache_hits * 100.0 / lookups : 0.0
+  snapshot.cache_entries = len(s_subtree_cache)
+  snapshot.epoch = s_render_epoch
+  return snapshot
+enddef
+
 # 任何不由 SubtreeValid() 覆盖的状态变化都必须走这里:git 状态、未保存标记、
 # 过滤条件、根目录切换、整表重置。
 def BumpRenderEpoch()
+  var invalidations: number = get(s_render_stats, 'invalidations', 0)
+  var invalidated_subtrees: number = get(s_render_stats, 'invalidated_subtrees', 0)
+  s_render_stats.invalidations = invalidations + 1
+  s_render_stats.invalidated_subtrees = invalidated_subtrees + len(s_subtree_cache)
   s_render_epoch += 1
   s_subtree_cache = {}
 enddef
@@ -2620,7 +2675,13 @@ def BuildSubtree(path: string, depth: number): dict<any>
 
   var entries = s_cache[path]
   if !s_render_cache_off && SubtreeValid(path, depth, entries)
+    var cache_hits: number = get(s_render_stats, 'cache_hits', 0)
+    s_render_stats.cache_hits = cache_hits + 1
     return s_subtree_cache[path]
+  endif
+  if !s_render_cache_off
+    var cache_misses: number = get(s_render_stats, 'cache_misses', 0)
+    s_render_stats.cache_misses = cache_misses + 1
   endif
 
   var lines: list<string> = []
@@ -2835,6 +2896,9 @@ def UpdateBufferDiff(out: list<string>)
   endif
   var n_new = len(out)
   var n_cur = len(cur)
+  var changed_lines = 0
+  var successful_writes = 0
+  var all_writes_succeeded = true
   var i = 0
   while i < n_new
     if i < n_cur && cur[i] ==# out[i]
@@ -2847,24 +2911,48 @@ def UpdateBufferDiff(out: list<string>)
     while j < n_new && !(j < n_cur && cur[j] ==# out[j])
       j += 1
     endwhile
-    call setbufline(s_bufnr, i + 1, out[i : j - 1])
+    try
+      var write_result: number = setbufline(s_bufnr, i + 1, out[i : j - 1])
+      if write_result == 0
+        changed_lines += j - i
+        successful_writes += 1
+      else
+        all_writes_succeeded = false
+      endif
+    catch
+      all_writes_succeeded = false
+    endtry
     i = j
   endwhile
   if n_cur > n_new
     try
-      call deletebufline(s_bufnr, n_new + 1, n_cur)
+      if deletebufline(s_bufnr, n_new + 1, n_cur) == 0
+        changed_lines += n_cur - n_new
+        successful_writes += 1
+      else
+        all_writes_succeeded = false
+      endif
     catch
+      all_writes_succeeded = false
     endtry
   endif
   # copy(): 调用方后面还会把 out 交给别的函数，缓存必须是当时的快照。
-  s_rendered_lines = copy(out)
+  # A failed API call means the requested output is not a valid future diff
+  # baseline. Read the actual buffer once in that rare path instead.
+  s_rendered_lines = all_writes_succeeded ? copy(out) : getbufline(s_bufnr, 1, '$')
   s_rendered_bufnr = s_bufnr
+  s_render_stats.last_changed_lines = changed_lines
+  var total_changed_lines: number = get(s_render_stats, 'total_changed_lines', 0)
+  var buffer_writes: number = get(s_render_stats, 'buffer_writes', 0)
+  s_render_stats.total_changed_lines = total_changed_lines + changed_lines
+  s_render_stats.buffer_writes = buffer_writes + successful_writes
 enddef
 
 def Render()
   if !s_open || s_root ==# ''
     return
   endif
+  var render_started = reltime()
   EnsureWindowAndBuffer()
 
   call EnsureSyntaxTree()
@@ -2937,6 +3025,21 @@ def Render()
     endif
   endif
   UpdateActiveHighlight()
+
+  var last_ms: float = reltimefloat(reltime(render_started)) * 1000.0
+  var renders: number = get(s_render_stats, 'renders', 0)
+  var total_ms: float = get(s_render_stats, 'total_ms', 0.0)
+  var max_ms: float = get(s_render_stats, 'max_ms', 0.0)
+  s_render_stats.renders = renders + 1
+  s_render_stats.total_ms = total_ms + last_ms
+  s_render_stats.last_ms = last_ms
+  # max({list<Float>}) only became available in Vim 9.1.1684. SimpleTree still
+  # supports Vim 9.0, so keep all newly added timing math on explicit Float
+  # comparisons instead of depending on the newer aggregate behavior.
+  if last_ms > max_ms
+    s_render_stats.max_ms = last_ms
+  endif
+  s_render_stats.visible_lines = len(out)
 enddef
 
 # =============================================================
@@ -4444,8 +4547,37 @@ export def DebugStatus()
   echo '  loading: ' .. string(keys(s_loading))
   echo '  scan_errors: ' .. string(s_scan_errors)
   echo '  cache_keys: ' .. string(keys(s_cache))
+  var render_stats = RenderStatsSnapshot()
+  echo printf('  render: count=%d last=%.2fms max=%.2fms avg=%.2fms visible=%d changed=%d',
+    render_stats.renders, render_stats.last_ms, render_stats.max_ms,
+    render_stats.avg_ms, render_stats.visible_lines, render_stats.last_changed_lines)
+  echo printf('  subtree_cache: entries=%d hit=%d miss=%d hit-rate=%.1f%% invalidations=%d',
+    render_stats.cache_entries, render_stats.cache_hits, render_stats.cache_misses,
+    render_stats.cache_hit_percent, render_stats.invalidations)
   Log('DebugStatus logged', 'MoreMsg')
 enddef
+
+
+export def Stats(reset: bool = false)
+  if reset
+    ResetRenderStats()
+    echom '[SimpleTree] render statistics reset'
+    return
+  endif
+  var stats = RenderStatsSnapshot()
+  echohl Title
+  echom '[SimpleTree] render statistics'
+  echohl None
+  echom printf('  renders=%d last=%.2fms max=%.2fms avg=%.2fms visible=%d',
+    stats.renders, stats.last_ms, stats.max_ms, stats.avg_ms, stats.visible_lines)
+  echom printf('  buffer changed=%d last / %d total; successful API writes=%d',
+    stats.last_changed_lines, stats.total_changed_lines, stats.buffer_writes)
+  echom printf('  subtree cache entries=%d hit=%d miss=%d hit-rate=%.1f%%',
+    stats.cache_entries, stats.cache_hits, stats.cache_misses, stats.cache_hit_percent)
+  echom printf('  epoch=%d invalidations=%d discarded-subtrees=%d',
+    stats.epoch, stats.invalidations, stats.invalidated_subtrees)
+enddef
+
 
 def HealthItem(ok: bool, label: string, detail: string = '')
   echohl ok ? 'MoreMsg' : 'ErrorMsg'
@@ -4939,5 +5071,6 @@ export def TestGetState(): dict<any>
     metadata_cache_count: metadata_cache_count,
     loading_count: len(s_loading),
     metadata_loading_count: metadata_loading_count,
+    render_stats: RenderStatsSnapshot(),
   }
 enddef

@@ -4,6 +4,19 @@
 
 ## Unreleased - 2026-08-05
 
+### 可观测渲染性能
+
+- 新增 `:SimpleTreeStats[!]`，会话内报告 Render 次数与最近/最大/平均耗时、可见
+  行数、buffer diff 实际改写行数与成功 API 写调用数、子树缓存 hit/miss/命中率、
+  epoch 失效次数及丢弃切片数；`:SimpleTreeDebug` 同步给出紧凑摘要。
+- 统计读取与 `!` 重置刻意旁路 `BumpRenderEpoch()` 和 `SubtreeValid()`：不会清缓存、
+  伪造 hit/miss 或让下一次渲染变慢。禁用缓存生成参照渲染时也不污染命中统计。
+- 最大耗时使用显式 Float 比较，不调用 Vim 9.1.1684 才支持的 `max(list<Float>)`；
+  计算前也将 `dict<any>` 成员收窄为 Number/Float，避免 Vim 9.0.1108 之前的
+  E1012。新增可观测性不改变项目原有 Vim 9.0 最低版本。
+- render-cache 回归增加观测透明性断言：查询前后全量状态一致，重置保留 epoch 与
+  cache entries，随后相同 Render 必须直接命中且不产生 miss。
+
 ### 全套统一
 
 - `.simplecore/` 回来了。10 个仓库里的 supervisor(`autoload/<plugin>/core.vim`

@@ -9,6 +9,7 @@
 :SimpleTreeSearch	simpletree.txt	/*:SimpleTreeSearch*
 :SimpleTreeSort	simpletree.txt	/*:SimpleTreeSort*
 :SimpleTreeSortReverse	simpletree.txt	/*:SimpleTreeSortReverse*
+:SimpleTreeStats	simpletree.txt	/*:SimpleTreeStats*
 :SimpleTreeToggleAutoFollow	simpletree.txt	/*:SimpleTreeToggleAutoFollow*
 :SimpleTreeToggleAutoRefresh	simpletree.txt	/*:SimpleTreeToggleAutoRefresh*
 :SimpleTreeVersion	simpletree.txt	/*:SimpleTreeVersion*

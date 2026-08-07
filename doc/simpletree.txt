@@ -89,7 +89,17 @@ under lib/ first, then target/release/ and target/debug/ for development use.
 
                                                      *:SimpleTreeDebug*
 :SimpleTreeDebug
-        Print root, window, backend, pending-request, and cache state.
+        Print root, window, backend, pending-request, cache state, and a compact
+        rendering-statistics summary.
+
+                                                     *:SimpleTreeStats*
+:SimpleTreeStats[!]
+        Report session-local render count, last/maximum/average duration,
+        visible and actually rewritten lines, successful setbufline() /
+        deletebufline() calls, subtree-cache hit/miss ratio, epoch
+        invalidations, and discarded cache slices. With [!] reset only the
+        counters. Reading or resetting never renders, advances the epoch, or
+        invalidates a subtree, so observation does not manufacture misses.
 
                                                      *:SimpleTreeHealth*
 :SimpleTreeHealth
