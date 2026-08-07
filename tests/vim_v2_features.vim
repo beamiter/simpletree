@@ -29,6 +29,8 @@ runtime plugin/simpletree.vim
 var base = tempname()
 call mkdir(base .. '/sub', 'p')
 call writefile(['x'], base .. '/file-one.txt')
+call writefile(['x'], base .. '/small-sort.txt')
+call writefile([repeat('x', 200)], base .. '/large-sort.txt')
 call writefile(['y'], base .. '/sub/nested.txt')
 
 # ---------- User 事件收集 ----------
@@ -69,6 +71,13 @@ def WaitFor(Cond: func(): bool, ms: number = 4000): bool
   return Cond()
 enddef
 
+def MetadataCacheReady(): bool
+  var state = simpletree#TestGetState()
+  return state.loading_count == 0
+    && state.cache_count > 0
+    && state.metadata_cache_count == state.cache_count
+enddef
+
 # ---------- 打开树 ----------
 execute 'SimpleTree ' .. fnameescape(base)
 call assert_true(WaitFor(() => index(TreeLines()->mapnew((_, l) => l =~# 'file-one'), true) >= 0 || match(join(TreeLines()), 'file-one') >= 0), 'tree should list fixture files')
@@ -95,6 +104,33 @@ call win_execute(tw, 'g:TestMapQ = maparg("q", "n")')
 call assert_equal('', get(g:, 'TestMapQ', 'x'), 'q must not be mapped in tree buffer')
 call win_execute(tw, 'g:TestMapX = maparg("X", "n")')
 call assert_match('OnRefresh', get(g:, 'TestMapX', ''), 'X should be mapped to refresh')
+
+# ---------- metadata 排序端到端 ----------
+call assert_true(WaitFor(() => simpletree#TestGetState().loading_count == 0),
+  'initial name scan should finish')
+call assert_equal(0, simpletree#TestGetState().metadata_cache_count,
+  'default name scan should not request metadata')
+call simpletree#SetSort('size')
+call assert_true(WaitFor(() => MetadataCacheReady()), 'size sort metadata rescan should finish')
+var sorted_lines = TreeLines()
+call assert_true(match(sorted_lines, 'large-sort') < match(sorted_lines, 'small-sort'),
+  'size sort should put the larger file first: ' .. string(sorted_lines))
+call assert_equal('size', simpletree#TestGetState().sort)
+
+# Metadata is a property of the cached list snapshot.  Passing through both
+# non-metadata modes must not clear and rescan that already-rich snapshot.
+call simpletree#SetSort('name')
+call simpletree#SetSort('extension')
+var rich_cache_count = simpletree#TestGetState().cache_count
+call simpletree#SetSort('mtime')
+var reused_state = simpletree#TestGetState()
+call assert_equal(rich_cache_count, reused_state.cache_count,
+  'returning to a metadata sort should reuse the rich cache')
+call assert_equal(0, reused_state.loading_count,
+  'returning to a metadata sort unexpectedly started another scan')
+call assert_equal(rich_cache_count, reused_state.metadata_cache_count,
+  'metadata provenance was lost while switching sort modes')
+call simpletree#SetSort('name')
 
 # ---------- fs watch 端到端（能力可用时） ----------
 if index(caps, 'watch') >= 0

@@ -12,6 +12,7 @@ SimpleTree 使用 Vim9 script，当前不支持 Neovim。
 - git status 标记：逐文件状态（修改/暂存/未跟踪/冲突/删除）与目录聚合标记，含符号与配色，可完全自定义或关闭。
 - 后台递归搜索：`:SimpleTreeSearch` 支持 substring / fuzzy 匹配，结果流式写入 quickfix。
 - 树内过滤（`F`）只显示匹配节点及其祖先；`/` 跳转式查找，`]f` / `[f` 循环匹配。
+- `s` 在名称、扩展名、修改时间、体积排序间循环，`gs` 反转顺序；目录始终优先，元数据按需异步获取并随缓存复用。
 - 树缓冲区按键全部可通过 `g:simpletree_mappings` 覆盖或禁用。
 - `User SimpleTree*` 自动命令事件（打开/关闭/换根/展开/文件操作等），便于第三方集成。
 - 后台限制并发扫描数量、合并协议输出 flush，快速展开大量目录时更稳定；watch 下的目录列表带失效信号缓存。
@@ -99,6 +100,8 @@ git clone https://github.com/beamiter/simpletree.git \
 | `:SimpleTreeToggleAutoRefresh` | 会话内切换自动刷新 |
 | `:SimpleTreeToggleAutoFollow` | 会话内切换活动文件跟随 |
 | `:SimpleTreeSearch <query>` | 后台递归搜索文件名，结果写入 quickfix（需要 v2 后台） |
+| `:SimpleTreeSort [mode]` | 设置或循环 `name` / `extension` / `mtime` / `size` 排序 |
+| `:SimpleTreeSortReverse` | 反转当前排序（目录仍保持在文件前） |
 
 ## 默认按键
 
@@ -136,6 +139,7 @@ git clone https://github.com/beamiter/simpletree.git \
 | `F` | 过滤已加载节点（空串清除；statusline 显示当前过滤） |
 | `/` | 按名称查找并跳转 |
 | `]f` / `[f` | 跳到下一个 / 上一个查找匹配 |
+| `s` / `gs` | 循环排序模式 / 反转当前排序 |
 | `?` | 显示完整快捷键帮助 |
 
 所有树内按键都可通过 `g:simpletree_mappings` 覆盖，例如：
@@ -157,7 +161,8 @@ let g:simpletree_set_default_mapping = 0
 nmap <silent> <leader>n <Plug>(simpletree-toggle)
 ```
 
-SimpleTree 不会覆盖已存在的 `<leader>e` 映射。树缓冲区内的按键目前固定，只有折叠全部的按键可通过 `g:simpletree_collapse_all_key` 调整。
+SimpleTree 不会覆盖已存在的 `<leader>e` 映射。树缓冲区内全部按键都可通过
+`g:simpletree_mappings` 覆盖或禁用；`g:simpletree_collapse_all_key` 继续作为折叠全部的兼容别名。
 
 ## 配置
 
@@ -176,6 +181,8 @@ SimpleTree 不会覆盖已存在的 `<leader>e` 映射。树缓冲区内的按�
 | `g:simpletree_hide_dotfiles` | `1` | 隐藏点文件 |
 | `g:simpletree_git_ignore` | `1` | 遵循 Git ignore 规则 |
 | `g:simpletree_page` | `200` | 后台每块返回条目数；限制在 `1..1000` |
+| `g:simpletree_sort` | `'name'` | `name` / `extension` / `mtime` / `size`；后两者默认最新/最大优先 |
+| `g:simpletree_sort_reverse` | `0` | 反转当前模式的顺序；目录仍始终优先 |
 | `g:simpletree_auto_follow` | `1` | 进入普通文件缓冲区时在树中跟随 |
 | `g:simpletree_auto_follow_change_root` | `0` | 活动文件在根外时自动切到其目录；根锁定时不生效 |
 | `g:simpletree_auto_refresh` | `1` | 自动刷新总开关 |

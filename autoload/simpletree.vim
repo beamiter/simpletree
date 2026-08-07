@@ -93,7 +93,9 @@ var s_git_ignore: bool = !!get(g:, 'simpletree_git_ignore', 1)
 
 var s_state: dict<any> = {}               # path -> {expanded: bool}
 var s_cache: dict<list<dict<any>>> = {}   # path -> entries[]
+var s_cache_has_metadata: dict<bool> = {} # path -> cached list requested meta=true
 var s_loading: dict<bool> = {}            # path -> true
+var s_loading_has_metadata: dict<bool> = {} # path -> inflight list requested meta=true
 var s_scan_errors: dict<string> = {}      # path -> last error; explicit refresh retries
 var s_pending: dict<number> = {}          # path -> request id
 var s_line_index: list<dict<any>> = []    # 渲染行对应的节点
@@ -164,6 +166,105 @@ var s_modified_paths: dict<bool> = {}
 # 书签会改变行内容(行尾多一个标记),所以每次增删都必须 BumpRenderEpoch()。
 var s_bookmarks: dict<bool> = {}
 var s_bookmarks_loaded: bool = false
+
+# ─────────────────── 排序 ───────────────────
+const SORT_MODES = ['name', 'extension', 'mtime', 'size']
+
+def SortMode(): string
+  var mode = get(g:, 'simpletree_sort', 'name')
+  if type(mode) != v:t_string
+    return 'name'
+  endif
+  mode = tolower(trim(mode))
+  return index(SORT_MODES, mode) >= 0 ? mode : 'name'
+enddef
+
+def SortNeedsMetadata(mode: string = SortMode()): bool
+  return mode ==# 'mtime' || mode ==# 'size'
+enddef
+
+# Metadata belongs to a directory-list snapshot, not to the selected sort mode.
+# Include inflight scans so a non-metadata refresh cannot replace a rich stale
+# cache immediately after SetSort() decides that no refresh is necessary.
+def CachedSnapshotsHaveMetadata(): bool
+  if empty(s_cache) && empty(s_loading)
+    return false
+  endif
+  for path in keys(s_cache)
+    if !get(s_cache_has_metadata, path, false)
+      return false
+    endif
+  endfor
+  for path in keys(s_loading)
+    if !get(s_loading_has_metadata, path, false)
+      return false
+    endif
+  endfor
+  return true
+enddef
+
+def StringCmp(left: string, right: string): number
+  if left ==# right
+    return 0
+  endif
+  return left <# right ? -1 : 1
+enddef
+
+def EntryNumber(entry: dict<any>, key: string): number
+  var value = get(entry, key, -1)
+  return type(value) == v:t_number ? value : -1
+enddef
+
+def CompareDecoratedEntries(left: dict<any>, right: dict<any>, mode: string,
+    reverse: bool): number
+  if left.is_dir != right.is_dir
+    return left.is_dir ? -1 : 1
+  endif
+
+  var cmp = 0
+  if mode ==# 'extension'
+    cmp = StringCmp(left.extension, right.extension)
+  elseif mode ==# 'mtime' || mode ==# 'size'
+    # 时间与体积默认采用更符合浏览习惯的降序。
+    cmp = left.metric == right.metric ? 0 : (left.metric > right.metric ? -1 : 1)
+  endif
+  if cmp == 0
+    cmp = StringCmp(left.folded_name, right.folded_name)
+  endif
+  if cmp == 0
+    cmp = StringCmp(left.name, right.name)
+  endif
+  return reverse ? -cmp : cmp
+enddef
+
+def SortedEntries(entries: list<dict<any>>): list<dict<any>>
+  var mode = SortMode()
+  var reverse = !!get(g:, 'simpletree_sort_reverse', 0)
+  # daemon 的基础顺序已经是目录优先、名称升序；默认路径保持零复制。
+  if mode ==# 'name' && !reverse
+    return entries
+  endif
+  # Precompute case-folded names/extensions once. A comparator can run O(n
+  # log n) times, so deriving these keys inside it is costly on huge folders.
+  var decorated: list<dict<any>> = []
+  for entry in entries
+    var name = get(entry, 'name', '')
+    decorated->add({
+      entry: entry,
+      is_dir: !!get(entry, 'is_dir', false),
+      name: name,
+      folded_name: tolower(name),
+      extension: mode ==# 'extension' ? tolower(fnamemodify(name, ':e')) : '',
+      metric: mode ==# 'mtime' || mode ==# 'size' ? EntryNumber(entry, mode) : -1,
+    })
+  endfor
+  decorated->sort((left, right) => CompareDecoratedEntries(left, right, mode, reverse))
+  var result: list<dict<any>> = []
+  for item in decorated
+    result->add(item.entry)
+  endfor
+  return result
+enddef
 
 # =============================================================
 # 工具函数
@@ -967,6 +1068,9 @@ def InvalidateAndRescan(dir_path: string)
   if has_key(s_cache, dir_path)
     call remove(s_cache, dir_path)
   endif
+  if has_key(s_cache_has_metadata, dir_path)
+    call remove(s_cache_has_metadata, dir_path)
+  endif
   if has_key(s_loading, dir_path)
     call remove(s_loading, dir_path)
   endif
@@ -1180,9 +1284,13 @@ def BackendCrashed(restarting: bool = false)
   endtry
   s_pending = {}
   s_loading = {}
+  s_loading_has_metadata = {}
   for path in failed_paths
     if has_key(s_cache, path)
       call remove(s_cache, path)
+    endif
+    if has_key(s_cache_has_metadata, path)
+      call remove(s_cache_has_metadata, path)
     endif
     s_scan_errors[path] = restarting
       ? 'backend restarting…'
@@ -1221,7 +1329,7 @@ def BSend(req: dict<any>): bool
   return simpletree#core#Send(req)
 enddef
 
-def BList(path: string, show_hidden: bool, git_ignore: bool, max: number, OnChunk: func, OnDone: func, OnError: func): number
+def BList(path: string, show_hidden: bool, git_ignore: bool, max: number, with_metadata: bool, OnChunk: func, OnDone: func, OnError: func): number
   if !BEnsureBackend()
     try
       OnError('backend not available')
@@ -1231,7 +1339,8 @@ def BList(path: string, show_hidden: bool, git_ignore: bool, max: number, OnChun
   endif
   var id = BNextId()
   s_bcbs[id] = {OnChunk: OnChunk, OnDone: OnDone, OnError: OnError}
-  if !BSend({type: 'list', id: id, path: path, show_hidden: show_hidden, git_ignore: git_ignore, max: max})
+  if !BSend({type: 'list', id: id, path: path, show_hidden: show_hidden,
+      git_ignore: git_ignore, max: max, meta: with_metadata})
     call remove(s_bcbs, id)
     try
       OnError('failed to send request to backend')
@@ -1292,6 +1401,9 @@ def CancelFrontendWork()
     if has_key(s_cache, p)
       call remove(s_cache, p)
     endif
+    if has_key(s_cache_has_metadata, p)
+      call remove(s_cache_has_metadata, p)
+    endif
   endfor
   for [p, id] in items(s_pending)
     try
@@ -1301,6 +1413,7 @@ def CancelFrontendWork()
   endfor
   s_pending = {}
   s_loading = {}
+  s_loading_has_metadata = {}
   # 也清掉尚未进入 s_pending 或已经脱离路径索引的旧请求回调。
   s_bcbs = {}
 enddef
@@ -1467,6 +1580,9 @@ def RefreshDirs(dirs: list<string>)
       # 未展开的目录只失效缓存，等下次展开时再扫
       if has_key(s_cache, dir_path)
         call remove(s_cache, dir_path)
+      endif
+      if has_key(s_cache_has_metadata, dir_path)
+        call remove(s_cache_has_metadata, dir_path)
       endif
       if has_key(s_scan_errors, dir_path)
         call remove(s_scan_errors, dir_path)
@@ -1871,6 +1987,9 @@ def CancelPending(path: string)
     endtry
     call remove(s_pending, path)
   endif
+  if has_key(s_loading_has_metadata, path)
+    call remove(s_loading_has_metadata, path)
+  endif
 enddef
 
 def ScheduleRender()
@@ -1925,12 +2044,15 @@ def ScanDirAsync(path: string, force: bool = false)
   var p = path
   var req_id: number = 0
   var session_generation = s_session_generation
+  var request_has_metadata = SortNeedsMetadata()
+  s_loading_has_metadata[path] = request_has_metadata
 
   req_id = BList(
     p,
     !s_hide_dotfiles,
     s_git_ignore,
     g:simpletree_page,
+    request_has_metadata,
     (entries) => {
       if !s_open || session_generation != s_session_generation
         return
@@ -1940,8 +2062,13 @@ def ScanDirAsync(path: string, force: bool = false)
         call remove(s_scan_errors, p)
       endif
       # 刷新已有目录时不发布中间结果，保留旧内容直到 OnDone 一次性替换
-      if !keep_stale
+      # Only the daemon's native name/ascending order can stream directly.
+      # Publishing every chunk in another mode would re-sort the entire growing
+      # directory after each batch (near O(chunks * n log n)); publish those
+      # modes atomically from OnDone instead.
+      if !keep_stale && SortMode() ==# 'name' && !get(g:, 'simpletree_sort_reverse', 0)
         s_cache[p] = acc
+        s_cache_has_metadata[p] = request_has_metadata
         ScheduleRender()
       endif
     },
@@ -1952,7 +2079,11 @@ def ScanDirAsync(path: string, force: bool = false)
       if has_key(s_loading, p)
         call remove(s_loading, p)
       endif
+      if has_key(s_loading_has_metadata, p)
+        call remove(s_loading_has_metadata, p)
+      endif
       s_cache[p] = acc
+      s_cache_has_metadata[p] = request_has_metadata
       if has_key(s_pending, p) && s_pending[p] == req_id
         call remove(s_pending, p)
       endif
@@ -1981,11 +2112,17 @@ def ScanDirAsync(path: string, force: bool = false)
       if has_key(s_loading, p)
         call remove(s_loading, p)
       endif
+      if has_key(s_loading_has_metadata, p)
+        call remove(s_loading_has_metadata, p)
+      endif
       if has_key(s_pending, p) && s_pending[p] == req_id
         call remove(s_pending, p)
       endif
       if has_key(s_cache, p)
         call remove(s_cache, p)
+      endif
+      if has_key(s_cache_has_metadata, p)
+        call remove(s_cache_has_metadata, p)
       endif
       s_scan_errors[p] = type(msg) == v:t_string && msg !=# '' ? msg : 'unknown scan error'
       if isdirectory(p)
@@ -2005,6 +2142,9 @@ def ScanDirAsync(path: string, force: bool = false)
   else
     if has_key(s_loading, path)
       call remove(s_loading, path)
+    endif
+    if has_key(s_loading_has_metadata, path)
+      call remove(s_loading_has_metadata, path)
     endif
   endif
 enddef
@@ -2207,6 +2347,8 @@ const KEY_ACTIONS: dict<string> = {
   bookmark_list: 'OnBookmarkJump',
   bookmark_next: 'OnBookmarkNext',
   bookmark_prev: 'OnBookmarkPrev',
+  sort_cycle: 'OnSortCycle',
+  sort_reverse: 'ToggleSortReverse',
 }
 
 const DEFAULT_KEYS: dict<string> = {
@@ -2258,6 +2400,8 @@ const DEFAULT_KEYS: dict<string> = {
   "'": 'bookmark_list',
   ']b': 'bookmark_next',
   '[b': 'bookmark_prev',
+  's': 'sort_cycle',
+  'gs': 'sort_reverse',
 }
 
 # 合并默认表、g:simpletree_collapse_all_key 兼容别名与 g:simpletree_mappings。
@@ -2398,6 +2542,8 @@ def RenderConfigSig(): string
     !!get(g:, 'simpletree_use_nerdfont', 0),
     !!get(g:, 'simpletree_show_bookmarks', 1),
     get(g:, 'simpletree_bookmark_symbol', '★'),
+    SortMode(),
+    !!get(g:, 'simpletree_sort_reverse', 0),
     GitStatusEnabled(),
     GitSymbols(),
     s_icons,
@@ -2492,7 +2638,7 @@ def BuildSubtree(path: string, depth: number): dict<any>
   if show_bookmarks
     LoadBookmarks()
   endif
-  for e in entries
+  for e in SortedEntries(entries)
     if !FilterAllowsEntry(e)
       continue
     endif
@@ -2836,6 +2982,8 @@ def SetRoot(new_root: string, lock: bool = false)
   s_pending = {}
   s_loading = {}
   s_cache = {}
+  s_cache_has_metadata = {}
+  s_loading_has_metadata = {}
   s_scan_errors = {}
   s_dir_mtimes = {}
 
@@ -3216,6 +3364,7 @@ export def OnCollapseAll()
   endfor
   s_pending = filter(s_pending, (k, _) => k ==# s_root)
   s_loading = filter(s_loading, (k, _) => k ==# s_root)
+  s_loading_has_metadata = filter(s_loading_has_metadata, (k, _) => k ==# s_root)
   for p in keys(s_watched)
     if p !=# s_root
       UnwatchDir(p)
@@ -3240,6 +3389,44 @@ export def OnToggleGitIgnore()
   s_git_ignore = !s_git_ignore
   g:simpletree_git_ignore = s_git_ignore ? 1 : 0
   Refresh()
+enddef
+
+export def CompleteSort(arglead: string, _cmdline: string, _cursorpos: number): list<string>
+  var lead = tolower(arglead)
+  return SORT_MODES->copy()->filter((_, mode) => stridx(mode, lead) == 0)
+enddef
+
+export def SetSort(requested: string = '')
+  var old_mode = SortMode()
+  var mode = tolower(trim(requested))
+  if mode ==# ''
+    mode = SORT_MODES[(index(SORT_MODES, old_mode) + 1) % len(SORT_MODES)]
+  elseif index(SORT_MODES, mode) < 0
+    echohl WarningMsg
+    echom '[SimpleTree] unknown sort mode: ' .. requested .. ' (use name, extension, mtime or size)'
+    echohl None
+    return
+  endif
+  g:simpletree_sort = mode
+  BumpRenderEpoch()
+  if SortNeedsMetadata(mode) && !CachedSnapshotsHaveMetadata()
+    # 当前快照确实缺 metadata 时才重扫；rich snapshot 在模式间切换时复用。
+    Refresh()
+  else
+    Render()
+  endif
+  echo '[SimpleTree] sort: ' .. mode .. (get(g:, 'simpletree_sort_reverse', 0) ? ' (reversed)' : '')
+enddef
+
+export def OnSortCycle()
+  SetSort()
+enddef
+
+export def ToggleSortReverse()
+  g:simpletree_sort_reverse = get(g:, 'simpletree_sort_reverse', 0) ? 0 : 1
+  BumpRenderEpoch()
+  Render()
+  echo '[SimpleTree] sort reverse: ' .. (g:simpletree_sort_reverse ? 'on' : 'off')
 enddef
 
 export def OnClose()
@@ -3701,6 +3888,8 @@ def BuildHelpLines(): list<string>
     'R     刷新树（仅重扫缓存）',
     'H     显示/隐藏点文件',
     'I     切换 gitignore 过滤（显示/隐藏被 git 忽略的文件）',
+    's     循环排序：name / extension / mtime / size',
+    'gs    反转当前排序',
     'q     关闭树窗口',
     'e     将当前节点设为根（目录；文件取父目录））',
     'U     根上移一层',
@@ -4071,6 +4260,8 @@ export def Refresh()
   s_pending = {}
   s_loading = {}
   s_cache = {}
+  s_cache_has_metadata = {}
+  s_loading_has_metadata = {}
   s_scan_errors = {}
   # 清空修改时间缓存，强制重新检测
   s_dir_mtimes = {}
@@ -4295,6 +4486,10 @@ export def Health()
     'page size', string(g:simpletree_page))
   HealthItem(g:simpletree_width >= 10 && g:simpletree_width <= 500,
     'tree width', string(g:simpletree_width))
+  var configured_sort = get(g:, 'simpletree_sort', 'name')
+  HealthItem(type(configured_sort) == v:t_string
+      && index(SORT_MODES, tolower(trim(configured_sort))) >= 0,
+    'sort mode', string(configured_sort))
 
   var trash = TrashCommand('/tmp/simpletree-health-check')
   var trash_detail = !get(g:, 'simpletree_use_trash', 1)
@@ -4636,6 +4831,13 @@ export def StatusLine(): string
   if FilterActive()
     flags->add('filter:' .. s_filter_query)
   endif
+  var sort_mode = SortMode()
+  if sort_mode !=# 'name' || get(g:, 'simpletree_sort_reverse', 0)
+    var reversed = !!get(g:, 'simpletree_sort_reverse', 0)
+    var descending_by_default = sort_mode ==# 'mtime' || sort_mode ==# 'size'
+    var direction = (descending_by_default != reversed) ? '↓' : '↑'
+    flags->add('sort:' .. sort_mode .. direction)
+  endif
   return ' EXPLORER  ' .. display .. (len(flags) > 0 ? ('  [' .. join(flags, ',') .. ']') : '')
 enddef
 
@@ -4713,11 +4915,29 @@ export def TestSetFilter(q: string)
 enddef
 
 export def TestGetState(): dict<any>
+  var metadata_cache_count = 0
+  for path in keys(s_cache)
+    if get(s_cache_has_metadata, path, false)
+      metadata_cache_count += 1
+    endif
+  endfor
+  var metadata_loading_count = 0
+  for path in keys(s_loading)
+    if get(s_loading_has_metadata, path, false)
+      metadata_loading_count += 1
+    endif
+  endfor
   return {
     caps: keys(s_backend_caps),
     watched: keys(s_watched),
     git_status_count: len(s_git_status),
     filter: s_filter_query,
     path_lines: len(s_path_lines),
+    sort: SortMode(),
+    sort_reverse: !!get(g:, 'simpletree_sort_reverse', 0),
+    cache_count: len(s_cache),
+    metadata_cache_count: metadata_cache_count,
+    loading_count: len(s_loading),
+    metadata_loading_count: metadata_loading_count,
   }
 enddef

@@ -116,6 +116,16 @@ under lib/ first, then target/release/ and target/debug/ for development use.
         default; call simpletree#Search({query}, 'fuzzy') for ordered
         subsequence matching.
 
+                                                     *:SimpleTreeSort*
+:SimpleTreeSort [mode]
+        Set the tree order to name, extension, mtime or size.  With no mode,
+        cycle to the next one.  Directories always remain before files;
+        mtime and size default to newest/largest first.
+
+                                              *:SimpleTreeSortReverse*
+:SimpleTreeSortReverse
+        Reverse the current sort order while retaining directories first.
+
 ==============================================================================
 5. MAPPINGS                                      *simpletree-mappings*
 
@@ -142,6 +152,8 @@ h, Left, <BS>
 R       Refresh.
 H       Toggle dotfiles.
 I       Toggle Git ignore filtering.
+s       Cycle name / extension / mtime / size sorting.
+gs      Reverse the current sorting mode.
 q       Close the tree.
 e       Use the selected directory as root; a file uses its parent.
 U       Move the root up one directory.
@@ -198,7 +210,7 @@ toggle_hidden, toggle_git_ignore, close, root_here, root_up, root_prompt,
 root_cwd, root_current, toggle_root_lock, copy, cut, paste, new_file,
 new_folder, rename, delete, help, open_vsplit, open_split, open_tab,
 preview, reveal_active, yank_name, yank_path, system_open, filter, find,
-find_next, find_prev.
+find_next, find_prev, sort_cycle, sort_reverse.
 
 |g:simpletree_collapse_all_key| is still honored as a compatibility alias
 for the collapse_all action.
@@ -258,6 +270,18 @@ g:simpletree_git_ignore
                                              *g:simpletree_page*
 g:simpletree_page
         Number, default 200.  Entries per response chunk, clamped to 1..1000.
+
+                                             *g:simpletree_sort*
+g:simpletree_sort
+        String, default "name".  One of name, extension, mtime or size.  The
+        latter two request entry metadata and sort newest/largest first.
+        Metadata is retained with each cached directory snapshot, so later
+        switches between sort modes do not rescan the same snapshot.
+
+                                     *g:simpletree_sort_reverse*
+g:simpletree_sort_reverse
+        Boolean, default 0.  Reverse the current mode without moving files
+        ahead of directories.
 
                                              *g:simpletree_auto_follow*
 g:simpletree_auto_follow

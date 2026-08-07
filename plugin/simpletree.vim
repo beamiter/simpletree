@@ -25,6 +25,24 @@ def ClampNumber(value: any, fallback: number, minimum: number, maximum: number):
   return min([maximum, max([minimum, value])])
 enddef
 
+def NormalizeSortMode(value: any): string
+  if type(value) != v:t_string
+    return 'name'
+  endif
+  var mode = tolower(trim(value))
+  return index(['name', 'extension', 'mtime', 'size'], mode) >= 0 ? mode : 'name'
+enddef
+
+def NormalizeFlag(value: any, fallback: number = 0): number
+  if type(value) == v:t_number
+    return value != 0 ? 1 : 0
+  endif
+  if type(value) == v:t_bool
+    return value ? 1 : 0
+  endif
+  return fallback
+enddef
+
 def LoadPersistedWidth(fallback: number): number
   if !get(g:, 'simpletree_persist_width', 1)
     return fallback
@@ -158,6 +176,9 @@ g:simpletree_hide_dotfiles = get(g:, 'simpletree_hide_dotfiles', 1)
 g:simpletree_git_ignore = get(g:, 'simpletree_git_ignore', 1)
 # 后端也会执行同样的边界检查；前端先钳制可避免无效配置进入协议。
 g:simpletree_page = ClampNumber(get(g:, 'simpletree_page', 200), 200, 1, 1000)
+# 目录始终优先；name/extension 默认升序，mtime/size 默认最新/最大优先。
+g:simpletree_sort = NormalizeSortMode(get(g:, 'simpletree_sort', 'name'))
+g:simpletree_sort_reverse = NormalizeFlag(get(g:, 'simpletree_sort_reverse', 0))
 # 打开文件后保持焦点在文件缓冲区
 g:simpletree_keep_focus = get(g:, 'simpletree_keep_focus', 1)
 g:simpletree_debug = get(g:, 'simpletree_debug', 0)
@@ -310,6 +331,8 @@ command! SimpleTreeVersion call g:SimpleTreeVersion()
 command! SimpleTreeToggleAutoRefresh call g:SimpleTreeToggleAutoRefresh()
 command! SimpleTreeToggleAutoFollow call g:SimpleTreeToggleAutoFollow()
 command! -nargs=+ SimpleTreeSearch simpletree#Search(<q-args>)
+command! -nargs=? -complete=customlist,simpletree#CompleteSort SimpleTreeSort simpletree#SetSort(<q-args>)
+command! SimpleTreeSortReverse simpletree#ToggleSortReverse()
 command! SimpleTreeRestart call simpletree#Restart()
 command! SimpleTreeLog     call simpletree#ShowLog()
 command! SimpleTreeBookmarks     call simpletree#OnBookmarkJump()

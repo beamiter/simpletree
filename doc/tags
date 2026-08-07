@@ -7,6 +7,8 @@
 :SimpleTreeRestart	simpletree.txt	/*:SimpleTreeRestart*
 :SimpleTreeReveal	simpletree.txt	/*:SimpleTreeReveal*
 :SimpleTreeSearch	simpletree.txt	/*:SimpleTreeSearch*
+:SimpleTreeSort	simpletree.txt	/*:SimpleTreeSort*
+:SimpleTreeSortReverse	simpletree.txt	/*:SimpleTreeSortReverse*
 :SimpleTreeToggleAutoFollow	simpletree.txt	/*:SimpleTreeToggleAutoFollow*
 :SimpleTreeToggleAutoRefresh	simpletree.txt	/*:SimpleTreeToggleAutoRefresh*
 :SimpleTreeVersion	simpletree.txt	/*:SimpleTreeVersion*
@@ -42,6 +44,8 @@ g:simpletree_show_bookmarks	simpletree.txt	/*g:simpletree_show_bookmarks*
 g:simpletree_show_file_icons	simpletree.txt	/*g:simpletree_show_file_icons*
 g:simpletree_show_modified	simpletree.txt	/*g:simpletree_show_modified*
 g:simpletree_show_root	simpletree.txt	/*g:simpletree_show_root*
+g:simpletree_sort	simpletree.txt	/*g:simpletree_sort*
+g:simpletree_sort_reverse	simpletree.txt	/*g:simpletree_sort_reverse*
 g:simpletree_split_below	simpletree.txt	/*g:simpletree_split_below*
 g:simpletree_split_force_right	simpletree.txt	/*g:simpletree_split_force_right*
 g:simpletree_use_nerdfont	simpletree.txt	/*g:simpletree_use_nerdfont*
