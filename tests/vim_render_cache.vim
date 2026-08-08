@@ -37,6 +37,8 @@ for s:f in s:files
   call writefile(['x'], s:tmp . '/' . s:f)
 endfor
 
+" 会话状态（展开集合）也落盘：绝不碰用户真正的 state.json。
+let g:simpletree_state_file = tempname() . '/state.json'
 runtime plugin/simpletree.vim
 
 function! s:Sid() abort

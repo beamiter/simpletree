@@ -23,6 +23,8 @@ let g:simpletree_git_status = 0
 let s:store = tempname() . '/bookmarks.json'
 let g:simpletree_bookmarks_file = s:store
 
+" 会话状态（展开集合）也落盘：绝不碰用户真正的 state.json。
+let g:simpletree_state_file = tempname() . '/state.json'
 runtime plugin/simpletree.vim
 
 let s:tmp = tempname()

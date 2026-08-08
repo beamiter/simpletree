@@ -9,7 +9,7 @@ CONTENTS                                                *simpletree-contents*
 4. Commands............................................|simpletree-commands|
 5. Mappings............................................|simpletree-mappings|
 6. Options.............................................|simpletree-options|
-7. Width persistence...................................|simpletree-width-state|
+7. Persisted state.....................................|simpletree-width-state|
 8. Backend diagnostics.................................|simpletree-backend|
 9. File-operation semantics............................|simpletree-safety|
 10. Tab pages..........................................|simpletree-tabpages|
@@ -159,6 +159,12 @@ under lib/ first, then target/release/ and target/debug/ for development use.
                                               *:SimpleTreeMarkClear*
 :SimpleTreeMarkClear
         Clear every mark.  Same as gM in the tree.
+
+                                            *:SimpleTreeStateClear*
+:SimpleTreeStateClear
+        Delete the persisted session state (the per-root expanded sets and the
+        last root).  The tree on screen is untouched; the session it belongs to
+        will record itself again when it closes.  See |simpletree-session-state|.
 
                                                      *:SimpleTreeSort*
 :SimpleTreeSort [mode]
@@ -415,6 +421,29 @@ g:simpletree_bookmarks_file                          *g:simpletree_bookmarks_fil
 g:simpletree_mark_symbol                                *g:simpletree_mark_symbol*
   Marker appended to a marked entry.  Default "✓".  See |simpletree-marks|.
 
+g:simpletree_persist_state                            *g:simpletree_persist_state*
+  Remember which directories were expanded, per root, and restore them the
+  next time that root is opened.  Default 1.  See |simpletree-session-state|.
+
+g:simpletree_state_file                                  *g:simpletree_state_file*
+  Where that state is stored.  Empty (the default) uses
+  $XDG_STATE_HOME/simpletree/state.json, falling back to
+  ~/.local/state/simpletree/state.json.
+
+g:simpletree_state_max_roots                        *g:simpletree_state_max_roots*
+  How many roots the file keeps, clamped to 0..1000.  Default 20.  When the
+  limit is reached the least recently saved root is dropped; the root of the
+  session doing the saving is never the one dropped.
+
+g:simpletree_state_max_dirs                          *g:simpletree_state_max_dirs*
+  How many expanded directories are recorded per root, clamped to 0..20000.
+  Default 500.  Shallower directories are kept first: dropping an ancestor
+  would keep its descendants from being shown anyway.
+
+g:simpletree_restore_last_root                    *g:simpletree_restore_last_root*
+  Make `:SimpleTree` with no argument reopen the root of the last session
+  instead of the directory of the current file.  Default 0.
+
                                              *g:simpletree_use_nerdfont*
 g:simpletree_use_nerdfont
         Boolean, default 1.  Use Nerd Font glyphs.
@@ -548,7 +577,7 @@ g:simpletree_use_watcher
         the "watch" capability, fall back to mtime polling.
 
 ==============================================================================
-7. WIDTH PERSISTENCE                       *simpletree-width-state*
+7. PERSISTED STATE                         *simpletree-width-state*
 
 When |g:simpletree_persist_width| is enabled, a resize updates the in-session
 width immediately.  Disk writes are debounced by
@@ -560,6 +589,24 @@ Default paths:
 - $XDG_STATE_HOME/simpletree/width when $XDG_STATE_HOME is set.
 - ~/.local/state/simpletree/width on Unix otherwise.
 - ~/vimfiles/simpletree/width on Windows otherwise.
+
+                                                *simpletree-session-state*
+The set of expanded directories is persisted the same way, per root, in
+|g:simpletree_state_file|.  It is written when the tree closes, when the root
+changes and on |VimLeavePre|, and read back the first time a root is opened in
+a session: reopening a project comes up with the directories you had open
+rather than a bare root.
+
+Restoring writes nothing to disk and starts no extra work.  Directories that
+have since been deleted or moved out of the root are dropped, and a directory
+you already touched in this session is never overwritten - collapsing one and
+reopening the same root keeps it collapsed.
+
+Only expansion is restored.  The tree root itself still follows the current
+file unless |g:simpletree_restore_last_root| is set, and neither the sort mode,
+the filter, the marks nor the hidden-file toggles survive a session.  The file
+is JSON and safe to delete by hand; |:SimpleTreeStateClear| does it for you,
+and :SimpleTreeHealth reports how many roots it holds.
 
 ==============================================================================
 8. BACKEND DIAGNOSTICS                         *simpletree-backend*

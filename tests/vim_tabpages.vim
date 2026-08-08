@@ -17,6 +17,8 @@ call writefile(['child'], s:root .. '/folder/child.txt')
 let g:simpletree_persist_width = 0
 let g:simpletree_daemon_path = s:daemon
 execute 'set runtimepath^=' .. fnameescape(s:repo)
+" 会话状态（展开集合）也落盘：绝不碰用户真正的 state.json。
+let g:simpletree_state_file = tempname() . '/state.json'
 runtime plugin/simpletree.vim
 
 function! s:Vars() abort

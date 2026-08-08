@@ -8,6 +8,8 @@ let g:simpletree_page = 0
 nnoremap <leader>e :let g:simpletree_user_mapping_ran = 1<CR>
 
 execute 'set runtimepath^=' .. fnameescape(s:root)
+" 会话状态（展开集合）也落盘：绝不碰用户真正的 state.json。
+let g:simpletree_state_file = tempname() . '/state.json'
 runtime plugin/simpletree.vim
 
 call assert_equal(1, g:simpletree_page, 'page size must be clamped away from zero')

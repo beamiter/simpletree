@@ -4,6 +4,33 @@
 
 ## Unreleased - 2026-08-08
 
+### 新增：展开集合与上次的根跨会话保留
+
+- 宽度写在 `$XDG_STATE_HOME/simpletree/width`，书签写在 `bookmarks.json`，
+  唯独用户每个会话真正重新手搭一遍的东西——展开了哪些目录——在 `:qa` 时被
+  丢掉。重开一个深项目意味着先按八次展开才能开始干活。
+- 新增 `g:simpletree_persist_state`（默认 1）与 `g:simpletree_state_file`
+  （默认 `.../simpletree/state.json`）。关树、换根和 `VimLeavePre` 时写入，
+  一个根在一次会话里第一次被打开时读回。
+- 恢复只写 `s_state`：目录内容照常按需扫描，`WatchExpandedDirs()` 自己捡起
+  这些目录，和用户手动展开走的是同一条路径——没有额外的一次全量遍历。
+- 恢复一个根只做一次。第二次（换根来回切、关了再开）不再读文件，否则用户
+  刚刚折叠掉的目录会被文件里的旧状态顶回来。已经不存在、或已经不在这个根
+  底下的路径直接丢弃：留着它们会让后面的 `I` 在空气上展开。
+- 文件有上限：`g:simpletree_state_max_roots`（默认 20，按 `saved_at` LRU
+  淘汰）与 `g:simpletree_state_max_dirs`（默认 500）。超出每根上限时留浅的
+  ——深处的一个展开贡献极小，而先丢祖先会让它的后代也显示不出来。正在保存
+  的那个根永远不参与淘汰：`localtime()` 只有秒的精度，同一秒里保存的两个根
+  按 `saved_at` 排不出先后。
+- 新增 `g:simpletree_restore_last_root`（默认 **0**）：`:SimpleTree` 不带
+  参数时回到上次的根。默认关闭是因为历史行为是"当前文件所在目录"，悄悄改掉
+  它会让"打开一个文件再开树"落在一棵完全不相干的树上。
+- 新增 `:SimpleTreeStateClear`，`:SimpleTreeHealth` 多一行 `session state`。
+- 新增测试 `tests/vim_session_state.vim`：预置一份状态文件后开树，断言里面
+  的目录自己展开了、不在里面的目录仍然折叠、已经消失的目录没有进 `s_state`；
+  然后断言保存下来的集合等于屏幕上的形状、换根时旧根先落盘、两个上限、关掉
+  开关之后文件一个字节都不变，以及 `:SimpleTreeStateClear` 真的删文件。
+
 ### 新增：复制与移动交给后台执行（`fs-ops`）
 
 - 过去复制的每一个字节都由 Vimscript 在主线程上搬：`readblob` 分块读、逐块

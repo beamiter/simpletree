@@ -35,6 +35,8 @@ let g:simpletree_use_system_copy = 0
 let g:simpletree_git_status = 0
 let g:simpletree_bookmarks_file = tempname() .. '/bookmarks.json'
 execute 'set runtimepath^=' .. fnameescape(s:repo)
+" 会话状态（展开集合）也落盘：绝不碰用户真正的 state.json。
+let g:simpletree_state_file = tempname() . '/state.json'
 runtime plugin/simpletree.vim
 
 function! s:Sid() abort

@@ -212,6 +212,19 @@ var s_modified_paths: dict<bool> = {}
 var s_bookmarks: dict<bool> = {}
 var s_bookmarks_loaded: bool = false
 
+# ─────────────────── 会话状态（展开集合 / 上次的根） ───────────────────
+#
+# 宽度和书签早就落盘了，而每个会话真正被用户重新手搭一遍的东西——展开了哪些
+# 目录——在 :qa 时丢掉。这里按根记录，重开同一棵树时原样恢复。
+#
+# 解码后的文件内容：
+#   {roots: {'<root>': {expanded: [...], saved_at: N}}, last_root: '<path>'}
+var s_session_state: dict<any> = {}
+var s_session_state_loaded: bool = false
+# 这个会话里已经恢复过的根。恢复只做一次：换根来回切时再恢复一遍，会把用户
+# 刚刚在本次会话里折叠掉的目录重新展开。
+var s_state_restored: dict<bool> = {}
+
 # ─────────────────── 排序 ───────────────────
 const SORT_MODES = ['name', 'extension', 'mtime', 'size']
 
@@ -1673,6 +1686,9 @@ enddef
 
 def EndFrontendSession()
   if s_open
+    # 关树是"这棵树今天长成什么样"最后一次还说得清的时刻：UnwatchAllDirs()
+    # 之后展开集合还在，但会话已经不是会话了。
+    PersistSessionState()
     UnwatchAllDirs()
     s_open = false
     s_session_generation += 1
@@ -2051,6 +2067,227 @@ def SaveBookmarks()
   catch
     Log('cannot write bookmarks: ' .. v:exception)
   endtry
+enddef
+
+# ─────────────────── 会话状态持久化 ───────────────────
+#
+# 宽度写在 .../simpletree/width，书签写在 .../simpletree/bookmarks.json；
+# 展开集合走同一条 XDG 解析规则，只是换一个文件名。
+
+def StateFile(): string
+  var configured = get(g:, 'simpletree_state_file', '')
+  if type(configured) == v:t_string && configured !=# ''
+    return fnamemodify(expand(configured), ':p')
+  endif
+  var base = exists('$XDG_STATE_HOME') && $XDG_STATE_HOME !=# ''
+    ? $XDG_STATE_HOME : expand('~/.local/state')
+  return base .. '/simpletree/state.json'
+enddef
+
+def StatePersistEnabled(): bool
+  return !!get(g:, 'simpletree_persist_state', 1)
+enddef
+
+# plugin/ 里已经钳过一次，但这两个上限也可以在运行时被改成任意东西，
+# 而它们唯一的作用就是给文件封顶——读的时候必须自己再确认一遍。
+def StateLimit(name: string, fallback: number, maximum: number): number
+  var value = get(g:, name, fallback)
+  if type(value) != v:t_number || value < 0
+    return fallback
+  endif
+  return min([value, maximum])
+enddef
+
+def LoadSessionState()
+  if s_session_state_loaded
+    return
+  endif
+  s_session_state_loaded = true
+  var file = StateFile()
+  if !filereadable(file)
+    return
+  endif
+  var decoded: any
+  try
+    decoded = json_decode(join(readfile(file), "\n"))
+  catch
+    Log('session state file is not valid JSON: ' .. file)
+    return
+  endtry
+  if type(decoded) != v:t_dict
+    return
+  endif
+  # 手写坏了的文件不该让树开不起来：形状对得上的部分收下，其余丢掉。
+  var roots: dict<any> = {}
+  var raw_roots = get(decoded, 'roots', {})
+  if type(raw_roots) == v:t_dict
+    for [root, record] in items(raw_roots)
+      if type(record) != v:t_dict
+        continue
+      endif
+      var expanded: list<string> = []
+      var raw_expanded = get(record, 'expanded', [])
+      if type(raw_expanded) == v:t_list
+        for p in raw_expanded
+          if type(p) == v:t_string && p !=# ''
+            add(expanded, p)
+          endif
+        endfor
+      endif
+      var saved_at = get(record, 'saved_at', 0)
+      roots[root] = {
+        expanded: expanded,
+        saved_at: type(saved_at) == v:t_number ? saved_at : 0,
+      }
+    endfor
+  endif
+  var last_root = get(decoded, 'last_root', '')
+  s_session_state = {
+    roots: roots,
+    last_root: type(last_root) == v:t_string ? last_root : '',
+  }
+enddef
+
+def SaveSessionState()
+  var file = StateFile()
+  var dir = fnamemodify(file, ':h')
+  if !isdirectory(dir)
+    try
+      mkdir(dir, 'p')
+    catch
+      Log('cannot create state directory: ' .. dir)
+      return
+    endtry
+  endif
+  try
+    writefile([json_encode(s_session_state)], file)
+  catch
+    Log('cannot write session state: ' .. v:exception)
+  endtry
+enddef
+
+# 当前根的展开集合记进内存里的会话状态；什么时候落盘由调用者决定。
+def CaptureSessionState()
+  if s_root ==# ''
+    return
+  endif
+  LoadSessionState()
+  var expanded: list<string> = []
+  for [p, st] in items(s_state)
+    # 根自己永远是展开的，记它没有意义；只在这个根下面的、今天还存在的目录
+    # 才值得写进文件——其余的下次恢复时也只会被丢掉。
+    if p ==# s_root || !get(st, 'expanded', false)
+      continue
+    endif
+    if !IsSubPath(s_root, p) || !isdirectory(p)
+      continue
+    endif
+    add(expanded, p)
+  endfor
+  # 超出上限时留浅的：深处的一个展开对下次开树的观感贡献极小，而它的祖先
+  # 都在更浅的层里——先丢祖先会让它自己也显示不出来。
+  sort(expanded, (a, b) => {
+    var da = count(a, '/')
+    var db = count(b, '/')
+    return da != db ? da - db : (a <# b ? -1 : (a ==# b ? 0 : 1))
+  })
+  var max_dirs = StateLimit('simpletree_state_max_dirs', 500, 20000)
+  if len(expanded) > max_dirs
+    expanded = max_dirs <= 0 ? [] : expanded[0 : max_dirs - 1]
+  endif
+
+  var roots: dict<any> = get(s_session_state, 'roots', {})
+  if empty(expanded)
+    # 全部折叠等于"没有什么可恢复的"：留一条空记录只会白占一个 LRU 名额。
+    if has_key(roots, s_root)
+      remove(roots, s_root)
+    endif
+  else
+    roots[s_root] = {expanded: sort(expanded), saved_at: localtime()}
+  endif
+
+  var max_roots = StateLimit('simpletree_state_max_roots', 20, 1000)
+  # 刚保存的这个根永远不参与淘汰：localtime() 只有秒的精度，同一秒里保存的
+  # 两个根按 saved_at 分不出先后，而"此刻正看着的这棵树"是最不该被丢掉的。
+  var others = filter(keys(roots), (_, k) => k !=# s_root)
+  sort(others, (a, b) => get(roots[b], 'saved_at', 0) - get(roots[a], 'saved_at', 0))
+  var keep = max([0, max_roots - (has_key(roots, s_root) ? 1 : 0)])
+  if len(others) > keep
+    for stale in others[keep : ]
+      remove(roots, stale)
+    endfor
+  endif
+  if max_roots <= 0 && has_key(roots, s_root)
+    remove(roots, s_root)
+  endif
+  s_session_state = {roots: roots, last_root: s_root}
+enddef
+
+export def PersistSessionState()
+  # 没有根就没有会话：这时写盘只会把别的会话刚记下的东西覆盖成空。
+  if !StatePersistEnabled() || s_root ==# ''
+    return
+  endif
+  CaptureSessionState()
+  SaveSessionState()
+enddef
+
+# 恢复只写 s_state：目录内容照常按需扫描，WatchExpandedDirs() 会自己捡起
+# 这些目录，和用户手动展开走的是同一条路径。
+def RestoreSessionState(root: string): number
+  if !StatePersistEnabled() || root ==# '' || get(s_state_restored, root, false)
+    return 0
+  endif
+  s_state_restored[root] = true
+  LoadSessionState()
+  var record = get(get(s_session_state, 'roots', {}), root, {})
+  if type(record) != v:t_dict
+    return 0
+  endif
+  var expanded: list<any> = get(record, 'expanded', [])
+  var restored = 0
+  for entry in expanded
+    var p: string = type(entry) == v:t_string ? entry : ''
+    # 落盘之后目录可能已经不在了，或者已经不在这个根底下。
+    if p ==# '' || !IsSubPath(root, p) || !isdirectory(p)
+      continue
+    endif
+    # 本次会话已经动过的路径不覆盖：刚折叠掉的目录不该被文件里的旧状态顶回来。
+    if has_key(s_state, p)
+      continue
+    endif
+    s_state[p] = {expanded: true}
+    restored += 1
+  endfor
+  return restored
+enddef
+
+# `:SimpleTree` 不带参数时的根。默认关闭：历史行为是用当前文件所在目录，
+# 悄悄改掉它会让"打开一个文件再开树"落在一棵完全不相干的树上。
+def PersistedLastRoot(): string
+  if !StatePersistEnabled() || !get(g:, 'simpletree_restore_last_root', 0)
+    return ''
+  endif
+  LoadSessionState()
+  var last = get(s_session_state, 'last_root', '')
+  if type(last) != v:t_string || last ==# '' || !IsDir(last)
+    return ''
+  endif
+  return last
+enddef
+
+export def StateClear()
+  var file = StateFile()
+  s_session_state = {}
+  s_session_state_loaded = true
+  s_state_restored = {}
+  if filereadable(file) && delete(file) != 0
+    echohl ErrorMsg
+    echom '[SimpleTree] cannot delete session state: ' .. file
+    echohl None
+    return
+  endif
+  echo '[SimpleTree] session state cleared: ' .. fnamemodify(file, ':~')
 enddef
 
 def IsBookmarked(path: string): bool
@@ -3846,6 +4083,9 @@ def SetRoot(new_root: string, lock: bool = false)
     return
   endif
   var old_root = s_root
+  # 换根之前把旧根记下来：这一步之后 s_root 就再也指不回它了，而它的展开
+  # 集合此刻还完整地留在 s_state 里。
+  PersistSessionState()
   DiscardRootScopedState()
   s_root = nr
   if lock
@@ -3860,8 +4100,12 @@ def SetRoot(new_root: string, lock: bool = false)
     return
   endif
 
+  RestoreSessionState(s_root)
   var st = GetNodeState(s_root)
   st.expanded = true
+  # 换根之后再存一次，这次记的是新根。否则文件里的 last_root 一直落后一次
+  # 换根，而它正是 g:simpletree_restore_last_root 下次开树要读的东西。
+  PersistSessionState()
 
   for [p, id] in items(s_pending)
     try
@@ -5330,7 +5574,10 @@ export def Toggle(root: string = '')
       # 不能拿当前文件重新定根,否则会把另一个 tab 的视图也换掉。
       rootArg = s_root
     else
-      if curf_abs ==# ''
+      var last_root = PersistedLastRoot()
+      if last_root !=# ''
+        rootArg = last_root
+      elseif curf_abs ==# ''
         rootArg = getcwd()
       else
         rootArg = fnamemodify(curf_abs, ':h')
@@ -5347,6 +5594,7 @@ export def Toggle(root: string = '')
   endif
   # `:SimpleTree {dir}` 也是一次换根：和 SetRoot() 一样丢掉只对旧根有意义的状态。
   if s_root !=# '' && new_root !=# s_root
+    PersistSessionState()
     DiscardRootScopedState()
   endif
   s_root = new_root
@@ -5366,6 +5614,9 @@ export def Toggle(root: string = '')
     return
   endif
 
+  # 展开集合要在第一次扫描/渲染之前回到 s_state，否则恢复出来的目录会在树
+  # 已经画完之后才一个个弹开。
+  RestoreSessionState(s_root)
   var st = GetNodeState(s_root)
   st.expanded = true
   WatchExpandedDirs()
@@ -5782,6 +6033,19 @@ export def Health()
   echom '  [--] fs watch: ' .. (!get(g:, 'simpletree_use_watcher', 1)
     ? 'disabled (mtime polling)'
     : (HasCap('watch') ? ('active, ' .. len(s_watched) .. ' dir(s)') : 'waiting for backend capability (mtime polling)'))
+
+  var state_detail = ''
+  if !StatePersistEnabled()
+    state_detail = 'disabled'
+  else
+    LoadSessionState()
+    var roots: dict<any> = get(s_session_state, 'roots', {})
+    var restored = s_root ==# '' ? -1 : len(get(get(roots, s_root, {}), 'expanded', []))
+    state_detail = printf('%d root(s) in %s%s', len(roots),
+      fnamemodify(StateFile(), ':~'),
+      restored < 0 ? '' : printf('; %d dir(s) for this root', restored))
+  endif
+  echom '  [--] session state: ' .. state_detail
 
   # 上下文：这个会话此刻到底在做什么。"为什么没反应" 的答案通常在这三行里。
   echom '  [--] session: ' .. (s_open

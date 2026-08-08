@@ -23,6 +23,8 @@ g:simpletree_open_on_create = 0
 g:simpletree_mappings = {'X': 'refresh', 'q': ''}
 
 exe 'set runtimepath^=' .. fnameescape(repo)
+# 会话状态（展开集合）也落盘：绝不碰用户真正的 state.json。
+g:simpletree_state_file = tempname() .. '/state.json'
 runtime plugin/simpletree.vim
 
 # ---------- fixture ----------

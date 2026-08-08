@@ -11,6 +11,7 @@
 :SimpleTreeSearch	simpletree.txt	/*:SimpleTreeSearch*
 :SimpleTreeSort	simpletree.txt	/*:SimpleTreeSort*
 :SimpleTreeSortReverse	simpletree.txt	/*:SimpleTreeSortReverse*
+:SimpleTreeStateClear	simpletree.txt	/*:SimpleTreeStateClear*
 :SimpleTreeStats	simpletree.txt	/*:SimpleTreeStats*
 :SimpleTreeToggleAutoFollow	simpletree.txt	/*:SimpleTreeToggleAutoFollow*
 :SimpleTreeToggleAutoRefresh	simpletree.txt	/*:SimpleTreeToggleAutoRefresh*
@@ -48,7 +49,9 @@ g:simpletree_mark_symbol	simpletree.txt	/*g:simpletree_mark_symbol*
 g:simpletree_modified_symbol	simpletree.txt	/*g:simpletree_modified_symbol*
 g:simpletree_open_on_create	simpletree.txt	/*g:simpletree_open_on_create*
 g:simpletree_page	simpletree.txt	/*g:simpletree_page*
+g:simpletree_persist_state	simpletree.txt	/*g:simpletree_persist_state*
 g:simpletree_persist_width	simpletree.txt	/*g:simpletree_persist_width*
+g:simpletree_restore_last_root	simpletree.txt	/*g:simpletree_restore_last_root*
 g:simpletree_root_locked	simpletree.txt	/*g:simpletree_root_locked*
 g:simpletree_set_default_mapping	simpletree.txt	/*g:simpletree_set_default_mapping*
 g:simpletree_show_bookmarks	simpletree.txt	/*g:simpletree_show_bookmarks*
@@ -59,6 +62,9 @@ g:simpletree_sort	simpletree.txt	/*g:simpletree_sort*
 g:simpletree_sort_reverse	simpletree.txt	/*g:simpletree_sort_reverse*
 g:simpletree_split_below	simpletree.txt	/*g:simpletree_split_below*
 g:simpletree_split_force_right	simpletree.txt	/*g:simpletree_split_force_right*
+g:simpletree_state_file	simpletree.txt	/*g:simpletree_state_file*
+g:simpletree_state_max_dirs	simpletree.txt	/*g:simpletree_state_max_dirs*
+g:simpletree_state_max_roots	simpletree.txt	/*g:simpletree_state_max_roots*
 g:simpletree_use_nerdfont	simpletree.txt	/*g:simpletree_use_nerdfont*
 g:simpletree_use_system_clipboard	simpletree.txt	/*g:simpletree_use_system_clipboard*
 g:simpletree_use_system_copy	simpletree.txt	/*g:simpletree_use_system_copy*
@@ -82,6 +88,7 @@ simpletree-marks	simpletree.txt	/*simpletree-marks*
 simpletree-options	simpletree.txt	/*simpletree-options*
 simpletree-requirements	simpletree.txt	/*simpletree-requirements*
 simpletree-safety	simpletree.txt	/*simpletree-safety*
+simpletree-session-state	simpletree.txt	/*simpletree-session-state*
 simpletree-simplecore	simpletree.txt	/*simpletree-simplecore*
 simpletree-tabpages	simpletree.txt	/*simpletree-tabpages*
 simpletree-troubleshooting	simpletree.txt	/*simpletree-troubleshooting*

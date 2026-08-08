@@ -6,6 +6,8 @@ call delete('/tmp/simpletree-vim-sorting-errors')
 execute 'set runtimepath^=' . fnameescape(s:root)
 let g:simpletree_sort = 'invalid'
 let g:simpletree_sort_reverse = {}
+" 会话状态（展开集合）也落盘：绝不碰用户真正的 state.json。
+let g:simpletree_state_file = tempname() . '/state.json'
 runtime plugin/simpletree.vim
 call assert_equal('name', g:simpletree_sort)
 call assert_equal(0, g:simpletree_sort_reverse)

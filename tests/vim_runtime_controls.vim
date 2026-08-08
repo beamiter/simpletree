@@ -7,6 +7,8 @@ g:simpletree_width_persist_delay = 20
 g:simpletree_set_default_mapping = 0
 
 execute 'set runtimepath^=' .. fnameescape(repo)
+# 会话状态（展开集合）也落盘：绝不碰用户真正的 state.json。
+g:simpletree_state_file = tempname() .. '/state.json'
 runtime plugin/simpletree.vim
 
 new

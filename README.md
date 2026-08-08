@@ -107,6 +107,7 @@ git clone https://github.com/beamiter/simpletree.git \
 | `:SimpleTreeToggleAutoFollow` | 会话内切换活动文件跟随 |
 | `:SimpleTreeSearch <query>` | 后台递归搜索文件名，结果写入 quickfix（需要 v2 后台）；只有最新一次能写结果 |
 | `:SimpleTreeMarkClear` | 清除全部批量操作标记（同树内 `gM`） |
+| `:SimpleTreeStateClear` | 删除已保存的会话状态（每个根的展开集合与上次的根） |
 | `:SimpleTreeSort [mode]` | 设置或循环 `name` / `extension` / `mtime` / `size` 排序 |
 | `:SimpleTreeSortReverse` | 反转当前排序（目录仍保持在文件前） |
 
@@ -198,6 +199,11 @@ SimpleTree 不会覆盖已存在的 `<leader>e` 映射。树缓冲区内全部�
 | `g:simpletree_persist_width` | `1` | 保存手动调整后的宽度 |
 | `g:simpletree_width_state_file` | 见下文 | 宽度状态文件 |
 | `g:simpletree_width_persist_delay` | `250` | 宽度写盘防抖毫秒数；限制在 `0..5000` |
+| `g:simpletree_persist_state` | `1` | 按根记住展开了哪些目录，下次开同一个根时恢复 |
+| `g:simpletree_state_file` | 见下文 | 会话状态文件 |
+| `g:simpletree_state_max_roots` | `20` | 文件里最多保留几个根；限制在 `0..1000` |
+| `g:simpletree_state_max_dirs` | `500` | 每个根最多记几个展开目录；限制在 `0..20000` |
+| `g:simpletree_restore_last_root` | `0` | `:SimpleTree` 不带参数时回到上次的根，而不是当前文件所在目录 |
 | `g:simpletree_show_root` | `1` | 显示可折叠的工作区根节点 |
 | `g:simpletree_root_locked` | `1` | 初始锁定根目录 |
 | `g:simpletree_hide_dotfiles` | `1` | 隐藏点文件 |
@@ -296,6 +302,27 @@ let g:simpletree_set_default_mapping = 0
 ```vim
 let g:simpletree_persist_width = 0
 let g:simpletree_width_state_file = expand('~/.vim/simpletree-width')
+```
+
+## 会话状态持久化
+
+展开集合按根走同一套持久化：关树、换根和退出 Vim 时写入
+`$XDG_STATE_HOME/simpletree/state.json`（回落 `~/.local/state/...`），一个根在
+一次会话里第一次被打开时读回来。重开一个项目直接是你上次留下的样子，而不是
+一个光秃秃的根。
+
+恢复不写盘、不额外扫描：已经被删掉或搬出根的目录直接丢弃，本次会话里你已经
+动过的目录一律不覆盖——折叠一个目录再重开同一个根，它仍然是折叠的。
+
+只恢复展开状态。树根本身仍然跟随当前文件，除非打开
+`g:simpletree_restore_last_root`；排序、过滤、标记和隐藏开关都不跨会话。文件是
+JSON，手工删掉没有任何后果，`:SimpleTreeStateClear` 帮你删，`:SimpleTreeHealth`
+会报里面有几个根。
+
+```vim
+let g:simpletree_persist_state = 0
+let g:simpletree_state_file = expand('~/.vim/simpletree-state.json')
+let g:simpletree_restore_last_root = 1
 ```
 
 ## 后台诊断与协议

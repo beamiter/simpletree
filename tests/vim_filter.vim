@@ -38,6 +38,8 @@ call writefile(['x'], base .. '/other/haystack.txt')
 call writefile(['x'], base .. '/top.txt')
 
 exe 'set runtimepath^=' .. fnameescape(repo)
+# 会话状态（展开集合）也落盘：绝不碰用户真正的 state.json。
+g:simpletree_state_file = tempname() .. '/state.json'
 runtime plugin/simpletree.vim
 
 def TreeWin(): number

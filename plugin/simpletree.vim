@@ -224,6 +224,15 @@ g:simpletree_bookmark_symbol = get(g:, 'simpletree_bookmark_symbol', '★')
 g:simpletree_mark_symbol = get(g:, 'simpletree_mark_symbol', '✓')
 # Where bookmarks persist; defaults under $XDG_STATE_HOME (or ~/.local/state).
 g:simpletree_bookmarks_file = get(g:, 'simpletree_bookmarks_file', '')
+# 展开集合按根持久化，和宽度/书签同一个目录（state.json）。
+g:simpletree_persist_state = NormalizeFlag(get(g:, 'simpletree_persist_state', 1), 1)
+g:simpletree_state_file = get(g:, 'simpletree_state_file', '')
+# 文件不能无限长：最多记多少个根（按最后保存时间 LRU 淘汰）、每个根多少个目录。
+g:simpletree_state_max_roots = ClampNumber(get(g:, 'simpletree_state_max_roots', 20), 20, 0, 1000)
+g:simpletree_state_max_dirs = ClampNumber(get(g:, 'simpletree_state_max_dirs', 500), 500, 0, 20000)
+# `:SimpleTree` 不带参数时回到上次的根。默认关闭：历史行为是用当前文件所在
+# 目录，悄悄改掉它会让"打开一个文件再开树"落在一棵完全不相干的树上。
+g:simpletree_restore_last_root = NormalizeFlag(get(g:, 'simpletree_restore_last_root', 0), 0)
 # 新建文件后直接在编辑区打开
 g:simpletree_open_on_create = get(g:, 'simpletree_open_on_create', 1)
 # 删除时优先移到系统回收站（支持 gio/trash-put/trash）
@@ -380,6 +389,7 @@ command! SimpleTreeLog     call simpletree#ShowLog()
 command! SimpleTreeBookmarks     call simpletree#OnBookmarkJump()
 command! SimpleTreeBookmarkClear call simpletree#BookmarkClear()
 command! SimpleTreeMarkClear     call simpletree#OnMarkClear()
+command! SimpleTreeStateClear    call simpletree#StateClear()
 
 nnoremap <silent> <Plug>(simpletree-toggle) <Cmd>SimpleTree<CR>
 if g:simpletree_set_default_mapping && maparg('<leader>e', 'n') ==# ''
@@ -389,7 +399,10 @@ endif
 # ---------------- 自动命令 ----------------
 augroup SimpleTreeBackend
   autocmd!
-  autocmd VimLeavePre * try | call g:SimpleTreeCaptureWidth(true) | call simpletree#Stop() | catch | endtry
+  # 展开集合和宽度一样，最后一次机会就在这里：:qa 不走 Close()，所以
+  # EndFrontendSession() 的那次保存对"退出 Vim"这条路径是够不着的。
+  autocmd VimLeavePre * try | call g:SimpleTreeCaptureWidth(true)
+        \ | call simpletree#PersistSessionState() | call simpletree#Stop() | catch | endtry
 augroup END
 
 augroup SimpleTreeWidthPersistence
