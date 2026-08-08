@@ -69,9 +69,12 @@ var s_pending_width: number = -1
 var s_width_persist_timer: number = 0
 var s_last_idle_refresh_time: float = 0.0
 
+# 只看当前 tabpage：同一棵树可以同时显示在多个 tab 里，扫描全部 tabpage
+# 会把另一个 tab 里那个窗口的宽度当成用户刚刚设定的偏好持久化下来。
 def CurrentTreeWidth(): number
+  var tabnr = tabpagenr()
   for win in getwininfo()
-    if getbufvar(win.bufnr, '&filetype') ==# 'simpletree'
+    if get(win, 'tabnr', 0) == tabnr && getbufvar(win.bufnr, '&filetype') ==# 'simpletree'
       return get(win, 'width', 0)
     endif
   endfor

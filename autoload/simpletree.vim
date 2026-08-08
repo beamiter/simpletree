@@ -85,6 +85,8 @@ call SetupIcons()
 # 前端状态
 # =============================================================
 var s_bufnr: number = -1
+# 当前 tabpage 的树窗口 id。这只是 TreeWin() 维护的备忘,权威状态在 s_tabs;
+# 读它的地方一律先过 WinValid()/TreeWin(),否则拿到的是别的 tab 的窗口。
 var s_winid: number = 0
 var s_root: string = ''
 var s_hide_dotfiles: bool = !!g:simpletree_hide_dotfiles
@@ -101,7 +103,21 @@ var s_pending: dict<number> = {}          # path -> request id
 var s_line_index: list<dict<any>> = []    # 渲染行对应的节点
 var s_active_path: string = ''            # 当前编辑器文件（用于活动项装饰）
 var s_target_winid: number = 0            # 最近使用的编辑窗口，避免反复询问
-var s_active_match_id: number = -1
+
+# ─────────────────── 每个 tabpage 一个树窗口 ───────────────────
+#
+# 树窗口曾经是一个全局 s_winid,而 win_id2win() 只在当前 tabpage 里查找:
+# 第二个 tab 里 WinValid() 恒为假,于是 Toggle() 又开一棵树,而先关掉的那一棵
+# 触发 BufWipeout 时会把还活着的那一棵一起拆掉(见 tests/vim_tabpages.vim)。
+#
+# 现在窗口按 tabpage 记录,但整棵树只有一个 buffer:同一个 buffer 在多个
+# tab 的窗口里显示,渲染仍然只写一次,缓存/展开状态天然共享,第二个 tab 的
+# 成本接近零。tabpagenr() 会在关闭 tab 后重排,不能做 key,所以用一个存在
+# tabpage 局部变量里的单调 token。
+#
+# token -> {winid, matchid}；matchid 是 matchaddpos() 的返回值，窗口局部。
+var s_tabs: dict<dict<number>> = {}
+var s_tab_seq: number = 0
 
 # 渲染节流
 var s_render_timer: number = 0
@@ -284,7 +300,9 @@ def CandidateWindows(): list<dict<any>>
     if get(w, 'tabnr', 0) != tabnr
       continue
     endif
-    if w.winid == s_winid
+    # 按 buffer 排除,而不是按窗口 id:同一个树 buffer 可能在这个 tab 里
+    # 有窗口而 s_winid 备忘指向别处。
+    if w.bufnr == s_bufnr
       continue
     endif
     # 只选择普通缓冲区窗口（buftype 为空）
@@ -1117,9 +1135,68 @@ def BufValid(): bool
   return ok
 enddef
 
+def TabToken(tabnr: number = 0): string
+  var t = tabnr > 0 ? tabnr : tabpagenr()
+  var token = gettabvar(t, 'simpletree_tab_token', '')
+  if type(token) != v:t_string || token ==# ''
+    s_tab_seq += 1
+    token = 't' .. s_tab_seq
+    settabvar(t, 'simpletree_tab_token', token)
+  endif
+  return token
+enddef
+
+def TabRecord(): dict<number>
+  var token = TabToken()
+  if !has_key(s_tabs, token)
+    s_tabs[token] = {winid: 0, matchid: -1}
+  endif
+  return s_tabs[token]
+enddef
+
+# 丢弃已经消失的树窗口。win_id2tabwin() 是唯一跨 tabpage 有效的窗口查询,
+# win_id2win() 在这里会把别的 tab 的活窗口误判成死的。
+def PruneTabs()
+  for [token, rec] in items(s_tabs)
+    if rec.winid == 0 || win_id2tabwin(rec.winid)[0] == 0
+        || winbufnr(rec.winid) != s_bufnr
+      remove(s_tabs, token)
+    endif
+  endfor
+enddef
+
+# 仍然活着的树窗口，按 tab 记录的顺序。
+def TreeWindows(): list<number>
+  PruneTabs()
+  return values(s_tabs)->mapnew((_, rec) => rec.winid)
+enddef
+
+# 当前 tabpage 的树窗口，没有则 0。副作用:刷新 s_winid 备忘,使得所有
+# "先 WinValid() 再用 s_winid" 的调用点自动指向当前 tab 的窗口。
+def TreeWin(): number
+  var rec = TabRecord()
+  if rec.winid == 0 || win_id2win(rec.winid) <= 0 || winbufnr(rec.winid) != s_bufnr
+    # 记录缺失或过期(例如窗口被 :only 关掉后又重开):按 buffer 重新认领。
+    rec.winid = 0
+    if s_bufnr > 0
+      var tabnr = tabpagenr()
+      for info in getwininfo()
+        if info.bufnr == s_bufnr && get(info, 'tabnr', 0) == tabnr
+          rec.winid = info.winid
+          break
+        endif
+      endfor
+    endif
+    if rec.winid == 0
+      rec.matchid = -1
+    endif
+  endif
+  s_winid = rec.winid
+  return rec.winid
+enddef
+
 def WinValid(): bool
-  var ok = (s_winid != 0 && win_id2win(s_winid) > 0)
-  return ok
+  return TreeWin() != 0
 enddef
 
 def OtherWindowId(): number
@@ -2506,10 +2583,19 @@ def EnsureWindowAndBuffer()
   noautocmd execute 'topleft vertical vsplit'
   s_winid = win_getid()
 
-  noautocmd call win_execute(s_winid, 'silent enew')
-  s_bufnr = winbufnr(s_winid)
-
-  call win_execute(s_winid, 'file SimpleTree')
+  # 已经有树 buffer 时（在别的 tab 里开着）复用它:一个 buffer 多个窗口,
+  # 渲染只写一次两个 tab 就都更新了。以前这里无条件 enew + `file SimpleTree`,
+  # 第二个 tab 会撞上 E95 "Buffer with this name already exists" 并留下一个
+  # 没有 filetype 的空窗口。
+  if BufValid()
+    noautocmd execute 'silent buffer ' .. s_bufnr
+  else
+    noautocmd call win_execute(s_winid, 'silent enew')
+    s_bufnr = winbufnr(s_winid)
+    call win_execute(s_winid, 'file SimpleTree')
+  endif
+  var rec = TabRecord()
+  rec.winid = s_winid
 
   call win_execute(s_winid, 'vertical resize ' .. g:simpletree_width)
 
@@ -2796,28 +2882,30 @@ def RootLabel(): string
   return label
 enddef
 
+# matchaddpos() 是窗口局部的,所以每个显示这棵树的窗口都要各自维护一个
+# match id;只更新当前 tab 会让别的 tab 停留在旧的高亮行上。
 def UpdateActiveHighlight()
-  if !WinValid()
+  PruneTabs()
+  if empty(s_tabs)
     return
   endif
-  if s_active_match_id > 0
-    try
-      call matchdelete(s_active_match_id, s_winid)
-    catch
-    endtry
-    s_active_match_id = -1
-  endif
-  if s_active_path ==# ''
-    return
-  endif
-  var lnum = PathLine(NormPath(s_active_path))
-  if lnum > 0
-    try
-      s_active_match_id = matchaddpos('SimpleTreeActiveFile', [[lnum]], 5, -1, {window: s_winid})
-    catch
-      s_active_match_id = -1
-    endtry
-  endif
+  var lnum = s_active_path ==# '' ? 0 : PathLine(NormPath(s_active_path))
+  for rec in values(s_tabs)
+    if rec.matchid > 0
+      try
+        call matchdelete(rec.matchid, rec.winid)
+      catch
+      endtry
+      rec.matchid = -1
+    endif
+    if lnum > 0
+      try
+        rec.matchid = matchaddpos('SimpleTreeActiveFile', [[lnum]], 5, -1, {window: rec.winid})
+      catch
+        rec.matchid = -1
+      endtry
+    endif
+  endfor
 enddef
 
 # path -> 行号索引。渲染期不再预先构建，第一次查询时按当前 s_line_index 建好
@@ -3041,10 +3129,12 @@ def Render()
   endtry
 
   var maxline = max([1, len(out)])
-  try
-    call win_execute(s_winid, 'if line(".") > ' .. maxline .. ' | normal! G | endif')
-  catch
-  endtry
+  for winid in TreeWindows()
+    try
+      call win_execute(winid, 'if line(".") > ' .. maxline .. ' | normal! G | endif')
+    catch
+    endtry
+  endfor
 
   s_line_index = idx
   # path -> 行号的字典按需构建：一次渲染通常只查一次(恢复光标)，为此建一个
@@ -3571,11 +3661,13 @@ export def OnClose()
   Close()
 enddef
 
+# 树 buffer 只有一个,被 wipe 说明最后一个窗口也没了——整个会话结束,
+# 所有 tab 的记录一起作废。
 export def OnBufWipe()
   EndFrontendSession()
+  s_tabs = {}
   s_winid = 0
   s_bufnr = -1
-  s_active_match_id = -1
 enddef
 
 # ===== 文件操作：复制/剪切/粘贴/新建/重命名/删除 =====
@@ -4394,7 +4486,9 @@ export def Toggle(root: string = '')
 
   var rootArg = root
   if rootArg ==# ''
-    if s_root_locked && s_root !=# '' && IsDir(s_root)
+    if (s_open || s_root_locked) && s_root !=# '' && IsDir(s_root)
+      # 会话已经在别的 tab 里开着:这里加的是同一棵树的第二个窗口,
+      # 不能拿当前文件重新定根,否则会把另一个 tab 的视图也换掉。
       rootArg = s_root
     else
       if curf_abs ==# ''
@@ -4413,8 +4507,12 @@ export def Toggle(root: string = '')
     return
   endif
 
-  s_session_generation += 1
-  s_open = true
+  # 会话代号只在真正新开一个会话时前进。给已有会话加第二个 tab 窗口时
+  # 递增它会让所有在途扫描的回调静默作废，而 s_pending 还留着它们的 id。
+  if !s_open
+    s_session_generation += 1
+    s_open = true
+  endif
   SeedModifiedPaths()
   EnsureWindowAndBuffer()
   if !BEnsureBackend()
@@ -4598,17 +4696,23 @@ export def AutoRefreshOnIdle()
   DoAutoRefresh()
 enddef
 
+# 只关掉当前 tabpage 的那个窗口;别的 tab 还开着时会话继续。从一个没有树的
+# tab 调用 :SimpleTreeClose 仍然是"全部关掉",保持命令原来的语义。
+# 最后一个窗口关闭时 bufhidden=wipe 会触发 OnBufWipe(),会话在那里结束。
 export def Close()
-  EndFrontendSession()
-  if WinValid()
+  var here = TreeWin()
+  for winid in (here != 0 ? [here] : TreeWindows())
     try
-      call win_execute(s_winid, 'close')
+      call win_execute(winid, 'close')
     catch
     endtry
+  endfor
+  PruneTabs()
+  if empty(s_tabs)
+    EndFrontendSession()
+    s_bufnr = -1
   endif
   s_winid = 0
-  s_bufnr = -1
-  s_active_match_id = -1
 enddef
 
 export def Stop()

@@ -4,6 +4,27 @@
 
 ## Unreleased - 2026-08-05
 
+### 修复：多 tabpage 下的树
+
+- 树窗口改为按 tabpage 记录。此前 `s_winid` 是一个全局变量，而 `win_id2win()`
+  只在当前 tabpage 里查找：第二个 tab 里 `WinValid()` 恒为假，`:SimpleTree`
+  会再开一棵树（而且撞上 `E95: Buffer with this name already exists`，留下一个
+  没有 filetype 的空窗口）；随后关掉第一个 tab，那个 buffer 的 `BufWipeout`
+  会结束整个前端会话，把还活着的那棵树一起拆掉——树不再响应按键，再按一次
+  又开第三棵。
+- 现在整棵树只有一个 buffer，同一个 buffer 在各 tab 的窗口里显示：渲染只写
+  一次，根目录、展开状态、扫描缓存与 git status 天然共享，第二个 tab 不产生
+  额外扫描。`:SimpleTree` 只作用于当前 tabpage；关掉最后一个树窗口才结束会话。
+- 会话已经开着时，无参数的 `:SimpleTree` 不再用当前文件重新定根——否则在新
+  tab 里打开会把另一个 tab 的视图一起换掉。给已有会话添加窗口也不再递增会话
+  代号，避免静默作废在途扫描的回调。
+- 活动文件高亮（`matchaddpos()` 是窗口局部的）改为每个树窗口各自维护，别的
+  tab 不会停在旧的高亮行上。
+- 宽度持久化只测量当前 tabpage 的树窗口，不再把另一个 tab 里那个窗口的宽度
+  当成用户刚设定的偏好存下来。
+- 新增 `tests/vim_tabpages.vim`：两个 tab 各自开关、在第一个 tab 里 toggle 必须
+  关闭而不是再开一棵、关掉一个 tab 后另一个 tab 的树仍然响应 toggle。
+
 ### 任意路径定位
 
 - `:SimpleTreeReveal [path]` 现在可显式定位根内文件或目录；相对路径固定以 tree root

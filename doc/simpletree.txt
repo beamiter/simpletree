@@ -12,7 +12,8 @@ CONTENTS                                                *simpletree-contents*
 7. Width persistence...................................|simpletree-width-state|
 8. Backend diagnostics.................................|simpletree-backend|
 9. File-operation semantics............................|simpletree-safety|
-10. Troubleshooting....................................|simpletree-troubleshooting|
+10. Tab pages..........................................|simpletree-tabpages|
+11. Troubleshooting....................................|simpletree-troubleshooting|
 
 ==============================================================================
 1. INTRODUCTION                                             *simpletree*
@@ -73,7 +74,8 @@ under lib/ first, then target/release/ and target/debug/ for development use.
 
                                                      *:SimpleTree*
 :SimpleTree [directory]
-        Open or close the tree.  An optional directory becomes the root.
+        Open or close the tree in the current tab page.  An optional directory
+        becomes the root.  See |simpletree-tabpages|.
 
                                                      *:SimpleTreeRefresh*
 :SimpleTreeRefresh
@@ -94,7 +96,8 @@ under lib/ first, then target/release/ and target/debug/ for development use.
 
                                                      *:SimpleTreeClose*
 :SimpleTreeClose
-        Flush the current width state and close the tree window.
+        Flush the current width state and close the current tab page's tree
+        window, or every tree window when this tab page has none.
 
                                                      *:SimpleTreeDebug*
 :SimpleTreeDebug
@@ -517,7 +520,26 @@ transaction or crash-consistency guarantee.  SimpleTree does not currently
 provide undo for file operations.
 
 ==============================================================================
-10. TROUBLESHOOTING                      *simpletree-troubleshooting*
+10. TAB PAGES                                       *simpletree-tabpages*
+
+One tree may be shown in several tab pages at once.  |:SimpleTree| always acts
+on the current tab page: it opens a tree window there when the tab has none,
+and closes only that window when it has one.  Every tab page shows the same
+tree buffer, so the root, the expanded directories, the scan cache, marks and
+Git status are shared and a second tab costs no extra scanning.
+
+Because the tree is shared, |:SimpleTree| without an argument does not re-root
+an already open tree when you open it in another tab; pass a directory or use
+|:SimpleTreeReveal| to change what is shown.  Closing the last tree window ends
+the session; closing one of several leaves the others working.
+
+|:SimpleTreeClose| closes the current tab page's tree window, or every tree
+window when the current tab page has none.  Width persistence
+(|simpletree-width-state|) measures the tree window in the current tab page
+only.
+
+==============================================================================
+11. TROUBLESHOOTING                      *simpletree-troubleshooting*
 
 BACKEND NOT FOUND ~
 

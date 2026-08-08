@@ -16,6 +16,7 @@ SimpleTree 使用 Vim9 script，当前不支持 Neovim。
 - 树缓冲区按键全部可通过 `g:simpletree_mappings` 覆盖或禁用。
 - `User SimpleTree*` 自动命令事件（打开/关闭/换根/展开/文件操作等），便于第三方集成。
 - 后台限制并发扫描数量、合并协议输出 flush，快速展开大量目录时更稳定；watch 下的目录列表带失效信号缓存。
+- 每个 tabpage 一个树窗口，共用同一棵树：根目录、展开状态与缓存共享，第二个 tab 几乎零开销，关掉其中一个不影响其他 tab。
 - 可折叠的工作区根节点；键盘、方向键和鼠标双击均可操作。
 - 自动定位当前编辑文件，并在树中高亮活动项。
 - 异步刷新后按路径恢复选中项，减少插入或删除条目造成的光标漂移。
@@ -90,10 +91,10 @@ git clone https://github.com/beamiter/simpletree.git \
 
 | 命令 | 说明 |
 |---|---|
-| `:SimpleTree [目录]` | 打开或关闭文件树；可选参数指定根目录 |
+| `:SimpleTree [目录]` | 在当前 tabpage 打开或关闭文件树；可选参数指定根目录 |
 | `:SimpleTreeRefresh` | 清空缓存并重新扫描当前树 |
 | `:SimpleTreeReveal [path]` | 定位活动文件，或显式定位工作区根内的文件/目录 |
-| `:SimpleTreeClose` | 保存当前宽度并关闭树窗口 |
+| `:SimpleTreeClose` | 保存当前宽度并关闭当前 tabpage 的树窗口（本 tab 没有则全部关闭） |
 | `:SimpleTreeDebug` | 输出窗口、根目录、后台和缓存状态 |
 | `:SimpleTreeStats[!]` | 查看渲染耗时、buffer diff 与子树缓存命中；`!` 仅重置计数 |
 | `:SimpleTreeHealth` | 检查 Vim 功能、配置范围、后台路径及系统 provider |

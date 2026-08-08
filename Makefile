@@ -20,6 +20,7 @@ vim-test:
 	vim -Nu NONE -n -i NONE -es -S tests/vim_bookmarks.vim
 	vim -Nu NONE -n -i NONE -es -S tests/vim_sorting.vim
 	vim -Nu NONE -n -i NONE -es -S tests/vim_reveal.vim
+	vim -Nu NONE -n -i NONE -es -S tests/vim_tabpages.vim
 
 # ---------------------------------------------------------------------------
 # simplecore: the vendored daemon supervisor shared by the simple* suite.
