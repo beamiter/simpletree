@@ -441,7 +441,15 @@ g:simpletree_use_trash
                                              *g:simpletree_use_system_copy*
 g:simpletree_use_system_copy
         Boolean, default 0.  Try an operating-system copy command first for
-        ordinary files.  See |simpletree-safety| for symbolic links.
+        ordinary files.  Only consulted by the in-Vim fallback; see
+        |g:simpletree_async_fs_ops| and |simpletree-safety|.
+
+                                             *g:simpletree_async_fs_ops*
+g:simpletree_async_fs_ops
+        Boolean, default 1.  Perform copy and move in the backend rather than
+        in Vim, when the backend advertises the "fs-ops" capability.  See
+        |simpletree-fsops|.  Set to 0 to force the in-Vim implementation,
+        which blocks the editor for the whole duration of a copy.
 
                                      *g:simpletree_use_system_clipboard*
 g:simpletree_use_system_clipboard
@@ -520,10 +528,10 @@ Protocol mode uses one JSON object per line.  A client may send: >
 The pong event includes protocol_version (currently 2), daemon_version, and
 capabilities.  Protocol v2 adds: a `meta` flag on list requests (size, mtime,
 is_symlink per entry), watch/unwatch requests with pushed fs_event records,
-git_status requests with per-file codes and directory aggregation, and
-streaming search requests.  Unreadable children degrade to warnings on the
-final chunk instead of failing the listing, and non-UTF-8 names are listed
-lossily with a non_utf8 flag.  Existing list and cancel requests remain
+git_status requests with per-file codes and directory aggregation,
+streaming search requests, and fs_op requests (|simpletree-fsops|).
+Unreadable children degrade to warnings on the final chunk instead of failing
+the listing, and non-UTF-8 names are listed lossily with a non_utf8 flag.  Existing list and cancel requests remain
 compatible; old clients ignore unknown event types.  Use
 |:SimpleTreeVersion| for the executable discovered by Vim.
 
@@ -539,8 +547,9 @@ queued records are coalesced before stdout is flushed.
 - A directory cannot be pasted into itself or its descendants.
 - Write targets, rename, and delete are constrained by the resolved workspace
   root, including symbolic-link boundaries.
-- On Unix, copying a symbolic link forces cp -a.  Without a safe provider the
-  operation is refused instead of dereferencing the link.
+- A copied symbolic link is recreated as a link, never dereferenced.  The
+  backend does this itself; the in-Vim fallback needs cp -a on Unix and refuses
+  the copy when no safe provider exists.
 - Delete always asks for confirmation and prefers a supported trash command.
 - Copy, overwrite, atomic move, and rename use sibling staging or backup paths
   and attempt restoration after failure.
@@ -551,6 +560,31 @@ queued records are coalesced before stdout is flushed.
 These protections reduce data-loss risk but are not a cross-platform
 transaction or crash-consistency guarantee.  SimpleTree does not currently
 provide undo for file operations.
+
+BACKEND FILE OPERATIONS ~
+                                                        *simpletree-fsops*
+Copying used to move every byte through Vimscript on the main thread, so
+pasting a large directory froze the editor — no redraw, no CTRL-C, no progress
+— until it finished.  When the backend advertises the "fs-ops" capability and
+|g:simpletree_async_fs_ops| is on, c/x + p instead send one fs_op request per
+item and return immediately; the tree updates as each reply arrives.
+
+Only the byte moving is delegated.  Workspace containment, the unsaved-buffer
+refusal, the conflict prompts and the post-prompt re-validation described in
+|simpletree-safety| all still run in Vim, and every prompt for a batch is
+answered before the first transfer starts, so an operation in flight cannot be
+interrupted by a question.  The backend applies the same sibling
+staging/backup discipline, and never follows a symbolic link: a copied link is
+recreated as a link, which is why cp -a is no longer needed for them.
+
+Items are transferred one at a time, in the order they were marked.  A backend
+that exits mid-batch fails the outstanding item with a message rather than
+leaving the paste silently unfinished.  Delete and rename remain in Vim: both
+are a single system call, not a walk.
+
+Without the capability (an older backend, or the option off) the previous
+in-Vim implementation runs unchanged, including
+|g:simpletree_use_system_copy|.
 
 MARKED NODES ~
                                                         *simpletree-marks*

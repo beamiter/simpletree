@@ -771,11 +771,9 @@ def CopyPathSafely(src: string, dst: string): dict<any>
   endif
   result.installed = true
 
-  if backup !=# '' && !DeletePathRecursive(backup)
-    echohl WarningMsg
-    echom '[SimpleTree] operation succeeded; old target backup remains at: ' .. backup
-    echohl None
-  else
+  # 报告留在 result.backup 里，由调用方统一提示：守护进程执行的搬运走的是同一个
+  # 结果形状，两边不能各喊一次。
+  if backup !=# '' && DeletePathRecursive(backup)
     result.backup = ''
   endif
   return result
@@ -798,9 +796,6 @@ def MovePathSafely(src: string, dst: string): dict<any>
     result.source_removed = true
     if backup !=# '' && !DeletePathRecursive(backup)
       result.backup = backup
-      echohl WarningMsg
-      echom '[SimpleTree] move succeeded; old target backup remains at: ' .. backup
-      echohl None
     endif
     return result
   endif
@@ -813,13 +808,10 @@ def MovePathSafely(src: string, dst: string): dict<any>
     return result
   endif
 
+  # 跨文件系统：只安装一份完整副本并保留源。复制期间源可能变化，复制完再删除
+  # 就是在赌那段窗口里什么都没发生；调用方会报告源仍然存在。
   result = CopyPathSafely(src, dst)
   result.source_removed = false
-  if result.installed
-    echohl WarningMsg
-    echom '[SimpleTree] atomic move unavailable; a complete copy was installed and the source was retained: ' .. src
-    echohl None
-  endif
   return result
 enddef
 
@@ -883,13 +875,15 @@ enddef
 
 # 冲突处理：询问覆盖或改名或放弃
 # 返回最终目标路径，或空字符串表示取消
-def ResolveConflict(destDir: string, base: string): string
+# reserved 是本批操作中已经分配、但还没有落盘的目标。批量粘贴异步执行时磁盘上
+# 还看不到它们，两个同名来源会因此互相覆盖而不询问；把它们当作"已存在"即可。
+def ResolveConflict(destDir: string, base: string, reserved: dict<bool> = {}): string
   var dst = PathJoin(destDir, base)
   if !IsSubPath(destDir, dst) || PathEq(destDir, dst)
     echohl ErrorMsg | echom '[SimpleTree] target must stay inside destination directory' | echohl None
     return ''
   endif
-  if !PathExists(dst)
+  if !PathExists(dst) && !has_key(reserved, dst)
     return dst
   endif
   var prompt = 'Target exists: ' .. dst .. '. [o]verwrite / [r]ename / [c]ancel: '
@@ -902,14 +896,14 @@ def ResolveConflict(destDir: string, base: string): string
       echohl ErrorMsg | echom '[SimpleTree] enter a single safe file name' | echohl None
       return ''
     endif
-    return ResolveConflict(destDir, newname)
+    return ResolveConflict(destDir, newname, reserved)
   else
     return ''
   endif
 enddef
 
 # 新建时：循环直到唯一名字或取消
-def AskUniqueName(destDir: string, base: string): string
+def AskUniqueName(destDir: string, base: string, reserved: dict<bool> = {}): string
   var name = base
   while name !=# ''
     var dst = PathJoin(destDir, name)
@@ -917,7 +911,7 @@ def AskUniqueName(destDir: string, base: string): string
       echohl ErrorMsg | echom '[SimpleTree] target must stay inside destination directory' | echohl None
       return ''
     endif
-    if !PathExists(dst)
+    if !PathExists(dst) && !has_key(reserved, dst)
       return dst
     endif
     name = input('Exists: ' .. dst .. ' . Input another name (empty to cancel): ', name .. ' copy')
@@ -1343,6 +1337,8 @@ export def DispatchLine(line: string)
         call remove(s_bcbs, id)
       endif
     endif
+  elseif ev.type ==# 'fs_op_done'
+    FinishFsOp(get(ev, 'id', 0), ev)
   elseif ev.type ==# 'error'
     var id = get(ev, 'id', 0)
     var msg2 = get(ev, 'message', '')
@@ -1354,6 +1350,8 @@ export def DispatchLine(line: string)
       endtry
       call remove(s_bcbs, id)
     endif
+    # 被拒绝的搬运也必须结束作业链，否则粘贴会挂在那一项上。
+    FinishFsOp(id, {message: msg2})
   elseif ev.type ==# 'ok'
     var id = get(ev, 'id', 0)
     if id != 0 && has_key(s_bcbs, id)
@@ -1377,6 +1375,9 @@ export def DispatchLine(line: string)
 enddef
 
 def BackendCrashed(restarting: bool = false)
+  FailPendingFsOps(restarting
+    ? 'backend restarting; the operation did not finish'
+    : 'backend exited; the operation did not finish')
   var failed_paths = keys(s_loading)
   try
     for [p, id] in items(s_pending)
@@ -1422,6 +1423,7 @@ enddef
 
 def BStop(): void
   SetupCore()
+  FailPendingFsOps('backend stopped; the operation did not finish')
   simpletree#core#Stop()
   s_bcbs = {}
   ResetBackendSessionState()
@@ -1448,6 +1450,67 @@ def BList(path: string, show_hidden: bool, git_ignore: bool, max: number, with_m
       OnError('failed to send request to backend')
     catch
     endtry
+    return 0
+  endif
+  return id
+enddef
+
+# =============================================================
+# fs-ops：把字节搬运交给守护进程
+# =============================================================
+# 复制的每一个字节过去都由 Vimscript 在主线程上搬：readblob 分块读、逐块
+# writefile、每个目录一次 readdir。粘贴一个 target/ 或 node_modules/ 会把编辑器
+# 冻住——不重绘、不响应 CTRL-C、没有进度——直到复制结束。守护进程恰好在这段
+# 时间里闲着，所以工作属于那边。
+#
+# 留在这边的是策略：工作区包含性、未保存缓冲区拒绝、冲突提示，以及提示之后的
+# 重新验证。它们依赖守护进程看不到的编辑器状态，一条也不能下放。
+var s_fsop_cbs: dict<func> = {}   # 请求 id -> Done(outcome)
+
+def FsOpsEnabled(): bool
+  return HasCap('fs-ops') && !!get(g:, 'simpletree_async_fs_ops', 1) && BIsRunning()
+enddef
+
+# 协议里的布尔是 v:true/v:false，作业代码只想看 Vim 的 bool；同时补齐守护进程
+# 在错误路径上不会发的字段，让调用方永远拿到同一个形状。
+def NormalizeFsOutcome(ev: dict<any>): dict<any>
+  return {
+    installed: !!get(ev, 'installed', v:false),
+    source_removed: !!get(ev, 'source_removed', v:false),
+    backup: get(ev, 'backup', ''),
+    message: get(ev, 'message', ''),
+  }
+enddef
+
+def FinishFsOp(id: number, ev: dict<any>)
+  if id == 0 || !has_key(s_fsop_cbs, id)
+    return
+  endif
+  var Done = s_fsop_cbs[id]
+  call remove(s_fsop_cbs, id)
+  try
+    Done(NormalizeFsOutcome(ev))
+  catch
+    Log('fs-op callback failed: ' .. v:exception)
+  endtry
+enddef
+
+# 后端在一次搬运中途消失时，把还在等待的作业当作失败结束。否则粘贴链会静默
+# 断在半路：剪贴板、标记和渲染都停在中间状态，而用户没有收到任何提示。
+def FailPendingFsOps(reason: string)
+  for id in keys(s_fsop_cbs)
+    FinishFsOp(str2nr(id), {message: reason})
+  endfor
+enddef
+
+def BFsOp(op: string, src: string, dst: string, Done: func): number
+  if !FsOpsEnabled()
+    return 0
+  endif
+  var id = BNextId()
+  s_fsop_cbs[id] = Done
+  if !BSend({type: 'fs_op', id: id, op: op, src: src, dst: dst})
+    call remove(s_fsop_cbs, id)
     return 0
   endif
   return id
@@ -3974,6 +4037,179 @@ export def OnCut()
     : printf('[SimpleTree] cut %d items: %s', len(targets), SummarizePaths(targets))
 enddef
 
+# 这一项被跳过。cut 模式下它必须留在剪贴板里：用户还没有得到这次移动，
+# 下一次 p 应该还能重试。
+def PasteSkip(ctx: dict<any>, src: string): dict<any>
+  if ctx.mode ==# 'cut'
+    ctx.remaining->add(src)
+  endif
+  return {}
+enddef
+
+# 计划一项粘贴：所有策略校验和冲突询问都在这里完成，返回一个已批准的搬运作业，
+# 空字典表示跳过。
+#
+# 计划整批发生在任何字节移动之前，这是异步执行带来的约束：搬运一旦交给守护
+# 进程，用户就不应该再被一个提示打断，作业也不能建立在一个已经过时的回答上。
+def PlanPasteJob(ctx: dict<any>, src: string, reserved: dict<bool>): dict<any>
+  var mode = ctx.mode
+  var destDir = ctx.destDir
+  if !PathExists(src)
+    echo '[SimpleTree] skip missing: ' .. src
+    return PasteSkip(ctx, src)
+  endif
+  var base = fnamemodify(src, ':t')
+  var source_type = getftype(src)
+  var source_is_link = source_type ==# 'link'
+  # A directory symlink is still a link object for copy/move semantics.
+  var source_subtree = source_type ==# 'dir'
+  if !WorkspaceContainsOperationPath(src, true)
+    echohl ErrorMsg | echom '[SimpleTree] source resolves outside the workspace' | echohl None
+    return PasteSkip(ctx, src)
+  endif
+  if source_type ==# 'dir'
+    && IsSubPath(ResolvedNormPath(src), ResolvedNormPath(destDir))
+    echohl WarningMsg | echom '[SimpleTree] cannot paste a directory into itself' | echohl None
+    return PasteSkip(ctx, src)
+  endif
+  if mode ==# 'cut'
+      && RefuseModifiedBuffers(src, source_subtree, 'move', !source_is_link)
+    return PasteSkip(ctx, src)
+  endif
+
+  var proposed = PathJoin(destDir, base)
+  var dst = ''
+  var same_target = PathEq(src, proposed)
+    || PathEq(ResolvedNormPath(src), ResolvedNormPath(proposed))
+  if same_target
+    if mode ==# 'cut'
+      echo '[SimpleTree] source is already in the target directory'
+      return PasteSkip(ctx, src)
+    endif
+    dst = AskUniqueName(destDir, base .. ' copy', reserved)
+  else
+    dst = ResolveConflict(destDir, base, reserved)
+  endif
+  if dst ==# ''
+    echo '[SimpleTree] skip: ' .. base
+    return PasteSkip(ctx, src)
+  endif
+  if !IsSubPath(destDir, dst) || PathEq(destDir, dst)
+    echohl ErrorMsg | echom '[SimpleTree] target must stay inside destination directory' | echohl None
+    return PasteSkip(ctx, src)
+  endif
+  var target_is_link = getftype(dst) ==# 'link'
+  var target_was_dir = getftype(dst) ==# 'dir'
+  var destination_buffer_subtree = source_subtree || target_was_dir
+  if RefuseModifiedBuffers(dst, destination_buffer_subtree, 'replace', !target_is_link)
+    return PasteSkip(ctx, src)
+  endif
+
+  return {
+    src: src,
+    dst: dst,
+    base: base,
+    source_is_link: source_is_link,
+    source_subtree: source_subtree,
+    target_is_link: target_is_link,
+    destination_buffer_subtree: destination_buffer_subtree,
+    rename_plan: mode ==# 'cut' ? BufferRenamePlan(src, dst, source_subtree) : [],
+  }
+enddef
+
+# 一次搬运结束后的编辑器侧收尾。transfer 的形状对同步实现和守护进程是同一个，
+# 所以这里不需要知道是谁做的活。
+def PasteApply(ctx: dict<any>, job: dict<any>, transfer: dict<any>)
+  var mode = ctx.mode
+  if !get(transfer, 'installed', false)
+    var why = get(transfer, 'message', '')
+    echohl ErrorMsg
+    echom '[SimpleTree] failed to ' .. (mode ==# 'copy' ? 'copy' : 'move') .. ': ' .. job.src
+      .. (why ==# '' ? '' : ' (' .. why .. ')')
+    echohl None
+    if mode ==# 'cut'
+      ctx.remaining->add(job.src)
+    endif
+    return
+  endif
+  if get(transfer, 'backup', '') !=# ''
+    echohl WarningMsg
+    echom '[SimpleTree] operation succeeded; old target backup remains at: ' .. transfer.backup
+    echohl None
+  endif
+
+  # 关闭被替换目标的未修改缓冲区，再把成功移动的源缓冲区改到新路径。
+  WipeBuffersForPath(job.dst, job.destination_buffer_subtree,
+    !job.target_is_link && !job.source_is_link)
+  if mode ==# 'cut' && get(transfer, 'source_removed', false)
+    ApplyBufferRenamePlan(job.rename_plan)
+  endif
+  ctx.focused = job.dst
+  InvalidateAndRescan(ctx.destDir)
+  if mode ==# 'cut'
+    var sp = fnamemodify(job.src, ':h')
+    if sp !=# ctx.destDir
+      InvalidateAndRescan(sp)
+    endif
+    if get(transfer, 'source_removed', false)
+      echo '[SimpleTree] moved: ' .. job.base .. ' -> ' .. ctx.destDir
+    else
+      ctx.remaining->add(job.src)
+      echohl WarningMsg
+      echom '[SimpleTree] copied safely, but source was not fully removed: ' .. job.src
+      echohl None
+    endif
+  else
+    echo '[SimpleTree] copied: ' .. job.base .. ' -> ' .. ctx.destDir
+  endif
+enddef
+
+# 作业一项一项地跑，而不是一次全部发给守护进程：并发搬运会让失败报告的顺序和
+# 同名目标的判定都变得不确定，而排队的代价只是延迟——一次复制本来就吃满守护
+# 进程的一个阻塞线程。
+#
+# 循环 + 回调而不是递归：同步回退路径下每项递归一层，一个上百项的标记集合会
+# 撞上 'maxfuncdepth'。异步分支在派发后直接返回，栈由 DispatchLine 重新起。
+def PasteStep(ctx: dict<any>)
+  while ctx.index < len(ctx.jobs)
+    var job = ctx.jobs[ctx.index]
+    if BFsOp(ctx.mode ==# 'cut' ? 'move' : 'copy', job.src, job.dst,
+        function(PasteStepDone, [ctx])) > 0
+      return
+    endif
+    # 没有 fs-ops 能力，或请求发不出去：退回 Vim 内的同步实现，绝不丢掉这一项。
+    PasteApply(ctx, job, ctx.mode ==# 'cut'
+      ? MovePathSafely(job.src, job.dst)
+      : CopyPathSafely(job.src, job.dst))
+    ctx.index += 1
+  endwhile
+  PasteFinish(ctx)
+enddef
+
+def PasteStepDone(ctx: dict<any>, transfer: dict<any>)
+  PasteApply(ctx, ctx.jobs[ctx.index], transfer)
+  ctx.index += 1
+  PasteStep(ctx)
+enddef
+
+def PasteFinish(ctx: dict<any>)
+  # 粘贴成功后标记就过期了：源路径在 cut 之后已经不存在，留着只会让下一个
+  # 操作作用在一批幽灵路径上。
+  if ctx.focused !=# ''
+    ClearMarks()
+  endif
+  Render()
+  if ctx.focused !=# ''
+    RevealPath(ctx.focused)
+  endif
+
+  if ctx.mode ==# 'cut'
+    s_clipboard = len(ctx.remaining) == 0
+      ? {mode: '', items: []}
+      : {mode: 'cut', items: ctx.remaining}
+  endif
+enddef
+
 export def OnPaste()
   if type(s_clipboard) != v:t_dict || get(s_clipboard, 'mode', '') ==# '' || len(get(s_clipboard, 'items', [])) == 0
     echo '[SimpleTree] clipboard empty'
@@ -3994,138 +4230,23 @@ export def OnPaste()
     return
   endif
 
-  var mode = s_clipboard.mode
-  var srcs: list<string> = copy(s_clipboard.items)
-  var focused = ''
-  var remaining: list<string> = []
-
-  for src in srcs
-    if !PathExists(src)
-      echo '[SimpleTree] skip missing: ' .. src
-      if mode ==# 'cut'
-        remaining->add(src)
-      endif
-      continue
-    endif
-    var base = fnamemodify(src, ':t')
-    var source_type = getftype(src)
-    var source_is_link = source_type ==# 'link'
-    # A directory symlink is still a link object for copy/move semantics.
-    var source_subtree = source_type ==# 'dir'
-    if !WorkspaceContainsOperationPath(src, true)
-      echohl ErrorMsg | echom '[SimpleTree] source resolves outside the workspace' | echohl None
-      if mode ==# 'cut'
-        remaining->add(src)
-      endif
-      continue
-    endif
-    if source_type ==# 'dir'
-      && IsSubPath(ResolvedNormPath(src), ResolvedNormPath(destDir))
-      echohl WarningMsg | echom '[SimpleTree] cannot paste a directory into itself' | echohl None
-      if mode ==# 'cut'
-        remaining->add(src)
-      endif
-      continue
-    endif
-    if mode ==# 'cut'
-        && RefuseModifiedBuffers(src, source_subtree, 'move', !source_is_link)
-      remaining->add(src)
-      continue
-    endif
-    var proposed = PathJoin(destDir, base)
-    var dst = ''
-    var same_target = PathEq(src, proposed)
-      || PathEq(ResolvedNormPath(src), ResolvedNormPath(proposed))
-    if same_target
-      if mode ==# 'cut'
-        echo '[SimpleTree] source is already in the target directory'
-        remaining->add(src)
-        continue
-      endif
-      dst = AskUniqueName(destDir, base .. ' copy')
-    else
-      dst = ResolveConflict(destDir, base)
-    endif
-    if dst ==# ''
-      echo '[SimpleTree] skip: ' .. base
-      if mode ==# 'cut'
-        remaining->add(src)
-      endif
-      continue
-    endif
-    if !IsSubPath(destDir, dst) || PathEq(destDir, dst)
-      echohl ErrorMsg | echom '[SimpleTree] target must stay inside destination directory' | echohl None
-      if mode ==# 'cut'
-        remaining->add(src)
-      endif
-      continue
-    endif
-    var target_is_link = getftype(dst) ==# 'link'
-    var target_was_dir = getftype(dst) ==# 'dir'
-    var destination_buffer_subtree = source_subtree || target_was_dir
-    if RefuseModifiedBuffers(dst, destination_buffer_subtree, 'replace', !target_is_link)
-      if mode ==# 'cut'
-        remaining->add(src)
-      endif
-      continue
-    endif
-
-    var rename_plan: list<dict<any>> = mode ==# 'cut'
-      ? BufferRenamePlan(src, dst, source_subtree)
-      : []
-    var transfer = mode ==# 'cut'
-      ? MovePathSafely(src, dst)
-      : CopyPathSafely(src, dst)
-    if transfer.installed
-      # 关闭被替换目标的未修改缓冲区，再把成功移动的源缓冲区改到新路径。
-      WipeBuffersForPath(dst, destination_buffer_subtree,
-        !target_is_link && !source_is_link)
-      if mode ==# 'cut' && transfer.source_removed
-        ApplyBufferRenamePlan(rename_plan)
-      endif
-      focused = dst
-      InvalidateAndRescan(destDir)
-      if mode ==# 'cut'
-        var sp = fnamemodify(src, ':h')
-        if sp !=# destDir
-          InvalidateAndRescan(sp)
-        endif
-        if transfer.source_removed
-          echo '[SimpleTree] moved: ' .. base .. ' -> ' .. destDir
-        else
-          remaining->add(src)
-          echohl WarningMsg
-          echom '[SimpleTree] copied safely, but source was not fully removed: ' .. src
-          echohl None
-        endif
-      else
-        echo '[SimpleTree] copied: ' .. base .. ' -> ' .. destDir
-      endif
-    else
-      echohl ErrorMsg
-      echom '[SimpleTree] failed to ' .. (mode ==# 'copy' ? 'copy' : 'move') .. ': ' .. src
-      echohl None
-      if mode ==# 'cut'
-        remaining->add(src)
-      endif
+  var ctx: dict<any> = {
+    mode: s_clipboard.mode,
+    destDir: destDir,
+    jobs: [],
+    index: 0,
+    remaining: [],
+    focused: '',
+  }
+  var reserved: dict<bool> = {}
+  for src in copy(s_clipboard.items)
+    var job = PlanPasteJob(ctx, src, reserved)
+    if !empty(job)
+      reserved[job.dst] = true
+      ctx.jobs->add(job)
     endif
   endfor
-
-  # 粘贴成功后标记就过期了：源路径在 cut 之后已经不存在，留着只会让下一个
-  # 操作作用在一批幽灵路径上。
-  if focused !=# ''
-    ClearMarks()
-  endif
-  Render()
-  if focused !=# ''
-    RevealPath(focused)
-  endif
-
-  if mode ==# 'cut'
-    s_clipboard = len(remaining) == 0
-      ? {mode: '', items: []}
-      : {mode: 'cut', items: remaining}
-  endif
+  PasteStep(ctx)
 enddef
 
 export def OnNewFile()

@@ -231,6 +231,9 @@ g:simpletree_collapse_all_key = get(g:, 'simpletree_collapse_all_key', 'z')
 g:simpletree_choose_window = get(g:, 'simpletree_choose_window', 1)
 g:simpletree_split_force_right = get(g:, 'simpletree_split_force_right', 1)
 g:simpletree_use_system_copy = get(g:, 'simpletree_use_system_copy', 0)
+# 复制/移动的字节搬运交给后端（需要 fs-ops 能力）。关闭后回到 Vim 内的同步
+# 实现，粘贴一个大目录会在整个复制期间冻结编辑器——这正是默认开启的原因。
+g:simpletree_async_fs_ops = NormalizeFlag(get(g:, 'simpletree_async_fs_ops', 1), 1)
 # y/Y 始终写入 Vim 无名寄存器；开启后还会尝试 + 寄存器或系统剪贴板工具。
 g:simpletree_use_system_clipboard = get(g:, 'simpletree_use_system_clipboard', 1)
 # 在目标窗口做水平分屏时是否放到下方（默认 1）。若为 0 则遵循 &splitbelow 或传统行为。

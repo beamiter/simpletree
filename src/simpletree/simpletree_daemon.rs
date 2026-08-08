@@ -1,3 +1,4 @@
+mod fsops;
 mod git;
 mod protocol;
 mod scan;
@@ -34,6 +35,7 @@ macro_rules! debug_log {
 fn runtime_capabilities(watch_available: bool, git_available: bool) -> Vec<&'static str> {
     let mut capabilities = BASE_CAPABILITIES.to_vec();
     capabilities.push("search");
+    capabilities.push("fs-ops");
     if watch_available {
         capabilities.push("watch");
     }
@@ -259,6 +261,25 @@ async fn main() -> Result<()> {
                             scan_slots.clone(),
                         ));
                     }
+                    Request::FsOp { id, op, src, dst } => {
+                        let Some((generation, cancel)) =
+                            begin_request(&active, &mut next_generation, id, &out_tx).await?
+                        else {
+                            continue;
+                        };
+
+                        tasks.spawn(run_fs_op_request(
+                            id,
+                            generation,
+                            op,
+                            PathBuf::from(src),
+                            PathBuf::from(dst),
+                            out_tx.clone(),
+                            cancel,
+                            active.clone(),
+                            scan_slots.clone(),
+                        ));
+                    }
                     Request::Cancel { id } => {
                         let cancel = {
                             let requests = active.lock().await;
@@ -450,6 +471,55 @@ async fn handle_git_status(
         truncated: status.truncated,
     };
     send_event_unless_cancelled(&out, &event, &cancel).await?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_fs_op_request(
+    id: u64,
+    generation: u64,
+    op: fsops::FsOpKind,
+    src: PathBuf,
+    dst: PathBuf,
+    out: EventTx,
+    cancel: CancellationToken,
+    active: ActiveRequests,
+    scan_slots: Arc<Semaphore>,
+) -> Result<()> {
+    let result = handle_fs_op(id, op, src, dst, out.clone(), cancel.clone(), scan_slots).await;
+    end_request(id, generation, result, &out, &cancel, &active).await
+}
+
+/// A copy can move gigabytes, so it takes a scan permit: the eight-slot
+/// semaphore is what keeps a paste from starving the directory listings the
+/// tree needs to stay responsive while the paste runs.
+async fn handle_fs_op(
+    id: u64,
+    op: fsops::FsOpKind,
+    src: PathBuf,
+    dst: PathBuf,
+    out: EventTx,
+    cancel: CancellationToken,
+    scan_slots: Arc<Semaphore>,
+) -> Result<()> {
+    let _permit = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => return Ok(()),
+        permit = scan_slots.acquire_owned() => permit.context("directory scan limiter closed")?,
+    };
+
+    let started = Instant::now();
+    let op_cancel = cancel.clone();
+    let outcome = tokio::task::spawn_blocking(move || fsops::run(op, &src, &dst, &op_cancel))
+        .await
+        .context("filesystem operation task failed")?;
+    debug_log!(
+        "handle_fs_op done id={id} installed={} elapsed_ms={}",
+        outcome.installed,
+        started.elapsed().as_millis()
+    );
+
+    send_event_unless_cancelled(&out, &Event::FsOpDone { id, outcome }, &cancel).await?;
     Ok(())
 }
 

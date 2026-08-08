@@ -11,6 +11,7 @@ SimpleTree 使用 Vim9 script，当前不支持 Neovim。
 - 文件系统 watch：后台监听已展开目录并推送变更事件，外部改动即时反映到树中；不可用时自动回退 mtime 轮询。
 - git status 标记：逐文件状态（修改/暂存/未跟踪/冲突/删除）与目录聚合标记，含符号与配色，可完全自定义或关闭。
 - 后台递归搜索：`:SimpleTreeSearch` 支持 substring / fuzzy 匹配，结果流式写入 quickfix。
+- 复制与移动由后台执行（`fs-ops` 能力）：粘贴一个大目录不再冻结编辑器，策略校验与提示仍全部留在 Vim 侧。
 - 树内过滤（`F`）只显示匹配节点及其祖先；`/` 跳转式查找，`]f` / `[f` 循环匹配。
 - `<Space>` 标记节点（可视模式按选区标记），`c` / `x` / `D` 随即作用于整个标记集合；删除只确认一次，但每条路径的守卫逐个复验。
 - `s` 在名称、扩展名、修改时间、体积排序间循环，`gs` 反转顺序；目录始终优先，元数据按需异步获取并随缓存复用。
@@ -257,7 +258,8 @@ autocmd User SimpleTreeFileCreated echom 'created: ' .. g:simpletree_event.path
 | 变量 | 默认值 | 说明 |
 |---|---:|---|
 | `g:simpletree_use_trash` | `1` | 删除时优先调用系统回收站工具 |
-| `g:simpletree_use_system_copy` | `0` | 普通文件复制时优先尝试系统命令，再回退到 Vim 实现 |
+| `g:simpletree_use_system_copy` | `0` | 普通文件复制时优先尝试系统命令，再回退到 Vim 实现（仅 Vim 内回退路径使用）|
+| `g:simpletree_async_fs_ops` | `1` | 复制/移动交给后台执行（需要 `fs-ops` 能力）；关闭后回到会冻结编辑器的 Vim 内同步实现 |
 | `g:simpletree_use_system_clipboard` | `1` | `y/Y` 写无名寄存器后尝试系统剪贴板 |
 | `g:simpletree_daemon_path` | `''` | 后台绝对路径；空值时从 runtimepath 自动查找 |
 | `g:simpletree_debug` | `0` | 在 `:messages` 中输出额外诊断 |
@@ -311,7 +313,8 @@ let g:simpletree_width_state_file = expand('~/.vim/simpletree-width')
 - 新建嵌套名称必须是目标目录内的相对路径；重命名只接受单个安全文件名。
 - 目录不能粘贴到自身或自身子目录；检查使用解析符号链接后的真实路径。
 - 指向根外的目录链接可以显示，但不能作为新建或粘贴目标。
-- Unix 上复制符号链接会强制使用 `cp -a` 保留链接本身；没有安全 provider 时拒绝复制。
+- 复制符号链接总是重建链接本身，不会解引用：后台原生支持；Vim 内回退路径在 Unix 上依赖 `cp -a`，没有安全 provider 时拒绝复制。
+- 复制与移动默认交给后台（`g:simpletree_async_fs_ops`）。工作区包含性、未保存缓冲区拒绝、冲突提示与提示后的重新验证仍在 Vim 侧执行；整批的提问都发生在第一次搬运开始之前，作业按标记顺序逐个执行。后台使用同样的同目录暂存/备份纪律。删除与重命名仍在 Vim 内完成——它们是一次系统调用，不是一次遍历。
 - 删除前总会确认；回收站失败后会再次询问是否永久删除。
 - 复制、覆盖、移动和重命名使用同目录暂存/备份并在失败时尝试回滚。
 - 与源、目标或目录子树关联的未保存缓冲区会阻止破坏性操作。

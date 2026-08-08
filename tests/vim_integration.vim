@@ -1,6 +1,10 @@
 set nocompatible
 set nomore
 
+" Every `sleep` after an OnPaste() below is waiting for the daemon: copy and move
+" are fs_op requests now, so OnPaste() returns before a single byte has moved.
+" tests/vim_fsops.vim asserts that gap directly.
+
 let s:repo = fnamemodify(expand('<sfile>:p'), ':h:h')
 let s:daemon = s:repo .. '/target/debug/simpletree-daemon'
 if !executable(s:daemon)
@@ -65,6 +69,27 @@ function! s:Select(fragment) abort
   endif
 endfunction
 
+" Select by exact path rather than by a substring of the rendered line: once a
+" paste has revealed its copy inside dest/, 'beta.txt' matches two lines and the
+" substring search finds the copy first.
+function! s:Sid() abort
+  return getscriptinfo({'name': 'autoload/simpletree.vim'})[0].sid
+endfunction
+
+function! s:SelectPath(path) abort
+  let winid = s:TreeWin()
+  call assert_true(winid > 0, 'tree window is missing')
+  call win_gotoid(winid)
+  let index = getscriptinfo({'sid': s:Sid()})[0].variables.s_line_index
+  for i in range(len(index))
+    if get(index[i], 'path', '') ==# a:path
+      call cursor(i + 1, 1)
+      return
+    endif
+  endfor
+  call assert_report('node is not in the tree: ' .. a:path)
+endfunction
+
 function! s:SelectLeaf(name) abort
   let winid = s:TreeWin()
   call assert_true(winid > 0, 'tree window is missing')
@@ -115,7 +140,7 @@ sleep 200m
 call assert_false(filereadable(s:root .. '/alpha.txt'))
 call assert_true(filereadable(s:root .. '/beta.txt'))
 call assert_true(bufnr(s:root .. '/beta.txt') > 0)
-call s:Select('beta.txt')
+call s:SelectPath(s:root .. '/beta.txt')
 call simpletree#OnYankPath()
 call assert_equal('beta.txt', getreg('"'))
 call simpletree#OnYankAbsPath()
@@ -141,7 +166,7 @@ sleep 200m
 
 if s:has_symlink_fixture
   " Nested creation cannot traverse an intermediate link outside the workspace.
-  call s:Select('beta.txt')
+  call s:SelectPath(s:root .. '/beta.txt')
   call feedkeys("\<C-U>escape/should-not-exist\<CR>", 't')
   call simpletree#OnNewFile()
   call assert_false(filereadable(s:outside .. '/should-not-exist'))
@@ -163,6 +188,7 @@ if s:has_symlink_fixture
   call simpletree#OnCopy()
   call s:SelectLeaf('alias-into-folder/')
   call simpletree#OnPaste()
+  sleep 400m
   call assert_equal([], glob(s:root .. '/folder/.simpletree-*', 0, 1))
 
   " Copying the link node preserves the link rather than traversing its target.
@@ -170,6 +196,7 @@ if s:has_symlink_fixture
   call simpletree#OnCopy()
   call s:Select('dest/')
   call simpletree#OnPaste()
+  sleep 400m
   call assert_equal('link', getftype(s:root .. '/dest/escape'))
   call assert_true(bufexists(s:outside_buf), 'copying a link closed its target buffer')
   call assert_equal(fnamemodify(s:outside .. '/outside.txt', ':p'),
@@ -201,7 +228,7 @@ call setbufvar(s:child_buf, '&modified', 0)
 let s:beta_buf = bufnr(s:root .. '/beta.txt')
 call setbufline(s:beta_buf, 1, ['unsaved'])
 call setbufvar(s:beta_buf, '&modified', 1)
-call s:Select('beta.txt')
+call s:SelectPath(s:root .. '/beta.txt')
 call simpletree#OnDelete()
 call assert_true(filereadable(s:root .. '/beta.txt'))
 call assert_true(getbufvar(s:beta_buf, '&modified'))
@@ -210,24 +237,27 @@ call setbufline(s:beta_buf, 1, ['source-v2'])
 call setbufvar(s:beta_buf, '&modified', 0)
 
 " Copy and overwrite use the staged transaction path.
-call s:Select('beta.txt')
+call s:SelectPath(s:root .. '/beta.txt')
 call simpletree#OnCopy()
 call s:Select('dest/')
 call simpletree#OnPaste()
+sleep 400m
 call assert_equal(['source-v2'], readfile(s:root .. '/dest/beta.txt'))
 call writefile(['source-v3'], s:root .. '/beta.txt')
-call s:Select('beta.txt')
+call s:SelectPath(s:root .. '/beta.txt')
 call simpletree#OnCopy()
 call s:Select('dest/')
 call feedkeys("o\<CR>", 't')
 call simpletree#OnPaste()
+sleep 400m
 call assert_equal(['source-v3'], readfile(s:root .. '/dest/beta.txt'))
 
 " A cut only clears its source after the complete destination is installed.
-call s:Select('gamma.txt')
+call s:SelectPath(s:root .. '/gamma.txt')
 call simpletree#OnCut()
 call s:Select('dest/')
 call simpletree#OnPaste()
+sleep 400m
 call assert_false(filereadable(s:root .. '/gamma.txt'))
 call assert_equal(['gamma'], readfile(s:root .. '/dest/gamma.txt'))
 

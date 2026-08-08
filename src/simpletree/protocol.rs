@@ -50,6 +50,18 @@ pub enum Request {
         #[serde(default)]
         force: bool,
     },
+    /// Copy / move / remove performed by the daemon instead of by Vimscript.
+    /// The frontend has already applied every policy check that depends on
+    /// editor state; this carries only the approved pair. `remove` ignores
+    /// `dst`, which may then be omitted.
+    #[serde(rename = "fs_op")]
+    FsOp {
+        id: u64,
+        op: crate::fsops::FsOpKind,
+        src: String,
+        #[serde(default)]
+        dst: String,
+    },
     #[serde(rename = "search")]
     Search {
         id: u64,
@@ -110,6 +122,14 @@ pub enum Event {
         id: u64,
         entries: Vec<Entry>,
         done: bool,
+    },
+    /// Result of an `fs_op`. Flattened so the frontend reads the same field
+    /// names its own synchronous helpers already return.
+    #[serde(rename = "fs_op_done")]
+    FsOpDone {
+        id: u64,
+        #[serde(flatten)]
+        outcome: crate::fsops::FsOpOutcome,
     },
     #[serde(rename = "pong")]
     Pong {
