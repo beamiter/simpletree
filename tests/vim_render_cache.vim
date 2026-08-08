@@ -199,6 +199,26 @@ call win_execute(bufwinid(s:Buf()), 'call cursor(2, 1)')
 call simpletree#OnBookmarkToggle()
 call s:Wait(200)
 
+" -------------------------------------------------------------- 标记 ---
+
+" 批量操作的标记同样属于行内容，遵守和书签一样的失效规则。
+call win_execute(bufwinid(s:Buf()), 'call cursor(3, 1)')
+call simpletree#OnMarkToggle()
+call s:Wait(200)
+call assert_true(join(s:Snapshot(), "\n") =~# '✓', '标记出现在树里')
+call s:AssertMatchesUncached('after marking a node')
+
+let g:simpletree_mark_symbol = '%%'
+call call(s:P('Render'), [])
+call assert_true(join(s:Snapshot(), "\n") =~# '%%', '改标记符号后立即生效')
+call s:AssertMatchesUncached('after changing the mark symbol')
+unlet g:simpletree_mark_symbol
+
+call simpletree#OnMarkClear()
+call s:Wait(200)
+call assert_false(join(s:Snapshot(), "\n") =~# '✓', '清除后标记消失')
+call s:AssertMatchesUncached('after clearing marks')
+
 " ------------------------------------------------------------ 新增/删除 ---
 
 call writefile(['new'], s:tmp . '/alpha/zz_new.rs')

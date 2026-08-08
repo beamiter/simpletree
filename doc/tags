@@ -3,6 +3,7 @@
 :SimpleTreeDebug	simpletree.txt	/*:SimpleTreeDebug*
 :SimpleTreeHealth	simpletree.txt	/*:SimpleTreeHealth*
 :SimpleTreeLog	simpletree.txt	/*:SimpleTreeLog*
+:SimpleTreeMarkClear	simpletree.txt	/*:SimpleTreeMarkClear*
 :SimpleTreeRefresh	simpletree.txt	/*:SimpleTreeRefresh*
 :SimpleTreeRestart	simpletree.txt	/*:SimpleTreeRestart*
 :SimpleTreeReveal	simpletree.txt	/*:SimpleTreeReveal*
@@ -35,6 +36,7 @@ g:simpletree_hide_dotfiles	simpletree.txt	/*g:simpletree_hide_dotfiles*
 g:simpletree_icons	simpletree.txt	/*g:simpletree_icons*
 g:simpletree_keep_focus	simpletree.txt	/*g:simpletree_keep_focus*
 g:simpletree_mappings	simpletree.txt	/*g:simpletree_mappings*
+g:simpletree_mark_symbol	simpletree.txt	/*g:simpletree_mark_symbol*
 g:simpletree_modified_symbol	simpletree.txt	/*g:simpletree_modified_symbol*
 g:simpletree_open_on_create	simpletree.txt	/*g:simpletree_open_on_create*
 g:simpletree_page	simpletree.txt	/*g:simpletree_page*
@@ -65,6 +67,7 @@ simpletree-daemon	simpletree.txt	/*simpletree-daemon*
 simpletree-events	simpletree.txt	/*simpletree-events*
 simpletree-install	simpletree.txt	/*simpletree-install*
 simpletree-mappings	simpletree.txt	/*simpletree-mappings*
+simpletree-marks	simpletree.txt	/*simpletree-marks*
 simpletree-options	simpletree.txt	/*simpletree-options*
 simpletree-requirements	simpletree.txt	/*simpletree-requirements*
 simpletree-safety	simpletree.txt	/*simpletree-safety*

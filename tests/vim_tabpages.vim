@@ -39,6 +39,10 @@ function! s:TreeWins(...) abort
   return l:res
 endfunction
 
+let s:finished = 0
+
+try
+
 enew
 execute 'SimpleTree ' .. fnameescape(s:root)
 sleep 200m
@@ -85,6 +89,16 @@ call assert_false(s:Vars().s_open, 'the last window closing did not end the sess
 SimpleTree
 sleep 200m
 call assert_equal(1, len(s:TreeWins()), 'the tree could not be reopened after a full close')
+
+let s:finished = 1
+
+catch
+  call add(v:errors, 'unexpected exception: ' .. v:exception .. ' @ ' .. v:throwpoint)
+endtry
+
+if !s:finished
+  call add(v:errors, 'the test body did not run to completion')
+endif
 
 SimpleTreeClose
 call simpletree#Stop()

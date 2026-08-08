@@ -138,6 +138,10 @@ under lib/ first, then target/release/ and target/debug/ for development use.
         default; call simpletree#Search({query}, 'fuzzy') for ordered
         subsequence matching.
 
+                                              *:SimpleTreeMarkClear*
+:SimpleTreeMarkClear
+        Clear every mark.  Same as gM in the tree.
+
                                                      *:SimpleTreeSort*
 :SimpleTreeSort [mode]
         Set the tree order to name, extension, mtime or size.  With no mode,
@@ -183,13 +187,22 @@ C       Prompt for a root directory.
 .       Use Vim's current working directory as root.
 d       Use the active file's directory as root.
 L       Toggle root locking.
-c       Copy the selected path to SimpleTree's file clipboard.
-x       Cut the selected path.
-p       Paste into the selected directory, or a selected file's parent.
+c       Copy the selected path, or the whole marked set, to SimpleTree's
+        file clipboard.
+x       Cut the selected path, or the whole marked set.
+p       Paste into the selected directory, or a selected file's parent.  A
+        successful paste clears the marks.
 a, n    Create a file.
 A, N    Create a directory.
 r       Rename.
-D       Delete, preferring the system trash when available.
+D       Delete, preferring the system trash when available.  With marks set,
+        one confirmation covers the whole set; every path is then re-checked
+        individually and the failures are reported together.
+<Space> Mark or unmark the node under the cursor, then move down one line.
+        In Visual mode the same key marks every node in the selection, or
+        unmarks them when the selection is already fully marked.
+gm      Mark every visible node sharing the cursor node's parent directory.
+gM      Clear all marks.  Also available as |:SimpleTreeMarkClear|.
 P       Preview while keeping tree focus.
 V, <C-V>
         Open in a vertical split.
@@ -232,7 +245,12 @@ toggle_hidden, toggle_git_ignore, close, root_here, root_up, root_prompt,
 root_cwd, root_current, toggle_root_lock, copy, cut, paste, new_file,
 new_folder, rename, delete, help, open_vsplit, open_split, open_tab,
 preview, reveal_active, yank_name, yank_path, system_open, filter, find,
-find_next, find_prev, sort_cycle, sort_reverse.
+find_next, find_prev, sort_cycle, sort_reverse, bookmark_toggle,
+bookmark_list, bookmark_next, bookmark_prev, mark_toggle, mark_siblings,
+mark_clear.
+
+The mark_toggle action installs a Visual-mode mapping on the same key as its
+Normal-mode one, so remapping it moves both.
 
 |g:simpletree_collapse_all_key| is still honored as a compatibility alias
 for the collapse_all action.
@@ -374,6 +392,9 @@ g:simpletree_bookmarks_file                          *g:simpletree_bookmarks_fil
   $XDG_STATE_HOME/simpletree/bookmarks.json, falling back to
   ~/.local/state/simpletree/bookmarks.json.  The file is a JSON array of
   absolute paths, so it can be edited or version-controlled by hand.
+
+g:simpletree_mark_symbol                                *g:simpletree_mark_symbol*
+  Marker appended to a marked entry.  Default "✓".  See |simpletree-marks|.
 
                                              *g:simpletree_use_nerdfont*
 g:simpletree_use_nerdfont
@@ -518,6 +539,27 @@ queued records are coalesced before stdout is flushed.
 These protections reduce data-loss risk but are not a cross-platform
 transaction or crash-consistency guarantee.  SimpleTree does not currently
 provide undo for file operations.
+
+MARKED NODES ~
+                                                        *simpletree-marks*
+Marks are a transient "the next operation applies to these" set, unlike
+bookmarks, which are a persistent "I care about this path" set.  <Space> marks
+the node under the cursor and moves down a line; in Visual mode the same key
+marks the whole selection (and unmarks it when it is already fully marked).
+gm marks every visible node sharing the cursor node's parent directory, and gM
+clears the set.  The count appears in the tree's statusline as marked:N and
+each marked line ends with |g:simpletree_mark_symbol|.
+
+While anything is marked, c, x and D act on the whole marked set instead of the
+node under the cursor; every other key is unaffected.  Delete asks once, listing
+up to five names plus "(and N more)", and then re-runs every per-path guard
+described in |simpletree-safety| individually — an unsaved buffer or a path that
+changed while the prompt was open fails that item only, and the failures are
+reported together.
+
+The workspace root can never be marked.  Marks are cleared when the root
+changes and after a successful paste; a refresh keeps them but drops any whose
+path no longer exists.
 
 ==============================================================================
 10. TAB PAGES                                       *simpletree-tabpages*

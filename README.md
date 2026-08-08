@@ -12,6 +12,7 @@ SimpleTree 使用 Vim9 script，当前不支持 Neovim。
 - git status 标记：逐文件状态（修改/暂存/未跟踪/冲突/删除）与目录聚合标记，含符号与配色，可完全自定义或关闭。
 - 后台递归搜索：`:SimpleTreeSearch` 支持 substring / fuzzy 匹配，结果流式写入 quickfix。
 - 树内过滤（`F`）只显示匹配节点及其祖先；`/` 跳转式查找，`]f` / `[f` 循环匹配。
+- `<Space>` 标记节点（可视模式按选区标记），`c` / `x` / `D` 随即作用于整个标记集合；删除只确认一次，但每条路径的守卫逐个复验。
 - `s` 在名称、扩展名、修改时间、体积排序间循环，`gs` 反转顺序；目录始终优先，元数据按需异步获取并随缓存复用。
 - 树缓冲区按键全部可通过 `g:simpletree_mappings` 覆盖或禁用。
 - `User SimpleTree*` 自动命令事件（打开/关闭/换根/展开/文件操作等），便于第三方集成。
@@ -102,6 +103,7 @@ git clone https://github.com/beamiter/simpletree.git \
 | `:SimpleTreeToggleAutoRefresh` | 会话内切换自动刷新 |
 | `:SimpleTreeToggleAutoFollow` | 会话内切换活动文件跟随 |
 | `:SimpleTreeSearch <query>` | 后台递归搜索文件名，结果写入 quickfix（需要 v2 后台） |
+| `:SimpleTreeMarkClear` | 清除全部批量操作标记（同树内 `gM`） |
 | `:SimpleTreeSort [mode]` | 设置或循环 `name` / `extension` / `mtime` / `size` 排序 |
 | `:SimpleTreeSortReverse` | 反转当前排序（目录仍保持在文件前） |
 
@@ -137,11 +139,13 @@ hit/miss、epoch 失效次数和被丢弃切片数。
 | `.` | 使用 Vim 当前工作目录作为根 |
 | `d` | 使用当前编辑文件所在目录作为根 |
 | `L` | 切换根锁定；默认根处于锁定状态 |
-| `c` / `x` / `p` | 复制 / 剪切 / 粘贴当前节点 |
+| `c` / `x` / `p` | 复制 / 剪切 / 粘贴；有标记时作用于整个标记集合 |
 | `a` / `n` | 新建文件 |
 | `A` / `N` | 新建目录 |
 | `r` | 重命名 |
-| `D` | 删除；可用时优先移到回收站 |
+| `D` | 删除；可用时优先移到回收站。有标记时一次确认覆盖整批 |
+| `<Space>` | 标记 / 取消标记当前节点并下移一行；可视模式下按整段选区标记 |
+| `gm` / `gM` | 标记全部可见同级节点 / 清除全部标记 |
 | `P` | 预览文件并保持树焦点 |
 | `V` / `<C-v>` | 垂直分屏打开 |
 | `S` / `<C-x>` | 水平分屏打开 |
@@ -221,6 +225,7 @@ SimpleTree 不会覆盖已存在的 `<leader>e` 映射。树缓冲区内全部�
 |---|---:|---|
 | `g:simpletree_show_modified` | `1` | 标记已修改但未保存的缓冲区 |
 | `g:simpletree_modified_symbol` | `'●'` | 未保存标记 |
+| `g:simpletree_mark_symbol` | `'✓'` | 批量操作标记（`<Space>`）的行尾符号 |
 | `g:simpletree_use_nerdfont` | `1` | 使用 Nerd Font 图标 |
 | `g:simpletree_show_file_icons` | `1` | 按扩展名显示文件图标 |
 | `g:simpletree_folder_suffix` | `1` | 目录名称显示斜杠后缀 |

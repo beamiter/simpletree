@@ -198,6 +198,8 @@ g:simpletree_show_modified = get(g:, 'simpletree_show_modified', 1)
 g:simpletree_modified_symbol = get(g:, 'simpletree_modified_symbol', '●')
 g:simpletree_show_bookmarks = get(g:, 'simpletree_show_bookmarks', 1)
 g:simpletree_bookmark_symbol = get(g:, 'simpletree_bookmark_symbol', '★')
+# 批量操作标记（<Space>）的行尾符号。
+g:simpletree_mark_symbol = get(g:, 'simpletree_mark_symbol', '✓')
 # Where bookmarks persist; defaults under $XDG_STATE_HOME (or ~/.local/state).
 g:simpletree_bookmarks_file = get(g:, 'simpletree_bookmarks_file', '')
 # 新建文件后直接在编辑区打开
@@ -341,6 +343,7 @@ command! SimpleTreeRestart call simpletree#Restart()
 command! SimpleTreeLog     call simpletree#ShowLog()
 command! SimpleTreeBookmarks     call simpletree#OnBookmarkJump()
 command! SimpleTreeBookmarkClear call simpletree#BookmarkClear()
+command! SimpleTreeMarkClear     call simpletree#OnMarkClear()
 
 nnoremap <silent> <Plug>(simpletree-toggle) <Cmd>SimpleTree<CR>
 if g:simpletree_set_default_mapping && maparg('<leader>e', 'n') ==# ''

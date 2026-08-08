@@ -1948,6 +1948,192 @@ export def BookmarkClear()
   echo printf('[SimpleTree] cleared %d bookmark%s', n, n == 1 ? '' : 's')
 enddef
 
+# ─────────────────── 标记（批量操作）───────────────────
+#
+# 书签是持久的"我关心这个路径"；标记是一次性的"下一个操作作用于这些路径"。
+# 剪贴板本来就是 {mode, items: [...]}，OnPaste() 也早就在 items 上循环，只是
+# 一直只放一个元素——标记只是把那条已有的路径喂满。
+#
+# 标记会改变行内容（行尾多一个符号），所以每次增删都必须 BumpRenderEpoch()，
+# 规则与书签相同；tests/vim_render_cache.vim 会在忘记时失败。
+var s_marked: dict<bool> = {}
+
+def MarkSymbol(): string
+  var sym = get(g:, 'simpletree_mark_symbol', '✓')
+  return type(sym) == v:t_string && sym !=# '' ? sym : '✓'
+enddef
+
+def IsMarked(path: string): bool
+  return get(s_marked, path, false)
+enddef
+
+# 已标记的路径，按路径排序——批量操作的顺序必须与树的显示顺序无关，否则
+# 同一批标记在不同展开状态下会得到不同的结果。
+def MarkedPaths(): list<string>
+  return sort(keys(s_marked))
+enddef
+
+# 丢掉指向已消失路径的标记。整表清空会让 H / I（它们走 Refresh()）把辛苦
+# 建起来的标记集合一起抹掉，那是比幽灵路径更烦人的行为。
+def PruneMarks()
+  var dropped = 0
+  for path in keys(s_marked)
+    if !PathExists(path)
+      remove(s_marked, path)
+      dropped += 1
+    endif
+  endfor
+  if dropped > 0
+    BumpRenderEpoch()
+  endif
+enddef
+
+def ClearMarks(render: bool = false)
+  if empty(s_marked)
+    return
+  endif
+  s_marked = {}
+  BumpRenderEpoch()
+  if render
+    Render()
+  endif
+enddef
+
+# 批量操作的目标集合：有标记时用标记，否则用光标所在节点。
+# 返回空表示没有可操作的目标，调用方负责给出提示。
+def ActionTargets(): list<string>
+  if !empty(s_marked)
+    return MarkedPaths()
+  endif
+  var node = CursorNode()
+  return IsActionableNode(node) ? [node.path] : []
+enddef
+
+# 最多列出 max 个名字，其余折叠成 "(and N more)"。破坏性操作的确认框必须
+# 让人一眼看清作用范围，但不能长到把屏幕顶掉。
+def SummarizePaths(paths: list<string>, maximum: number = 5): string
+  var names = paths->copy()->map((_, p) => fnamemodify(RStripSlash(p), ':t'))
+  if len(names) <= maximum
+    return join(names, ', ')
+  endif
+  return join(names[0 : maximum - 1], ', ')
+    .. printf(' (and %d more)', len(names) - maximum)
+enddef
+
+def MarkPath(path: string): bool
+  if path ==# '' || PathEq(path, s_root)
+    return false
+  endif
+  s_marked[path] = true
+  return true
+enddef
+
+export def OnMarkToggle()
+  var node = CursorNode()
+  if !IsActionableNode(node)
+    echo '[SimpleTree] nothing to mark'
+    return
+  endif
+  if get(node, 'is_root', v:false) || PathEq(node.path, s_root)
+    echo '[SimpleTree] the workspace root cannot be marked'
+    return
+  endif
+  if has_key(s_marked, node.path)
+    remove(s_marked, node.path)
+  else
+    s_marked[node.path] = true
+  endif
+  BumpRenderEpoch()
+  Render()
+  # 与书签一致：标记后往下走一行，连续标记不用手动移动光标。
+  var lnum = CursorLine()
+  if lnum > 0 && lnum < len(s_line_index) && WinValid()
+    try | call win_execute(s_winid, 'normal! ' .. (lnum + 1) .. 'G') | catch | endtry
+  endif
+  echo printf('[SimpleTree] %d marked', len(s_marked))
+enddef
+
+# 可视模式下对选区内的每一行做标记。整段全部已标记时取消标记，否则补齐——
+# 这样重复按同一个键在同一段选区上是可逆的。
+export def OnMarkRange()
+  if !WinValid()
+    return
+  endif
+  var first = line("'<")
+  var last = line("'>")
+  if first <= 0 || last <= 0
+    return
+  endif
+  var paths: list<string> = []
+  for lnum in range(max([1, first]), min([last, len(s_line_index)]))
+    var node = s_line_index[lnum - 1]
+    if !IsActionableNode(node) || PathEq(get(node, 'path', ''), s_root)
+      continue
+    endif
+    paths->add(node.path)
+  endfor
+  if empty(paths)
+    echo '[SimpleTree] nothing to mark'
+    return
+  endif
+  var all_marked = paths->copy()->filter((_, p) => !IsMarked(p))->empty()
+  for p in paths
+    if all_marked
+      if has_key(s_marked, p)
+        remove(s_marked, p)
+      endif
+    else
+      MarkPath(p)
+    endif
+  endfor
+  BumpRenderEpoch()
+  Render()
+  echo printf('[SimpleTree] %d marked', len(s_marked))
+enddef
+
+# 标记光标节点的全部可见同级节点（同一父目录、同一缩进层）。
+export def OnMarkSiblings()
+  if !WinValid()
+    return
+  endif
+  var node = CursorNode()
+  if !IsActionableNode(node)
+    echo '[SimpleTree] nothing to mark'
+    return
+  endif
+  var parent = fnamemodify(RStripSlash(node.path), ':h')
+  var depth = get(node, 'depth', -1)
+  var added = 0
+  for entry in s_line_index
+    if !IsActionableNode(entry) || get(entry, 'depth', -2) != depth
+      continue
+    endif
+    if fnamemodify(RStripSlash(entry.path), ':h') !=# parent
+      continue
+    endif
+    if !IsMarked(entry.path) && MarkPath(entry.path)
+      added += 1
+    endif
+  endfor
+  if added == 0
+    echo '[SimpleTree] no new siblings to mark'
+    return
+  endif
+  BumpRenderEpoch()
+  Render()
+  echo printf('[SimpleTree] %d marked', len(s_marked))
+enddef
+
+export def OnMarkClear()
+  if empty(s_marked)
+    echo '[SimpleTree] no marks'
+    return
+  endif
+  var n = len(s_marked)
+  ClearMarks(true)
+  echo printf('[SimpleTree] cleared %d mark%s', n, n == 1 ? '' : 's')
+enddef
+
 def GitCodeFor(path: string): string
   if empty(s_git_status)
     return ''
@@ -2312,6 +2498,8 @@ def SetupSyntaxTree(): void
     cmds->add('syntax match SimpleTreeLoading "Loading\.\.\."')
     var modified_pat = escape(get(g:, 'simpletree_modified_symbol', '●'), '\')
     cmds->add('syntax match SimpleTreeModified "\V' .. modified_pat .. '\m$"')
+    # 标记符号总是装饰串的最后一段，所以锚在行尾即可。
+    cmds->add('syntax match SimpleTreeMark "\V' .. escape(MarkSymbol(), '\') .. '\m$"')
 
     # 目录：图标 -> 名称 -> 斜杠（nextgroup + contained）
     var dir1 = s_icons.dir
@@ -2373,6 +2561,7 @@ def SetupSyntaxTree(): void
     cmds->add('highlight default link SimpleTreeHidden Comment')
     cmds->add('highlight default link SimpleTreeLoading WarningMsg')
     cmds->add('highlight default link SimpleTreeModified WarningMsg')
+    cmds->add('highlight default link SimpleTreeMark Statement')
     cmds->add('highlight default link SimpleTreeActiveFile CursorLine')
     cmds->add('highlight default link SimpleTreeIconLang Type')
     cmds->add('highlight default link SimpleTreeIconScript Statement')
@@ -2461,6 +2650,15 @@ const KEY_ACTIONS: dict<string> = {
   bookmark_prev: 'OnBookmarkPrev',
   sort_cycle: 'OnSortCycle',
   sort_reverse: 'ToggleSortReverse',
+  mark_toggle: 'OnMarkToggle',
+  mark_siblings: 'OnMarkSiblings',
+  mark_clear: 'OnMarkClear',
+}
+
+# action -> 可视模式下的函数名。装在与普通模式同一个键上，所以重绑
+# mark_toggle 会把可视映射一起带走，不会留下一个指向旧键的孤儿。
+const VISUAL_ACTIONS: dict<string> = {
+  mark_toggle: 'OnMarkRange',
 }
 
 const DEFAULT_KEYS: dict<string> = {
@@ -2514,6 +2712,9 @@ const DEFAULT_KEYS: dict<string> = {
   '[b': 'bookmark_prev',
   's': 'sort_cycle',
   'gs': 'sort_reverse',
+  '<Space>': 'mark_toggle',
+  'gm': 'mark_siblings',
+  'gM': 'mark_clear',
 }
 
 # 合并默认表、g:simpletree_collapse_all_key 兼容别名与 g:simpletree_mappings。
@@ -2554,6 +2755,13 @@ def InstallKeymaps()
       continue
     endif
     cmds->add('nnoremap <nowait> <silent> <buffer> ' .. key .. ' <Cmd>call simpletree#' .. Fn .. '()<CR>')
+    var VFn = get(VISUAL_ACTIONS, action, '')
+    if VFn !=# ''
+      # `:<C-u>` 而不是 `<Cmd>`：'< 和 '> 只有在离开可视模式后才更新，
+      # <Cmd> 保持可视模式，读到的会是上一次选区。
+      cmds->add('xnoremap <nowait> <silent> <buffer> ' .. key
+        .. ' :<C-u>call simpletree#' .. VFn .. '()<CR>')
+    endif
   endfor
   call win_execute(s_winid, join(cmds, " | "))
 enddef
@@ -2718,6 +2926,8 @@ def RenderConfigSig(): string
     !!get(g:, 'simpletree_use_nerdfont', 0),
     !!get(g:, 'simpletree_show_bookmarks', 1),
     get(g:, 'simpletree_bookmark_symbol', '★'),
+    MarkSymbol(),
+    len(s_marked),
     SortMode(),
     !!get(g:, 'simpletree_sort_reverse', 0),
     GitStatusEnabled(),
@@ -2816,6 +3026,8 @@ def BuildSubtree(path: string, depth: number): dict<any>
   var modified_symbol = get(g:, 'simpletree_modified_symbol', '●')
   var show_bookmarks = !!get(g:, 'simpletree_show_bookmarks', 1)
   var bookmark_symbol = get(g:, 'simpletree_bookmark_symbol', '★')
+  var has_marks = !empty(s_marked)
+  var mark_symbol = MarkSymbol()
   var indent = repeat('  ', depth)
   if show_bookmarks
     LoadBookmarks()
@@ -2845,10 +3057,14 @@ def BuildSubtree(path: string, depth: number): dict<any>
     if bookmarked
       decoration ..= ' ' .. bookmark_symbol
     endif
+    var marked = has_marks && IsMarked(e.path)
+    if marked
+      decoration ..= ' ' .. mark_symbol
+    endif
 
     lines->add(indent .. icon .. ' ' .. e.name .. suffix .. decoration)
     idx->add({path: e.path, is_dir: e.is_dir, name: e.name, depth: depth,
-      modified: modified, git: git_code, bookmarked: bookmarked})
+      modified: modified, git: git_code, bookmarked: bookmarked, marked: marked})
 
     if expanded
       var sub = BuildSubtree(e.path, depth + 1)
@@ -3180,6 +3396,8 @@ def SetRoot(new_root: string, lock: bool = false)
   endif
   var old_root = s_root
   UnwatchAllDirs()
+  # 换根后旧根下的标记不再可见，留着只会让下一次批量操作作用在看不见的路径上。
+  ClearMarks()
   s_git_status = {}
   BumpRenderEpoch()
   s_git_repo_root = ''
@@ -3672,27 +3890,32 @@ enddef
 
 # ===== 文件操作：复制/剪切/粘贴/新建/重命名/删除 =====
 export def OnCopy()
-  var node = CursorNode()
-  if !IsActionableNode(node)
+  var targets = ActionTargets()
+  if empty(targets)
     echo '[SimpleTree] nothing to copy'
     return
   endif
-  s_clipboard = {mode: 'copy', items: [node.path]}
-  echo '[SimpleTree] copy: ' .. node.path
+  s_clipboard = {mode: 'copy', items: targets}
+  echo len(targets) == 1
+    ? ('[SimpleTree] copy: ' .. targets[0])
+    : printf('[SimpleTree] copy %d items: %s', len(targets), SummarizePaths(targets))
 enddef
 
 export def OnCut()
-  var node = CursorNode()
-  if !IsActionableNode(node)
+  var targets = ActionTargets()
+  if empty(targets)
     echo '[SimpleTree] nothing to cut'
     return
   endif
-  if get(node, 'is_root', v:false)
+  # 标记集合里根目录已经被 MarkPath() 挡住了，这里挡的是光标落在根节点上。
+  if targets->copy()->filter((_, p) => PathEq(p, s_root))->len() > 0
     echo '[SimpleTree] workspace root cannot be moved'
     return
   endif
-  s_clipboard = {mode: 'cut', items: [node.path]}
-  echo '[SimpleTree] cut: ' .. node.path
+  s_clipboard = {mode: 'cut', items: targets}
+  echo len(targets) == 1
+    ? ('[SimpleTree] cut: ' .. targets[0])
+    : printf('[SimpleTree] cut %d items: %s', len(targets), SummarizePaths(targets))
 enddef
 
 export def OnPaste()
@@ -3832,6 +4055,11 @@ export def OnPaste()
     endif
   endfor
 
+  # 粘贴成功后标记就过期了：源路径在 cut 之后已经不存在，留着只会让下一个
+  # 操作作用在一批幽灵路径上。
+  if focused !=# ''
+    ClearMarks()
+  endif
   Render()
   if focused !=# ''
     RevealPath(focused)
@@ -4013,35 +4241,102 @@ export def OnRename()
   endif
 enddef
 
+# 删除单个已确认的路径。确认框可能开了任意长时间，所以每一条破坏性守卫都在
+# 这里对活的条目重新验证一次——批量删除让这段间隔更长，不是更短。
+# 返回 {removed, trashed, parent, reason}；reason 非空表示这一项被拒绝或失败，
+# 批量路径把它们汇总后一次性报出来。
+def DeleteOneConfirmed(path: string, can_trash: bool): dict<any>
+  var result = {removed: false, trashed: false, parent: fnamemodify(path, ':h'), reason: ''}
+  if !PathExists(path) || !WorkspaceContainsOperationPath(path, true)
+    result.reason = 'path changed; refusing to delete'
+    return result
+  endif
+  var path_type = getftype(path)
+  var path_is_link = path_type ==# 'link'
+  var subtree = path_type ==# 'dir'
+  if RefuseModifiedBuffers(path, subtree, 'delete', !path_is_link)
+    result.reason = 'unsaved buffer'
+    return result
+  endif
+
+  var trashed = can_trash && MoveToTrash(path)
+  var removed = trashed
+  if can_trash && !trashed
+    var fallback = exists('*confirm')
+      ? confirm('Move to trash failed. Permanently delete instead?', "&Delete\n&Cancel", 2) == 1
+      : input('Move to trash failed. Permanently delete? [y/N]: ') =~? '^y'
+    if !fallback
+      result.reason = 'canceled'
+      return result
+    endif
+    # The fallback confirmation is another unbounded pause. Do not apply the
+    # earlier decision to a path that was replaced while the prompt was open.
+    if !PathExists(path) || !WorkspaceContainsOperationPath(path, true)
+      result.reason = 'path changed; refusing permanent delete'
+      return result
+    endif
+    path_type = getftype(path)
+    path_is_link = path_type ==# 'link'
+    subtree = path_type ==# 'dir'
+    if RefuseModifiedBuffers(path, subtree, 'delete', !path_is_link)
+      result.reason = 'unsaved buffer'
+      return result
+    endif
+  endif
+  if !removed
+    removed = DeletePathRecursive(path)
+    if !removed
+      result.reason = 'delete failed'
+      return result
+    endif
+  endif
+  # 只关闭未修改缓冲区；modified 已在操作前硬性拒绝。
+  WipeBuffersForPath(path, subtree, !path_is_link)
+  Emit('FileDeleted', {path: path, trashed: trashed})
+  result.removed = true
+  result.trashed = trashed
+  return result
+enddef
+
 export def OnDelete()
-  var node = CursorNode()
-  if !IsActionableNode(node)
+  var targets = ActionTargets()
+  if empty(targets)
     echo '[SimpleTree] nothing to delete'
     return
   endif
-  if get(node, 'is_root', v:false)
-    echohl WarningMsg | echom '[SimpleTree] refusing to delete workspace root' | echohl None
+
+  # 确认之前先筛一遍：根目录、已消失的路径和解析后跑出工作区的路径不进提示框，
+  # 否则用户是在为一份他不会得到的清单点 Yes。
+  var deletable: list<string> = []
+  for p in targets
+    if p ==# '' || PathEq(p, s_root)
+      echohl WarningMsg | echom '[SimpleTree] refusing to delete workspace root' | echohl None
+      continue
+    endif
+    if !PathExists(p)
+      echo '[SimpleTree] path not exists: ' .. p
+      continue
+    endif
+    if !WorkspaceContainsOperationPath(p, true)
+      echohl ErrorMsg | echom '[SimpleTree] refusing to delete a path that resolves outside the workspace: ' .. p | echohl None
+      continue
+    endif
+    if RefuseModifiedBuffers(p, getftype(p) ==# 'dir', 'delete', getftype(p) !=# 'link')
+      continue
+    endif
+    deletable->add(p)
+  endfor
+  if empty(deletable)
     return
   endif
-  var p = node.path
-  if p ==# '' || !PathExists(p)
-    echo '[SimpleTree] path not exists'
-    return
-  endif
-  if !WorkspaceContainsOperationPath(p, true)
-    echohl ErrorMsg | echom '[SimpleTree] refusing to delete a path that resolves outside the workspace' | echohl None
-    return
-  endif
-  var path_type = getftype(p)
-  var path_is_link = path_type ==# 'link'
-  var subtree = path_type ==# 'dir'
-  if RefuseModifiedBuffers(p, subtree, 'delete', !path_is_link)
-    return
-  endif
-  var can_trash = len(TrashCommand(p)) > 0
-  var ok = 0
+
+  var can_trash = len(TrashCommand(deletable[0])) > 0
   var action = can_trash ? 'Move to trash' : 'Permanently delete'
-  var msg = action .. ' ' .. (subtree ? 'directory' : 'file') .. ' "' .. p .. '" ?'
+  var msg = len(deletable) == 1
+    ? printf('%s %s "%s" ?', action,
+        (getftype(deletable[0]) ==# 'dir' ? 'directory' : 'file'), deletable[0])
+    : printf('%s %d items: %s ?', action, len(deletable), SummarizePaths(deletable))
+  var ok = 0
   if exists('*confirm')
     ok = (confirm(msg, "&Yes\n&No", 2) == 1) ? 1 : 0
   else
@@ -4052,57 +4347,51 @@ export def OnDelete()
     return
   endif
 
-  # input()/confirm() may remain open for an arbitrary time. Re-read the live
-  # entry type and repeat all destructive guards after the user answers.
-  if !PathExists(p) || !WorkspaceContainsOperationPath(p, true)
-    echohl ErrorMsg | echom '[SimpleTree] path changed; refusing to delete' | echohl None
-    return
-  endif
-  path_type = getftype(p)
-  path_is_link = path_type ==# 'link'
-  subtree = path_type ==# 'dir'
-  if RefuseModifiedBuffers(p, subtree, 'delete', !path_is_link)
-    return
-  endif
+  var parents: dict<bool> = {}
+  var removed: list<string> = []
+  var trashed_count = 0
+  var failures: list<string> = []
+  for p in deletable
+    var outcome = DeleteOneConfirmed(p, can_trash)
+    if outcome.removed
+      removed->add(p)
+      if outcome.trashed
+        trashed_count += 1
+      endif
+      if has_key(s_marked, p)
+        remove(s_marked, p)
+        BumpRenderEpoch()
+      endif
+      if outcome.parent !=# ''
+        parents[outcome.parent] = true
+      endif
+    else
+      failures->add(fnamemodify(RStripSlash(p), ':t') .. ': ' .. outcome.reason)
+    endif
+  endfor
 
-  var parent = fnamemodify(p, ':h')
-  var trashed = can_trash && MoveToTrash(p)
-  var removed = trashed
-  if can_trash && !trashed
-    var fallback = exists('*confirm')
-      ? confirm('Move to trash failed. Permanently delete instead?', "&Delete\n&Cancel", 2) == 1
-      : input('Move to trash failed. Permanently delete? [y/N]: ') =~? '^y'
-    if !fallback
-      return
-    endif
-    # The fallback confirmation is another unbounded pause. Do not apply the
-    # earlier decision to a path that was replaced while the prompt was open.
-    if !PathExists(p) || !WorkspaceContainsOperationPath(p, true)
-      echohl ErrorMsg | echom '[SimpleTree] path changed; refusing permanent delete' | echohl None
-      return
-    endif
-    path_type = getftype(p)
-    path_is_link = path_type ==# 'link'
-    subtree = path_type ==# 'dir'
-    if RefuseModifiedBuffers(p, subtree, 'delete', !path_is_link)
-      return
-    endif
-  endif
-  if !removed
-    removed = DeletePathRecursive(p)
-    if !removed
-      echohl ErrorMsg | echom '[SimpleTree] delete failed' | echohl None
-      return
-    endif
-  endif
-  # 只关闭未修改缓冲区；modified 已在操作前硬性拒绝。
-  WipeBuffersForPath(p, subtree, !path_is_link)
-  echo '[SimpleTree] ' .. (trashed ? 'moved to trash: ' : 'deleted: ') .. p
-  Emit('FileDeleted', {path: p, trashed: trashed})
-  InvalidateAndRescan(parent)
+  for parent in keys(parents)
+    InvalidateAndRescan(parent)
+  endfor
   Render()
-  if parent !=# ''
-    RevealPath(parent)
+
+  if !empty(failures)
+    echohl ErrorMsg
+    echom printf('[SimpleTree] %d of %d not deleted: %s',
+      len(failures), len(deletable), join(failures[0 : 4], '; '))
+    echohl None
+  endif
+  if empty(removed)
+    return
+  endif
+  if len(removed) == 1
+    echo '[SimpleTree] ' .. (trashed_count > 0 ? 'moved to trash: ' : 'deleted: ') .. removed[0]
+  else
+    echo printf('[SimpleTree] deleted %d items (%d to trash)', len(removed), trashed_count)
+  endif
+  var focus = fnamemodify(removed[0], ':h')
+  if focus !=# ''
+    RevealPath(focus)
   endif
 enddef
 
@@ -4147,9 +4436,13 @@ def BuildHelpLines(): list<string>
     ca_key .. '     一键折叠根下所有目录',
     'F     过滤已加载节点（空串清除）',
     '/     按名称查找并跳转；]f/[f 下一个/上一个匹配',
+    '<Space> 标记/取消标记当前节点（可视模式下按整段选区标记）',
+    'gm    标记当前节点的全部可见同级节点',
+    'gM    清除全部标记',
     '?     显示/关闭本帮助面板',
     '----------------------------------------',
     '提示：新建支持 foo/bar.ext；删除优先移到系统回收站；剪切成功后自动清空剪贴板。',
+    '有标记时 c/x/D 作用于整个标记集合，否则作用于光标所在节点。',
     '按键可用 g:simpletree_mappings 自定义；此帮助显示默认键位。',
   ]
 enddef
@@ -4542,6 +4835,8 @@ export def Refresh()
   # 保存当前光标位置
   var current_node = CursorNode()
   var current_path = get(current_node, 'path', '')
+
+  PruneMarks()
 
   for [p, id] in items(s_pending)
     try
@@ -5278,6 +5573,9 @@ export def StatusLine(): string
   endif
   if FilterActive()
     flags->add('filter:' .. s_filter_query)
+  endif
+  if !empty(s_marked)
+    flags->add('marked:' .. len(s_marked))
   endif
   var sort_mode = SortMode()
   if sort_mode !=# 'name' || get(g:, 'simpletree_sort_reverse', 0)
