@@ -169,6 +169,9 @@ var s_fs_refresh_timer: number = 0
 # json_decode 产物是 dict<any>，保持 any 避免赋值处的类型收窄失败。
 var s_git_status: dict<any> = {}
 var s_git_repo_root: string = ''
+var s_git_repo_roots: list<string> = []   # 本次回复覆盖的全部仓库
+var s_git_request_id: number = 0
+var s_git_awaiting_first: bool = false
 var s_git_timer: number = 0
 # git_status 的结果只在成功时才有事件；失败时 daemon 回的是一条 error。
 # 记下最近一次的结果，:SimpleTreeHealth 才能说出"为什么没有标记"，而不是
@@ -1614,6 +1617,7 @@ def ResetBackendSessionState()
   s_git_status = {}
   BumpRenderEpoch()
   s_git_repo_root = ''
+  s_git_repo_roots = []
   s_git_last_error = ''
   s_git_last_ok = 0
 enddef
@@ -1800,13 +1804,29 @@ enddef
 # 一个真回调；成功路径由 OnGitStatusEvent() 按 id 摘除。
 def SendGitStatus(force: bool)
   var req_id = BNextId()
+  s_git_request_id = req_id
+  # 一次请求可能覆盖多个仓库，回复因此是一串事件而不是一条。第一条到达时才清
+  # 空旧结果：提前清会让树在整个查询期间丢掉所有标记。
+  s_git_awaiting_first = true
   s_bcbs[req_id] = {
     OnChunk: (_) => {
     },
     OnDone: () => {
     },
     OnError: (msg) => {
+      if req_id != s_git_request_id
+        return
+      endif
       s_git_last_error = msg
+      # 一个仓库都没找到时旧标记就是错的：它们属于上一个根。
+      if s_git_awaiting_first
+        s_git_awaiting_first = false
+        s_git_status = {}
+        s_git_repo_roots = []
+        s_git_repo_root = ''
+        BumpRenderEpoch()
+        ScheduleRender()
+      endif
       Log('git status failed: ' .. msg, 'WarningMsg')
     },
   }
@@ -1840,7 +1860,16 @@ enddef
 
 def OnGitStatusEvent(ev: dict<any>)
   var event_id = get(ev, 'id', 0)
-  if event_id != 0 && has_key(s_bcbs, event_id)
+  # 迟到的旧请求会把它那一批仓库的状态混进新的根里，所以按 id 丢弃。
+  if event_id != 0 && event_id != s_git_request_id
+    if has_key(s_bcbs, event_id)
+      remove(s_bcbs, event_id)
+    endif
+    return
+  endif
+  # 一次请求发多条事件，只有最后一条带 done；提前摘掉回调会让后续仓库的错误
+  # 无处可去。
+  if get(ev, 'done', v:false) && event_id != 0 && has_key(s_bcbs, event_id)
     remove(s_bcbs, event_id)
   endif
   if !s_open
@@ -1850,15 +1879,26 @@ def OnGitStatusEvent(ev: dict<any>)
   if type(statuses) != v:t_dict
     return
   endif
+  if s_git_awaiting_first
+    s_git_awaiting_first = false
+    s_git_status = {}
+    s_git_repo_roots = []
+  endif
   s_git_last_error = ''
   s_git_last_ok = localtime()
-  s_git_status = statuses
+  # 不同仓库的状态图路径不重叠，所以合并而不是覆盖：一个根下的第二个仓库过去
+  # 会把第一个仓库的标记整个顶掉。
+  call extend(s_git_status, statuses)
   BumpRenderEpoch()
-  s_git_repo_root = get(ev, 'repo_root', '')
-  if get(ev, 'truncated', v:false)
-    Log('git status truncated for ' .. s_git_repo_root, 'WarningMsg')
+  var repo_root = get(ev, 'repo_root', '')
+  if repo_root !=# '' && index(s_git_repo_roots, repo_root) < 0
+    s_git_repo_roots->add(repo_root)
   endif
-  Emit('GitStatusUpdated', {repo_root: s_git_repo_root, count: len(s_git_status)})
+  s_git_repo_root = repo_root
+  if get(ev, 'truncated', v:false)
+    Log('git status truncated for ' .. repo_root, 'WarningMsg')
+  endif
+  Emit('GitStatusUpdated', {repo_root: repo_root, count: len(s_git_status)})
   ScheduleRender()
 enddef
 
@@ -3665,6 +3705,11 @@ def DiscardRootScopedState()
   ClearMarks()
   s_git_status = {}
   s_git_repo_root = ''
+  s_git_repo_roots = []
+  # 一次查询已经在路上时换根，它算的是旧根下的仓库。把 id 作废，否则那批结果
+  # 会在新根下重新落盘，直到下一次查询才被顶掉。
+  s_git_request_id = 0
+  s_git_awaiting_first = false
   s_filter_memo = {}
   BumpRenderEpoch()
 enddef
@@ -5563,10 +5608,13 @@ export def Health()
   elseif s_git_last_error !=# ''
     git_detail = 'last query failed: ' .. s_git_last_error
   elseif s_git_last_ok > 0
+    # 一个根下可能有多个仓库；只报最后一个会让"标记为什么不全"变得无法诊断。
+    var source = len(s_git_repo_roots) > 1
+      ? printf('%d repos (%s)', len(s_git_repo_roots), join(s_git_repo_roots[0 : 2], ', '))
+      : (s_git_repo_root ==# '' ? '(unknown repo)' : s_git_repo_root)
     git_detail = printf('%d entr%s from %s, last updated %s',
       len(s_git_status), len(s_git_status) == 1 ? 'y' : 'ies',
-      (s_git_repo_root ==# '' ? '(unknown repo)' : s_git_repo_root),
-      strftime('%H:%M:%S', s_git_last_ok))
+      source, strftime('%H:%M:%S', s_git_last_ok))
   else
     git_detail = 'capability present, no reply yet'
   endif

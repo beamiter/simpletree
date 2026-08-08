@@ -34,6 +34,7 @@ vim-test:
 	vim -Nu NONE -n -i NONE -es -S tests/vim_search.vim
 	vim -Nu NONE -n -i NONE -es -S tests/vim_fsops.vim
 	vim -Nu NONE -n -i NONE -es -S tests/vim_filter.vim
+	vim -Nu NONE -n -i NONE -es -S tests/vim_git_multi.vim
 
 # ---------------------------------------------------------------------------
 # simplecore: the vendored daemon supervisor shared by the simple* suite.

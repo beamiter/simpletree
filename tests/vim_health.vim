@@ -13,8 +13,10 @@ if !executable(s:daemon)
   let s:daemon = s:repo .. '/lib/simpletree-daemon'
 endif
 
-" tempname() lives under /tmp, which is deliberately not a git repository:
-" the daemon answers git_status with an error there.
+" tempname() lives under /tmp, and the fixture below it holds no repository at
+" any depth, so the daemon answers git_status with an error there.  It reports
+" that itself now — discovery walks down as well as up — rather than passing
+" git's own stderr through.
 let s:root = tempname()
 call mkdir(s:root, 'p')
 call writefile(['top'], s:root .. '/top.txt')
@@ -56,7 +58,7 @@ call assert_false(s:text =~# 'git status: active',
       \ 'health still reports "active" for a root outside any repository')
 call assert_true(s:text =~# 'git status: last query failed: \S',
       \ 'the daemon''s git_status error was dropped instead of reported: ' .. s:text)
-call assert_true(s:text =~# 'not a git repository',
+call assert_true(s:text =~# 'not inside a git repository: ' .. escape(s:root, '/.'),
       \ 'the reported git failure lost the daemon''s own wording: ' .. s:text)
 
 " The failing request must not leak its correlation entry either.

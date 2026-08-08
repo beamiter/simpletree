@@ -449,6 +449,10 @@ async fn run_git_status_request(
     end_request(id, generation, result, &out, &cancel, &active).await
 }
 
+/// One request can cover several repositories: a tree rooted at a directory of
+/// checkouts used to resolve to none at all and show no marks anywhere.  Each
+/// repository gets its own event so the frontend can render the first one
+/// without waiting for the last, and only the final event carries `done`.
 async fn handle_git_status(
     id: u64,
     path: PathBuf,
@@ -457,21 +461,65 @@ async fn handle_git_status(
     out: EventTx,
     cancel: CancellationToken,
 ) -> Result<()> {
-    let status = tokio::select! {
+    let discover_path = path.clone();
+    let scopes = tokio::select! {
         biased;
         _ = cancel.cancelled() => return Ok(()),
-        status = git::repo_status(&cache, &path, force) => status?,
+        scopes = tokio::task::spawn_blocking(move || git::discover_repos(&discover_path)) =>
+            scopes.context("repository discovery task failed")?,
     };
+    if scopes.is_empty() {
+        bail!("not inside a git repository: {}", path.display());
+    }
 
-    let event = Event::GitStatus {
+    // The last successful repository carries `done`, so the one still in hand is
+    // held back until the loop knows whether another will follow.  A repository
+    // that fails inside a directory of them must not cost the others their
+    // marks — but if every one of them fails, that is the answer.
+    let mut held: Option<git::RepoStatus> = None;
+    let mut first_error: Option<anyhow::Error> = None;
+    for scope in &scopes {
+        let status = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Ok(()),
+            status = git::repo_status(&cache, scope, force) => status,
+        };
+        let status = match status {
+            Ok(status) => status,
+            Err(error) => {
+                debug_log!("git status failed for {:?}: {error}", scope.repo_root);
+                first_error.get_or_insert(error);
+                continue;
+            }
+        };
+        if let Some(previous) = held.replace(status)
+            && !send_event_unless_cancelled(&out, &git_status_event(id, &previous, false), &cancel)
+                .await?
+        {
+            return Ok(());
+        }
+    }
+
+    match held {
+        Some(final_status) => {
+            send_event_unless_cancelled(&out, &git_status_event(id, &final_status, true), &cancel)
+                .await?;
+            Ok(())
+        }
+        None => {
+            Err(first_error.unwrap_or_else(|| anyhow::anyhow!("git status produced no result")))
+        }
+    }
+}
+
+fn git_status_event(id: u64, status: &git::RepoStatus, done: bool) -> Event {
+    Event::GitStatus {
         id,
         repo_root: status.repo_root.to_string_lossy().into_owned(),
         statuses: status.statuses.as_ref().clone(),
-        done: true,
+        done,
         truncated: status.truncated,
-    };
-    send_event_unless_cancelled(&out, &event, &cancel).await?;
-    Ok(())
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

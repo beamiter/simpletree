@@ -475,7 +475,35 @@ g:simpletree_git_status
         Boolean, default 1.  Show per-file git status marks and colors.
         Effective only when the backend advertises the "git-status"
         capability and git is executable; otherwise the tree silently
-        behaves as if this were 0.
+        behaves as if this were 0.  See |simpletree-git-repos| for what
+        happens when the root holds more than one repository, or sits inside
+        a very large one.
+
+REPOSITORY DISCOVERY ~
+                                                   *simpletree-git-repos*
+The tree root is not assumed to be a repository, nor to be inside exactly one.
+
+When the root is inside a repository, status is asked for that repository and
+restricted to the root's own subtree with a pathspec.  A tree rooted at
+`<monorepo>/services/api` therefore does not re-run status over ten thousand
+unrelated files on every save, and does not ship their statuses over the
+protocol either.
+
+When the root is not inside a repository, every repository *below* it is found
+instead, so a directory of checkouts (`~/projects`, `~/work`) shows marks in
+each one.  The search descends at most three levels, stops at the first
+repository on each branch, ignores dotted directories and symbolic links, and
+covers at most 32 repositories.  Each repository answers with its own event and
+the frontend merges them; a repository that fails does not cost the others
+their marks, and |:SimpleTreeHealth| reports how many were found.
+
+A `.git` entry only counts as a repository when it is a file (a worktree or
+submodule pointer) or a directory containing HEAD.  An empty `.git` directory
+above your project no longer turns every status query into git's own "not a
+git repository" error reported against your tree root.
+
+When no repository is found at all, that is reported through
+|:SimpleTreeHealth| rather than silently producing an unmarked tree.
 
                                              *g:simpletree_git_status_symbols*
 g:simpletree_git_status_symbols
