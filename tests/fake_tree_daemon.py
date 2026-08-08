@@ -78,6 +78,11 @@ def main():
                 emit({"type": "error", "id": request_id, "message": str(error)})
         elif request_type == "cancel":
             emit({"type": "ok", "id": request_id})
+        elif request_type == "search":
+            # Deliberately silent: tests/vim_search.vim drives every search
+            # reply through simpletree#DispatchLine() so the ordering of two
+            # overlapping searches is exact rather than a race.
+            pass
         else:
             emit({
                 "type": "error",

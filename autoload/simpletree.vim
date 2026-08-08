@@ -183,6 +183,10 @@ var s_filter_memo: dict<bool> = {}    # dir -> 已加载后代中是否有匹配
 # 跳转式查找
 var s_find_query: string = ''
 
+# 最近一次 :SimpleTreeSearch 的请求 id。搜索是唯一会写 quickfix 的操作，
+# 必须串行化：只有最新一次能写结果，旧的一律作废并取消。
+var s_search_id: number = 0
+
 # path -> 渲染行号（1-based），reveal/高亮 O(1) 定位
 var s_path_lines: dict<number> = {}
 # s_line_index 每次渲染递增；s_path_lines 落后时按需重建。
@@ -1495,6 +1499,8 @@ def CancelFrontendWork()
     endtry
     s_git_timer = 0
   endif
+  # 会话结束后到达的搜索结果不能再写 quickfix。
+  s_search_id = 0
 
   # 流式列表在 done 前写入的缓存只是半成品；取消后必须失效，避免下次打开当成完整结果。
   for p in keys(s_loading)
@@ -5740,13 +5746,31 @@ export def Search(query: string, mode: string = 'substring')
   var results: list<dict<any>> = []
   var q = query
   var id = BNextId()
+  # 只保留最新一次搜索。此前两次搜索的回调各自活着，谁先完成谁写 quickfix,
+  # 先发的那次晚几秒完成时会把用户正在读的结果整个换掉并重新 copen;被放弃的
+  # 那次遍历还一直占着 8 个并发扫描许可中的一个。
+  if s_search_id != 0
+    try | BCancel(s_search_id) | catch | endtry
+    if has_key(s_bcbs, s_search_id)
+      call remove(s_bcbs, s_search_id)
+    endif
+  endif
+  s_search_id = id
   s_bcbs[id] = {
     OnChunk: (entries) => {
+      if id != s_search_id
+        return
+      endif
       for e in entries
         results->add({filename: e.path, lnum: 1, text: (e.is_dir ? '[dir] ' : '') .. e.name})
       endfor
     },
     OnDone: () => {
+      # 迟到的旧搜索绝不能动 quickfix。
+      if id != s_search_id
+        return
+      endif
+      s_search_id = 0
       if len(results) == 0
         echo '[SimpleTree] no matches for: ' .. q
         return
@@ -5755,6 +5779,10 @@ export def Search(query: string, mode: string = 'substring')
       execute 'copen'
     },
     OnError: (msg) => {
+      if id != s_search_id
+        return
+      endif
+      s_search_id = 0
       echohl WarningMsg
       echom '[SimpleTree] search failed: ' .. msg
       echohl None
@@ -5763,6 +5791,9 @@ export def Search(query: string, mode: string = 'substring')
   if !BSend({type: 'search', id: id, root: s_root, query: query, mode: mode, show_hidden: !s_hide_dotfiles, git_ignore: s_git_ignore})
     if has_key(s_bcbs, id)
       call remove(s_bcbs, id)
+    endif
+    if s_search_id == id
+      s_search_id = 0
     endif
     echo '[SimpleTree] failed to send search request'
   endif

@@ -4,6 +4,18 @@
 
 ## Unreleased - 2026-08-05
 
+### 修复：搜索的取消与串行化
+
+- 后台：被取消的 `search` 会永久占住一个并发扫描许可。消费端在 `break` 之后
+  仍持有 `batch_rx` 就去 `worker.await`，而 walk 线程正卡在容量 4 的
+  `blocking_send()` 上——`blocking_send` 只有在接收端被 *drop* 时才报错，于是
+  两边互等。取消 8 次之后，整个会话的目录列举全部停止。现在 await 之前先
+  `drop(batch_rx)`。新增单元测试用一个不被消费的事件通道稳定复现卡死。
+- 前端：两次 `:SimpleTreeSearch` 不再互相覆盖。此前两组回调各自活着，先发的
+  那次晚几秒完成时会把用户正在读的 quickfix 整个换掉并重新 `copen`，被放弃的
+  遍历还一直占着许可。现在只有最新一次能写结果，新搜索会取消并注销上一次；
+  关闭树也会让在途搜索作废。新增 `tests/vim_search.vim`。
+
 ### CI：修好门禁本身
 
 - `.github/workflows/ci.yml` 的两处 `dtolnay/rust-toolchain@1.85.0` 提到

@@ -102,7 +102,7 @@ git clone https://github.com/beamiter/simpletree.git \
 | `:SimpleTreeVersion` | 输出当前发现的 Rust 后台版本 |
 | `:SimpleTreeToggleAutoRefresh` | 会话内切换自动刷新 |
 | `:SimpleTreeToggleAutoFollow` | 会话内切换活动文件跟随 |
-| `:SimpleTreeSearch <query>` | 后台递归搜索文件名，结果写入 quickfix（需要 v2 后台） |
+| `:SimpleTreeSearch <query>` | 后台递归搜索文件名，结果写入 quickfix（需要 v2 后台）；只有最新一次能写结果 |
 | `:SimpleTreeMarkClear` | 清除全部批量操作标记（同树内 `gM`） |
 | `:SimpleTreeSort [mode]` | 设置或循环 `name` / `extension` / `mtime` / `size` 排序 |
 | `:SimpleTreeSortReverse` | 反转当前排序（目录仍保持在文件前） |

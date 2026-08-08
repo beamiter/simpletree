@@ -146,7 +146,9 @@ under lib/ first, then target/release/ and target/debug/ for development use.
         root and put the matches into the quickfix list.  Requires a backend
         that advertises the "search" capability.  Substring matching is the
         default; call simpletree#Search({query}, 'fuzzy') for ordered
-        subsequence matching.
+        subsequence matching.  Only the newest search may write the quickfix
+        list: starting another one cancels the previous walk, so a slow earlier
+        search can no longer replace the results being read.
 
                                               *:SimpleTreeMarkClear*
 :SimpleTreeMarkClear

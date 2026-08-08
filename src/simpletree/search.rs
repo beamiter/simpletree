@@ -152,6 +152,13 @@ pub async fn handle_search(
         }
     }
 
+    // Drop the receiver before awaiting: on the cancelled path the walk is
+    // usually parked in `blocking_send()` on this bounded channel, and
+    // `blocking_send` only fails once the receiver is gone.  Awaiting while
+    // still holding `batch_rx` hung here forever, and the caller's owned scan
+    // permit went with it — eight cancelled searches and no directory in the
+    // session could be listed again.
+    drop(batch_rx);
     worker.await.context("search worker task failed")??;
     if cancel.is_cancelled() {
         return Ok(());
@@ -194,5 +201,58 @@ mod tests {
         assert_eq!(normalize_max_results(None), DEFAULT_SEARCH_RESULTS);
         assert_eq!(normalize_max_results(Some(0)), 1);
         assert_eq!(normalize_max_results(Some(usize::MAX)), MAX_SEARCH_RESULTS);
+    }
+
+    /// A cancelled search used to deadlock and leak one of the eight
+    /// concurrent-scan permits: the consumer broke out of the batch loop and
+    /// awaited the worker while still holding the receiver, and the worker was
+    /// parked in `blocking_send()` on a bounded channel that only errors once
+    /// the receiver is *dropped*.  After eight cancellations every directory
+    /// listing in the session stopped.
+    ///
+    /// The setup reproduces the parked worker deterministically: the event
+    /// channel holds one message and is never drained, so the consumer stalls
+    /// after a single chunk while the walk keeps producing.
+    #[test]
+    fn cancelling_a_search_releases_its_blocking_worker() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        for index in 0..(BATCH_SIZE * 8) {
+            std::fs::write(directory.path().join(format!("match_{index}.rs")), b"x")
+                .expect("fixture");
+        }
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+
+        runtime.block_on(async {
+            let (out, _undrained) = mpsc::channel::<String>(1);
+            let cancel = CancellationToken::new();
+            let task = tokio::spawn(handle_search(
+                7,
+                directory.path().to_path_buf(),
+                "match".to_string(),
+                SearchOptions {
+                    mode: SearchMode::Substring,
+                    max_results: MAX_SEARCH_RESULTS,
+                    show_hidden: false,
+                    git_ignore: false,
+                },
+                out,
+                cancel.clone(),
+            ));
+
+            // Long enough for the walk to fill both channels and park.
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            cancel.cancel();
+
+            let joined = tokio::time::timeout(std::time::Duration::from_secs(10), task)
+                .await
+                .expect("cancelled search never returned; its blocking worker is still parked");
+            joined
+                .expect("search task panicked")
+                .expect("cancelled search reported an error");
+        });
     }
 }
