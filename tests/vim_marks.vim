@@ -243,15 +243,32 @@ call assert_equal(2, len(s:Marked()), 'a declined delete dropped the marks')
 
 " An unsaved buffer anywhere in the marked set fails that item closed before the
 " prompt is ever shown; the post-prompt re-validation is exercised separately.
+"
+" Going through OnDelete() proves nothing here: confirm() returns No in headless
+" ex mode, so both files survive whether or not the pre-prompt filter exists.
+" The filter is therefore driven directly — that is the only way this assertion
+" can go red when RefuseModifiedBuffers() is dropped from it.
+let s:Deletable = function(printf('<SNR>%d_DeletableTargets', s:Sid()))
 execute 'badd ' .. fnameescape(s:root .. '/del_a.txt')
 let s:buf = bufnr(s:root .. '/del_a.txt')
 call bufload(s:buf)
 call setbufline(s:buf, 1, ['unsaved'])
 call setbufvar(s:buf, '&modified', 1)
+call assert_equal([s:root .. '/del_b.txt'],
+      \ call(s:Deletable, [[s:root .. '/del_a.txt', s:root .. '/del_b.txt']]),
+      \ 'an unsaved buffer must drop its own item, and only its own item')
 call simpletree#OnDelete()
 call assert_true(filereadable(s:root .. '/del_a.txt'))
 call setbufvar(s:buf, '&modified', 0)
 execute 'silent! bwipeout! ' .. s:buf
+
+" Saved again, the same path is offered again: the filter reads live buffer state
+" rather than memoising a rejection.  The other three pre-prompt guards are
+" equally unobservable through confirm(), so they are pinned here too.
+call assert_equal([s:root .. '/del_a.txt', s:root .. '/del_b.txt'],
+      \ call(s:Deletable, [[s:root .. '/del_a.txt', s:root .. '/del_b.txt']]))
+call assert_equal([], call(s:Deletable, [[s:root, s:root .. '/nope.txt', s:other .. '/bee.txt']]),
+      \ 'the root, a vanished path and an outside path must never reach the prompt')
 
 " Drive the per-item worker directly: every destructive guard is re-run there,
 " because the single prompt may have been open for an arbitrary time.

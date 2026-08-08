@@ -4354,15 +4354,11 @@ def DeleteOneConfirmed(path: string, can_trash: bool): dict<any>
   return result
 enddef
 
-export def OnDelete()
-  var targets = ActionTargets()
-  if empty(targets)
-    echo '[SimpleTree] nothing to delete'
-    return
-  endif
-
-  # 确认之前先筛一遍：根目录、已消失的路径和解析后跑出工作区的路径不进提示框，
-  # 否则用户是在为一份他不会得到的清单点 Yes。
+# 确认之前先筛一遍：根目录、已消失的路径、解析后跑出工作区的路径和带未保存缓冲区
+# 的路径都不进提示框，否则用户是在为一份他不会得到的清单点 Yes。
+# 拆成独立函数是因为这层过滤在 headless 下无法经由 confirm() 观察——测试只能直接
+# 调它，见 tests/vim_marks.vim。
+def DeletableTargets(targets: list<string>): list<string>
   var deletable: list<string> = []
   for p in targets
     if p ==# '' || PathEq(p, s_root)
@@ -4382,6 +4378,17 @@ export def OnDelete()
     endif
     deletable->add(p)
   endfor
+  return deletable
+enddef
+
+export def OnDelete()
+  var targets = ActionTargets()
+  if empty(targets)
+    echo '[SimpleTree] nothing to delete'
+    return
+  endif
+
+  var deletable = DeletableTargets(targets)
   if empty(deletable)
     return
   endif
