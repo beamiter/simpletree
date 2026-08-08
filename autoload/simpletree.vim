@@ -228,6 +228,81 @@ def SortNeedsMetadata(mode: string = SortMode()): bool
   return mode ==# 'mtime' || mode ==# 'size'
 enddef
 
+# ─────────────────── 明细列 ───────────────────
+#
+# size/mtime/is_symlink 一直都在协议里，也一直随 meta 标志流进来——只是除了排序
+# 之外没有任何人用它们。于是"按体积排序"可以，"看见体积"不行。
+const COLUMN_NAMES = ['size', 'mtime', 'symlink']
+
+def ColumnList(): list<string>
+  var configured = get(g:, 'simpletree_columns', [])
+  if type(configured) != v:t_list
+    return []
+  endif
+  var columns: list<string> = []
+  for name in configured
+    if type(name) == v:t_string && index(COLUMN_NAMES, name) >= 0
+        && index(columns, name) < 0
+      columns->add(name)
+    endif
+  endfor
+  return columns
+enddef
+
+# 开了明细列就必须带 metadata 扫描，和 mtime/size 排序完全同一个理由。SetSort()
+# 里那套"快照已经很富就别重扫"的逻辑因此对两者都成立。
+def RequiresMetadata(mode: string = SortMode()): bool
+  return SortNeedsMetadata(mode) || !empty(ColumnList())
+enddef
+
+def ColumnTimeFormat(): string
+  var format = get(g:, 'simpletree_column_time_format', '%m-%d %H:%M')
+  return type(format) == v:t_string && format !=# '' ? format : '%m-%d %H:%M'
+enddef
+
+def ColumnSep(): string
+  var sep = get(g:, 'simpletree_column_sep', '  ')
+  return type(sep) == v:t_string ? sep : '  '
+enddef
+
+# 1024 进制、最多一位小数。宽度固定为 6，列才能对齐；目录没有有意义的体积，
+# 显示 '-' 而不是它的目录项大小——那个数字只会误导人。
+def HumanSize(bytes: number): string
+  if bytes < 0
+    return printf('%6s', '-')
+  endif
+  var units = ['B', 'K', 'M', 'G', 'T', 'P']
+  var value = bytes * 1.0
+  var unit = 0
+  while value >= 1024.0 && unit < len(units) - 1
+    value = value / 1024.0
+    unit += 1
+  endwhile
+  var text = unit == 0
+    ? printf('%d%s', float2nr(value), units[unit])
+    : (value < 10.0
+      ? printf('%.1f%s', value, units[unit])
+      : printf('%d%s', float2nr(round(value)), units[unit]))
+  return printf('%6s', text)
+enddef
+
+# 返回一行的明细列文本，没有列时返回空串。宽度固定，不随条目变化，否则同一层
+# 的列不会对齐。
+def ColumnText(e: dict<any>, columns: list<string>, time_format: string, sep: string): string
+  var fields: list<string> = []
+  for column in columns
+    if column ==# 'size'
+      fields->add(e.is_dir ? printf('%6s', '-') : HumanSize(EntryNumber(e, 'size')))
+    elseif column ==# 'mtime'
+      var mtime = EntryNumber(e, 'mtime')
+      fields->add(mtime > 0 ? strftime(time_format, mtime) : '-')
+    elseif column ==# 'symlink'
+      fields->add(get(e, 'is_symlink', v:false) ? '@' : ' ')
+    endif
+  endfor
+  return join(fields, sep)
+enddef
+
 # Metadata belongs to a directory-list snapshot, not to the selected sort mode.
 # Include inflight scans so a non-metadata refresh cannot replace a rich stale
 # cache immediately after SetSort() decides that no refresh is necessary.
@@ -2626,7 +2701,7 @@ def ScanDirAsync(path: string, force: bool = false)
   var p = path
   var req_id: number = 0
   var session_generation = s_session_generation
-  var request_has_metadata = SortNeedsMetadata()
+  var request_has_metadata = RequiresMetadata()
   s_loading_has_metadata[path] = request_has_metadata
 
   req_id = BList(
@@ -2868,6 +2943,7 @@ def SetupSyntaxTree(): void
     cmds->add('highlight default link SimpleTreeLoading WarningMsg')
     cmds->add('highlight default link SimpleTreeModified WarningMsg')
     cmds->add('highlight default link SimpleTreeMark Statement')
+    cmds->add('highlight default link SimpleTreeColumn Comment')
     cmds->add('highlight default link SimpleTreeActiveFile CursorLine')
     cmds->add('highlight default link SimpleTreeIconLang Type')
     cmds->add('highlight default link SimpleTreeIconScript Statement')
@@ -3073,7 +3149,7 @@ def InstallKeymaps()
 enddef
 
 def RegisterGitPropTypes()
-  for type_name in ['SimpleTreeGitModified', 'SimpleTreeGitStaged', 'SimpleTreeGitUntracked', 'SimpleTreeGitConflict', 'SimpleTreeGitDeleted']
+  for type_name in ['SimpleTreeGitModified', 'SimpleTreeGitStaged', 'SimpleTreeGitUntracked', 'SimpleTreeGitConflict', 'SimpleTreeGitDeleted', 'SimpleTreeColumn']
     try
       call prop_type_add(type_name, {bufnr: s_bufnr, highlight: type_name, combine: true})
     catch
@@ -3153,6 +3229,10 @@ enddef
 # 钉死这条规则。
 #
 # path -> {depth, epoch, entries, count, dirs, lines, idx}
+# 明细列右对齐要用到树窗口宽度。它在 Render() 开头取一次并进入配置签名，缩放
+# 窗口因此会作废整棵渲染缓存——只有开了列的时候才如此，没开列的树不该为一次
+# 拖拽付出重算的代价。
+var s_render_width: number = 0
 var s_subtree_cache: dict<dict<any>> = {}
 var s_render_epoch: number = 0
 var s_render_cfg_sig: string = ''
@@ -3234,6 +3314,10 @@ def RenderConfigSig(): string
     get(g:, 'simpletree_bookmark_symbol', '★'),
     MarkSymbol(),
     len(s_marked),
+    ColumnList(),
+    empty(ColumnList()) ? 0 : s_render_width,
+    ColumnTimeFormat(),
+    ColumnSep(),
     SortMode(),
     !!get(g:, 'simpletree_sort_reverse', 0),
     GitStatusEnabled(),
@@ -3336,6 +3420,9 @@ def BuildSubtree(path: string, depth: number): dict<any>
   var bookmark_symbol = get(g:, 'simpletree_bookmark_symbol', '★')
   var has_marks = !empty(s_marked)
   var mark_symbol = MarkSymbol()
+  var columns = ColumnList()
+  var column_time_format = ColumnTimeFormat()
+  var column_sep = ColumnSep()
   var indent = repeat('  ', depth)
   if show_bookmarks
     LoadBookmarks()
@@ -3370,9 +3457,26 @@ def BuildSubtree(path: string, depth: number): dict<any>
       decoration ..= ' ' .. mark_symbol
     endif
 
-    lines->add(indent .. icon .. ' ' .. e.name .. suffix .. decoration)
-    idx->add({path: e.path, is_dir: e.is_dir, name: e.name, depth: depth,
-      modified: modified, git: git_code, bookmarked: bookmarked, marked: marked})
+    var body = indent .. icon .. ' ' .. e.name .. suffix
+    var entry = {path: e.path, is_dir: e.is_dir, name: e.name, depth: depth,
+      modified: modified, git: git_code, bookmarked: bookmarked, marked: marked}
+    if empty(columns)
+      lines->add(body .. decoration)
+    else
+      # 明细列插在名字和装饰之间：● / ★ / ✓ 的语法匹配全部锚在行尾，把列放到
+      # 它们后面会让那些高亮整体失效。
+      var column_text = ColumnText(e, columns, column_time_format, column_sep)
+      var used = strdisplaywidth(body) + strdisplaywidth(column_text)
+        + strdisplaywidth(decoration)
+      var gap = max([2, s_render_width - used])
+      var padding = repeat(' ', gap)
+      lines->add(body .. padding .. column_text .. decoration)
+      # 列没有可靠的行内锚点（名字里什么字符都可能出现），所以高亮走文本属性：
+      # 渲染时的字节偏移是精确的，正则只能是猜。
+      entry.column_col = strlen(body) + gap + 1
+      entry.column_end = entry.column_col + strlen(column_text)
+    endif
+    idx->add(entry)
 
     if expanded
       var sub = BuildSubtree(e.path, depth + 1)
@@ -3483,6 +3587,18 @@ def ApplyGitHighlights(out: list<string>)
   catch
     return
   endtry
+  # 明细列和 git 标记共用这一次属性重建：prop_clear() 已经把整块清掉了，分两处
+  # 加就会互相抹掉对方。
+  for i in range(len(s_line_index))
+    var column_col = get(s_line_index[i], 'column_col', 0)
+    if column_col > 0
+      try
+        call prop_add(i + 1, column_col, {bufnr: s_bufnr, type: 'SimpleTreeColumn',
+          end_col: get(s_line_index[i], 'column_end', column_col)})
+      catch
+      endtry
+    endif
+  endfor
   if empty(s_git_status) || !GitStatusEnabled()
     return
   endif
@@ -3603,6 +3719,13 @@ def Render()
   EnsureWindowAndBuffer()
 
   call EnsureSyntaxTree()
+
+  var tree_winid = TreeWin()
+  s_render_width = tree_winid > 0 ? winwidth(tree_winid) : 0
+  if s_render_width <= 0
+    var configured = get(g:, 'simpletree_width', 45)
+    s_render_width = type(configured) == v:t_number && configured > 0 ? configured : 45
+  endif
 
   # 运行时改了图标/后缀之类的配置,整棵缓存作废。O(1),每次渲染只比一次。
   var cfg_sig = RenderConfigSig()
@@ -4176,13 +4299,50 @@ export def SetSort(requested: string = '')
   endif
   g:simpletree_sort = mode
   BumpRenderEpoch()
-  if SortNeedsMetadata(mode) && !CachedSnapshotsHaveMetadata()
+  if RequiresMetadata(mode) && !CachedSnapshotsHaveMetadata()
     # 当前快照确实缺 metadata 时才重扫；rich snapshot 在模式间切换时复用。
     Refresh()
   else
     Render()
   endif
   echo '[SimpleTree] sort: ' .. mode .. (get(g:, 'simpletree_sort_reverse', 0) ? ' (reversed)' : '')
+enddef
+
+export def CompleteColumns(arglead: string, _cmdline: string, _cursorpos: number): list<string>
+  return (COLUMN_NAMES + ['none'])->copy()->filter((_, name) => stridx(name, arglead) == 0)
+enddef
+
+# :SimpleTreeColumns [size|mtime|symlink]...  空参数在"全开"和"全关"之间切换。
+# 开启需要 metadata，走的是 SetSort() 那条一模一样的"缺了才重扫"逻辑。
+export def SetColumns(requested: string = '')
+  var wanted: list<string> = []
+  var words = split(trim(requested), '\s\+')
+  if empty(words)
+    wanted = empty(ColumnList()) ? ['size', 'mtime'] : []
+  elseif len(words) == 1 && (words[0] ==# 'none' || words[0] ==# 'off')
+    wanted = []
+  else
+    for name in words
+      if index(COLUMN_NAMES, name) < 0
+        echohl WarningMsg
+        echom '[SimpleTree] unknown column: ' .. name .. ' (use size, mtime, symlink or none)'
+        echohl None
+        return
+      endif
+      if index(wanted, name) < 0
+        wanted->add(name)
+      endif
+    endfor
+  endif
+
+  g:simpletree_columns = wanted
+  BumpRenderEpoch()
+  if RequiresMetadata() && !CachedSnapshotsHaveMetadata()
+    Refresh()
+  else
+    Render()
+  endif
+  echo '[SimpleTree] columns: ' .. (empty(wanted) ? 'none' : join(wanted, ' '))
 enddef
 
 export def OnSortCycle()

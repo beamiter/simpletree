@@ -1,5 +1,6 @@
 :SimpleTree	simpletree.txt	/*:SimpleTree*
 :SimpleTreeClose	simpletree.txt	/*:SimpleTreeClose*
+:SimpleTreeColumns	simpletree.txt	/*:SimpleTreeColumns*
 :SimpleTreeDebug	simpletree.txt	/*:SimpleTreeDebug*
 :SimpleTreeHealth	simpletree.txt	/*:SimpleTreeHealth*
 :SimpleTreeLog	simpletree.txt	/*:SimpleTreeLog*
@@ -27,6 +28,9 @@ g:simpletree_bookmark_symbol	simpletree.txt	/*g:simpletree_bookmark_symbol*
 g:simpletree_bookmarks_file	simpletree.txt	/*g:simpletree_bookmarks_file*
 g:simpletree_choose_window	simpletree.txt	/*g:simpletree_choose_window*
 g:simpletree_collapse_all_key	simpletree.txt	/*g:simpletree_collapse_all_key*
+g:simpletree_column_sep	simpletree.txt	/*g:simpletree_column_sep*
+g:simpletree_column_time_format	simpletree.txt	/*g:simpletree_column_time_format*
+g:simpletree_columns	simpletree.txt	/*g:simpletree_columns*
 g:simpletree_daemon_path	simpletree.txt	/*g:simpletree_daemon_path*
 g:simpletree_debug	simpletree.txt	/*g:simpletree_debug*
 g:simpletree_file_icon_map	simpletree.txt	/*g:simpletree_file_icon_map*

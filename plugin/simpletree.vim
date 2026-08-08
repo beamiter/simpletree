@@ -33,6 +33,20 @@ def NormalizeSortMode(value: any): string
   return index(['name', 'extension', 'mtime', 'size'], mode) >= 0 ? mode : 'name'
 enddef
 
+def NormalizeColumns(value: any): list<string>
+  if type(value) != v:t_list
+    return []
+  endif
+  var columns: list<string> = []
+  for name in value
+    if type(name) == v:t_string && index(['size', 'mtime', 'symlink'], name) >= 0
+        && index(columns, name) < 0
+      columns->add(name)
+    endif
+  endfor
+  return columns
+enddef
+
 def NormalizeFilterMode(value: any): string
   if type(value) != v:t_string
     return 'auto'
@@ -263,6 +277,11 @@ g:simpletree_use_watcher = get(g:, 'simpletree_use_watcher', 1)
 g:simpletree_filter_mode = NormalizeFilterMode(get(g:, 'simpletree_filter_mode', 'auto'))
 # 后端过滤一次最多接收多少条命中
 g:simpletree_filter_max_results = ClampNumber(get(g:, 'simpletree_filter_max_results', 500), 500, 1, 5000)
+# 名字右侧的明细列，取值 'size' / 'mtime' / 'symlink'；空列表关闭
+# 开启会让列表请求带上 meta（和按体积/时间排序同一条路径）
+g:simpletree_columns = NormalizeColumns(get(g:, 'simpletree_columns', []))
+g:simpletree_column_time_format = get(g:, 'simpletree_column_time_format', '%m-%d %H:%M')
+g:simpletree_column_sep = get(g:, 'simpletree_column_sep', '  ')
 # 树缓冲区按键覆盖表：{键: action}；action 为空字符串表示禁用该键
 g:simpletree_mappings = get(g:, 'simpletree_mappings', {})
 
@@ -355,6 +374,7 @@ command! SimpleTreeToggleAutoFollow call g:SimpleTreeToggleAutoFollow()
 command! -nargs=+ SimpleTreeSearch simpletree#Search(<q-args>)
 command! -nargs=? -complete=customlist,simpletree#CompleteSort SimpleTreeSort simpletree#SetSort(<q-args>)
 command! SimpleTreeSortReverse simpletree#ToggleSortReverse()
+command! -nargs=* -complete=customlist,simpletree#CompleteColumns SimpleTreeColumns simpletree#SetColumns(<q-args>)
 command! SimpleTreeRestart call simpletree#Restart()
 command! SimpleTreeLog     call simpletree#ShowLog()
 command! SimpleTreeBookmarks     call simpletree#OnBookmarkJump()

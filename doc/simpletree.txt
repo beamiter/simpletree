@@ -128,6 +128,12 @@ under lib/ first, then target/release/ and target/debug/ for development use.
         that last outcome, not from the capability bit, so a root outside any
         repository now says why instead of claiming to be active.
 
+                                                     *:SimpleTreeColumns*
+:SimpleTreeColumns [{column}...]
+        Set |g:simpletree_columns| for this session.  With no argument it
+        toggles between "size mtime" and none; "none" (or "off") clears it.
+        An unknown column name is refused and changes nothing.
+
                                                      *:SimpleTreeVersion*
 :SimpleTreeVersion
         Run the discovered backend with --version and display the result.
@@ -428,6 +434,25 @@ g:simpletree_icons
                                              *g:simpletree_file_icon_map*
 g:simpletree_file_icon_map
         Dictionary, default {}.  Override file icons by lowercase extension.
+
+                                                  *g:simpletree_columns*
+g:simpletree_columns
+        List, default [].  Detail columns rendered to the right of the name,
+        in the given order.  Accepts 'size', 'mtime' and 'symlink'; unknown
+        names are dropped.  Enabling any column makes directory listings ask
+        the backend for metadata, exactly as sorting by mtime or size does, so
+        turning them on may cost one re-scan.  Directories show "-" for size.
+        The block is right-aligned to the tree width and carries the
+        SimpleTreeColumn highlight group (`highlight default link` to Comment).
+
+                                       *g:simpletree_column_time_format*
+g:simpletree_column_time_format
+        String, default '%m-%d %H:%M'.  |strftime()| format for the mtime
+        column.
+
+                                             *g:simpletree_column_sep*
+g:simpletree_column_sep
+        String, default '  '.  Separator between two detail columns.
 
                                              *g:simpletree_collapse_all_key*
 g:simpletree_collapse_all_key

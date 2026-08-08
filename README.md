@@ -16,6 +16,7 @@ SimpleTree 使用 Vim9 script，当前不支持 Neovim。
 - 树内过滤（`F`）走后台递归遍历：匹配整棵树，包括从没展开过的目录，只显示匹配节点和通往它们的目录（强制展开不写进展开状态）；`/` 跳转式查找，`]f` / `[f` 循环匹配。
 - `<Space>` 标记节点（可视模式按选区标记），`c` / `x` / `D` 随即作用于整个标记集合；删除只确认一次，但每条路径的守卫逐个复验。
 - `s` 在名称、扩展名、修改时间、体积排序间循环，`gs` 反转顺序；目录始终优先，元数据按需异步获取并随缓存复用。
+- 可选明细列（`g:simpletree_columns` / `:SimpleTreeColumns`）：体积、修改时间、符号链接标记，右对齐显示在名字右侧，数据来自后台早就返回的 metadata。
 - 树缓冲区按键全部可通过 `g:simpletree_mappings` 覆盖或禁用。
 - `User SimpleTree*` 自动命令事件（打开/关闭/换根/展开/文件操作等），便于第三方集成。
 - 后台限制并发扫描数量、合并协议输出 flush，快速展开大量目录时更稳定；watch 下的目录列表带失效信号缓存。
@@ -244,6 +245,9 @@ SimpleTree 不会覆盖已存在的 `<leader>e` 映射。树缓冲区内全部�
 | `g:simpletree_use_watcher` | `1` | 使用后台文件系统 watch 推送刷新；`0` 回到 mtime 轮询 |
 | `g:simpletree_filter_mode` | `'auto'` | `F` 过滤的数据来源：`auto`（有 `search` 能力就用后台）/ `daemon` / `loaded`（只看已展开部分，历史行为）|
 | `g:simpletree_filter_max_results` | `500` | 后台过滤一次最多收集多少条命中 |
+| `g:simpletree_columns` | `[]` | 名字右侧的明细列：`size` / `mtime` / `symlink`；开启会让列表请求带 metadata |
+| `g:simpletree_column_time_format` | `'%m-%d %H:%M'` | mtime 列的 `strftime()` 格式 |
+| `g:simpletree_column_sep` | `'  '` | 两个明细列之间的分隔 |
 | `g:simpletree_mappings` | `{}` | 树缓冲区按键覆盖表 `{键: action}`；空字符串禁用 |
 
 git 状态高亮组：`SimpleTreeGitModified`、`SimpleTreeGitStaged`、`SimpleTreeGitUntracked`、`SimpleTreeGitConflict`、`SimpleTreeGitDeleted`，均为 `highlight default link`，可在 colorscheme 中覆盖。

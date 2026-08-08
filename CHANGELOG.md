@@ -33,6 +33,25 @@
   `OnPaste()` 返回时目标"还不存在"（Vim 不会在脚本执行期间跑 channel 回调，
   所以这个断言是确定的，不是靠计时），并断言关闭开关后的同步回退仍然工作。
 
+### 新增：体积 / 修改时间 / 符号链接明细列
+
+- `Entry` 早就带着 `size`、`mtime`、`is_symlink`，`meta` 标志早就流经
+  `ScanDirAsync()`，`s_cache_has_metadata` 早就记着哪些快照是"富"的——但这一切
+  只喂给排序比较器。于是"按体积排序"可以，"看见体积"不行。
+- 新增 `g:simpletree_columns`（`size`/`mtime`/`symlink`，默认空）、
+  `g:simpletree_column_time_format`、`g:simpletree_column_sep`，以及
+  `:SimpleTreeColumns [size|mtime|symlink|none]`。开启明细列和按体积/时间排序
+  走同一条"缺 metadata 才重扫"的逻辑，快照已经够富时不会白扫一次。
+- 列插在名字和装饰之间、右对齐到树宽：`●`/`★`/`✓` 的语法匹配全部锚在行尾，
+  把列放到它们右边会让那三个高亮整体失效。列本身用文本属性高亮
+  （`SimpleTreeColumn`，默认 link 到 `Comment`）——名字里什么字符都可能出现，
+  行内正则只能是猜，而渲染期的字节偏移是精确的。
+- 树宽只在开了列的时候进入渲染配置签名：没开列的树不该为一次窗口缩放付出整棵
+  缓存重算的代价。
+- 新增测试：`tests/vim_columns.vim` 覆盖默认关闭、体积格式（`4.0K` / `5B` /
+  目录为 `-`）、右对齐后两行等宽、文本属性存在、时间格式可配、关掉之后行尾
+  恢复原样、未知列名不改配置。
+
 ### 新增：一个根下的多个 git 仓库；根在大仓库内时按子树限定
 
 - `resolve_repo_root()` 只往上走，所以树根是一个"放着若干 checkout 的目录"
