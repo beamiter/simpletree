@@ -236,9 +236,10 @@ m       Toggle a bookmark on the node under the cursor.  Bookmarked entries
         around.
 z       Collapse all directories below the root.  Configure with
         |g:simpletree_collapse_all_key|.
-F       Filter loaded nodes by name; matching entries and their ancestors
-        stay visible.  An empty query clears the filter.  The filter only
-        applies to directories whose listings are already loaded.
+F       Filter the tree by name; matching entries and the directories leading
+        to them stay visible.  An empty query clears the filter.  Matches are
+        found across the whole tree, including directories that have never
+        been expanded — see |simpletree-filter|.
 /       Prompt for a name and jump to the next matching row.
 ]f, [f  Jump to the next / previous match of the last / query.
 ?       Toggle the mapping help window.
@@ -585,6 +586,39 @@ are a single system call, not a walk.
 Without the capability (an older backend, or the option off) the previous
 in-Vim implementation runs unchanged, including
 |g:simpletree_use_system_copy|.
+
+TREE FILTER ~
+                                                       *simpletree-filter*
+F prompts for a substring and narrows the tree to the entries whose name
+contains it, plus the directories on the way to them, which are expanded for
+as long as the filter is active.  That expansion is a rendering decision only:
+clearing the filter restores exactly the directories you had open, not the
+ones the filter needed.
+
+Matches come from the backend's recursive walk, the same one |:SimpleTreeSearch|
+uses, so a filter finds a file in a directory you have never expanded.  Results
+stream in, and the statusline shows filter:{query} followed by "…" while more
+are still arriving, or by "(N+)" when the walk stopped at
+|g:simpletree_filter_max_results|.  Retyping the filter supersedes the previous
+walk; a chunk from an abandoned query cannot put its matches back on screen.
+An explicit |:SimpleTreeRefresh| re-runs the walk, because a refresh means the
+filesystem changed.
+
+Set |g:simpletree_filter_mode| to 'loaded' for the historical behaviour, in
+which the filter only inspects directories whose listing is already cached.
+That is also the automatic fallback against a backend that does not advertise
+the "search" capability, where the filter cannot see beyond what is loaded.
+
+                                            *g:simpletree_filter_mode*
+g:simpletree_filter_mode
+        String, default 'auto'.  One of 'auto', 'daemon', 'loaded'.  'auto'
+        uses the backend when it advertises "search" and falls back to
+        'loaded' otherwise.
+
+                                     *g:simpletree_filter_max_results*
+g:simpletree_filter_max_results
+        Number, default 500, clamped to 1..5000.  Upper bound on the matches a
+        single filter collects.
 
 MARKED NODES ~
                                                         *simpletree-marks*

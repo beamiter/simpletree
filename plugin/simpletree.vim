@@ -33,6 +33,14 @@ def NormalizeSortMode(value: any): string
   return index(['name', 'extension', 'mtime', 'size'], mode) >= 0 ? mode : 'name'
 enddef
 
+def NormalizeFilterMode(value: any): string
+  if type(value) != v:t_string
+    return 'auto'
+  endif
+  var mode = tolower(trim(value))
+  return index(['auto', 'daemon', 'loaded'], mode) >= 0 ? mode : 'auto'
+enddef
+
 def NormalizeFlag(value: any, fallback: number = 0): number
   if type(value) == v:t_number
     return value != 0 ? 1 : 0
@@ -250,6 +258,11 @@ g:simpletree_git_status = get(g:, 'simpletree_git_status', 1)
 g:simpletree_git_status_symbols = get(g:, 'simpletree_git_status_symbols', {})
 # 使用后端文件系统 watch 推送刷新；关闭后回到 mtime 轮询
 g:simpletree_use_watcher = get(g:, 'simpletree_use_watcher', 1)
+# F 过滤的数据来源：'auto'（有 search 能力就用后端）/'daemon'/'loaded'
+# 'loaded' 是历史行为——只看已经展开过的目录，刚打开的树里那等于什么也搜不到
+g:simpletree_filter_mode = NormalizeFilterMode(get(g:, 'simpletree_filter_mode', 'auto'))
+# 后端过滤一次最多接收多少条命中
+g:simpletree_filter_max_results = ClampNumber(get(g:, 'simpletree_filter_max_results', 500), 500, 1, 5000)
 # 树缓冲区按键覆盖表：{键: action}；action 为空字符串表示禁用该键
 g:simpletree_mappings = get(g:, 'simpletree_mappings', {})
 

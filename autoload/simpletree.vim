@@ -178,7 +178,13 @@ var s_git_last_ok: number = 0
 
 # 树内过滤：只作用于已加载缓存的节点
 var s_filter_query: string = ''
-var s_filter_memo: dict<bool> = {}    # dir -> 已加载后代中是否有匹配
+var s_filter_memo: dict<bool> = {}       # dir -> 已加载后代中是否有匹配（'loaded' 模式）
+var s_filter_daemon: bool = false        # 当前过滤集合来自后端 search
+var s_filter_hits: dict<bool> = {}       # 匹配到的路径
+var s_filter_ancestors: dict<bool> = {}  # 匹配路径到根之间的每一级目录
+var s_filter_search_id: number = 0
+var s_filter_pending: bool = false
+var s_filter_truncated: bool = false
 
 # 跳转式查找
 var s_find_query: string = ''
@@ -2255,6 +2261,31 @@ def GitCodeFor(path: string): string
 enddef
 
 # ---------------- 树内过滤 ----------------
+# 过滤有两种数据来源。
+#
+# 'loaded'：只看 s_cache，也就是用户手动展开过的部分。刚打开一棵树时那部分是
+# 空的，于是 F + router 什么也找不到——看起来像功能坏了，而不像一条有文档的
+# 限制。这是历史行为，保留为回退。
+#
+# 'daemon'：把同一条递归 search 请求（quickfix 搜索用的那条）的结果当成过滤
+# 集合。匹配到的路径显示，通往它们的目录也显示并在渲染期强制展开——强制展开
+# 不写进 s_state，清掉过滤之后用户自己的展开状态原样回来。
+def FilterMode(): string
+  var mode = get(g:, 'simpletree_filter_mode', 'auto')
+  if type(mode) != v:t_string || index(['auto', 'loaded', 'daemon'], mode) < 0
+    mode = 'auto'
+  endif
+  return mode ==# 'auto' ? (HasCap('search') ? 'daemon' : 'loaded') : mode
+enddef
+
+def FilterMaxResults(): number
+  var maximum = get(g:, 'simpletree_filter_max_results', 500)
+  if type(maximum) != v:t_number || maximum < 1
+    return 500
+  endif
+  return maximum > 5000 ? 5000 : maximum
+enddef
+
 def FilterActive(): bool
   return s_filter_query !=# ''
 enddef
@@ -2289,10 +2320,136 @@ def FilterAllowsEntry(e: dict<any>): bool
   if !FilterActive()
     return true
   endif
+  if s_filter_daemon
+    # 后端结果覆盖整棵树，所以"没在结果里"就是真的不匹配，而不是"还没展开"。
+    return has_key(s_filter_hits, e.path)
+      || (e.is_dir && has_key(s_filter_ancestors, e.path))
+  endif
   if NameMatchesFilter(e.name)
     return true
   endif
   return e.is_dir && DirHasFilterMatch(e.path)
+enddef
+
+# 通往匹配项的目录必须在渲染时展开，否则深层匹配没有一条能走到它的路。刻意
+# 不落到 s_state：清掉过滤之后，用户自己的展开状态必须原样回来。
+def FilterForcesExpand(path: string): bool
+  return s_filter_daemon && FilterActive() && has_key(s_filter_ancestors, path)
+enddef
+
+def NodeExpanded(path: string): bool
+  return GetNodeState(path).expanded || FilterForcesExpand(path)
+enddef
+
+# 记下从匹配项到根之间的每一级目录。往上走时碰到已经记过的那一级就可以停：
+# 它上面的祖先必然也已经记过，深树下这把 O(命中数 × 深度) 摊成接近线性。
+def RecordFilterAncestors(path: string)
+  var parent = ParentDir(path)
+  while parent !=# '' && !PathEq(parent, s_root) && IsSubPath(s_root, parent)
+    if has_key(s_filter_ancestors, parent)
+      return
+    endif
+    s_filter_ancestors[parent] = true
+    var next = ParentDir(parent)
+    if PathEq(next, parent)
+      return
+    endif
+    parent = next
+  endwhile
+enddef
+
+def CancelFilterSearch()
+  if s_filter_search_id != 0
+    try | BCancel(s_filter_search_id) | catch | endtry
+    s_filter_search_id = 0
+  endif
+  s_filter_pending = false
+enddef
+
+def ClearFilterHits()
+  CancelFilterSearch()
+  s_filter_hits = {}
+  s_filter_ancestors = {}
+  s_filter_truncated = false
+enddef
+
+def StartFilterSearch(query: string)
+  ClearFilterHits()
+  if query ==# '' || s_root ==# '' || !BEnsureBackend() || !HasCap('search')
+    return
+  endif
+  var id = BNextId()
+  s_filter_search_id = id
+  s_filter_pending = true
+  var maximum = FilterMaxResults()
+  s_bcbs[id] = {
+    OnChunk: (entries) => {
+      # 上一次过滤的分块迟到时必须丢掉：它属于一个用户已经不再看的查询。
+      if id != s_filter_search_id
+        return
+      endif
+      var added = false
+      for e in entries
+        if has_key(s_filter_hits, e.path)
+          continue
+        endif
+        s_filter_hits[e.path] = true
+        RecordFilterAncestors(e.path)
+        added = true
+      endfor
+      if added
+        # 结果是流式到达的，每一批都会改变可见集合；不失效渲染缓存的话，先到
+        # 的几条会一直是屏幕上的全部内容。
+        BumpRenderEpoch()
+        ScheduleRender()
+      endif
+    },
+    OnDone: () => {
+      if id != s_filter_search_id
+        return
+      endif
+      s_filter_search_id = 0
+      s_filter_pending = false
+      s_filter_truncated = len(s_filter_hits) >= maximum
+      BumpRenderEpoch()
+      ScheduleRender()
+    },
+    OnError: (msg) => {
+      if id != s_filter_search_id
+        return
+      endif
+      s_filter_search_id = 0
+      s_filter_pending = false
+      echohl WarningMsg
+      echom '[SimpleTree] filter search failed: ' .. msg
+      echohl None
+      ScheduleRender()
+    },
+  }
+  if !BSend({type: 'search', id: id, root: s_root, query: query, mode: 'substring',
+      max_results: maximum, show_hidden: !s_hide_dotfiles, git_ignore: s_git_ignore})
+    if has_key(s_bcbs, id)
+      call remove(s_bcbs, id)
+    endif
+    s_filter_search_id = 0
+    s_filter_pending = false
+  endif
+enddef
+
+# 所有设置过滤的入口都走这里，包括测试钩子：模式判定、命中集合和渲染失效必须
+# 只有一份。
+def ApplyFilter(query: string)
+  s_filter_query = query
+  s_filter_memo = {}
+  s_filter_daemon = query !=# '' && FilterMode() ==# 'daemon'
+  if s_filter_daemon
+    StartFilterSearch(query)
+  else
+    ClearFilterHits()
+  endif
+  BumpRenderEpoch()
+  Emit('FilterChanged', {query: query})
+  Render()
 enddef
 
 export def OnFilter()
@@ -2302,11 +2459,7 @@ export def OnFilter()
   catch
     return
   endtry
-  s_filter_query = q
-  s_filter_memo = {}
-  BumpRenderEpoch()
-  Emit('FilterChanged', {query: q})
-  Render()
+  ApplyFilter(q)
   if q ==# ''
     echo '[SimpleTree] filter cleared'
   endif
@@ -3072,7 +3225,9 @@ def SubtreeValid(path: string, depth: number, entries: list<dict<any>>): bool
   endif
   # 只需要检查目录子节点:文件行的内容完全由 entries 与 epoch 决定。
   for pair in rec.dirs
-    if GetNodeState(pair[0]).expanded != pair[1]
+    # NodeExpanded()，不是 s_state：过滤强制展开的目录也必须参与有效性判断，
+    # 否则清掉过滤之后缓存里还留着被强制展开的那棵子树。
+    if NodeExpanded(pair[0]) != pair[1]
       return false
     endif
     if pair[1] && !SubtreeValidPath(pair[0], depth + 1)
@@ -3091,7 +3246,7 @@ def BuildLines(path: string, depth: number, lines: list<string>, idx: list<dict<
 enddef
 
 def BuildSubtree(path: string, depth: number): dict<any>
-  var want = GetNodeState(path).expanded
+  var want = NodeExpanded(path)
   if !want
     return {lines: [], idx: []}
   endif
@@ -3152,7 +3307,7 @@ def BuildSubtree(path: string, depth: number): dict<any>
     var expanded = false
     var icon = ''
     if e.is_dir
-      expanded = GetNodeState(e.path).expanded
+      expanded = NodeExpanded(e.path)
       icon = expanded ? s_icons.dir_open : s_icons.dir
       dirs->add([e.path, expanded])
     else
@@ -3504,6 +3659,8 @@ enddef
 # 已经看不见的路径上，旧根还会一直被 watch 着。
 def DiscardRootScopedState()
   UnwatchAllDirs()
+  # 命中集合是按根算出来的：换根之后它们指向的是一批屏幕上看不见的路径。
+  ClearFilterHits()
   # 换根后旧根下的标记不再可见，留着只会让下一次批量操作作用在看不见的路径上。
   ClearMarks()
   s_git_status = {}
@@ -5041,6 +5198,11 @@ export def Refresh()
   s_scan_errors = {}
   # 清空修改时间缓存，强制重新检测
   s_dir_mtimes = {}
+  # 后端过滤的命中集合是上一次遍历的快照。刷新的意思正是"磁盘变了"，所以它
+  # 必须跟着重算，否则过滤视图会一直显示已经删掉的路径。
+  if s_filter_daemon && FilterActive()
+    StartFilterSearch(s_filter_query)
+  endif
   if s_root !=# ''
     ScanDirAsync(s_root)
   endif
@@ -5850,7 +6012,15 @@ export def StatusLine(): string
     flags->add('hidden:on')
   endif
   if FilterActive()
-    flags->add('filter:' .. s_filter_query)
+    # 后端过滤是流式到达的，"没有更多结果了"和"结果还在路上"看起来一模一样；
+    # 截断同理，否则用户会以为剩下的文件不存在。
+    var filter_flag = 'filter:' .. s_filter_query
+    if s_filter_pending
+      filter_flag ..= '…'
+    elseif s_filter_truncated
+      filter_flag ..= printf('(%d+)', len(s_filter_hits))
+    endif
+    flags->add(filter_flag)
   endif
   if !empty(s_marked)
     flags->add('marked:' .. len(s_marked))
@@ -5956,11 +6126,7 @@ export def TestSetRenderCache(enabled: bool)
 enddef
 
 export def TestSetFilter(q: string)
-  s_filter_query = q
-  s_filter_memo = {}
-  BumpRenderEpoch()
-  Emit('FilterChanged', {query: q})
-  Render()
+  ApplyFilter(q)
 enddef
 
 export def TestGetState(): dict<any>

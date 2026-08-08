@@ -12,7 +12,7 @@ SimpleTree 使用 Vim9 script，当前不支持 Neovim。
 - git status 标记：逐文件状态（修改/暂存/未跟踪/冲突/删除）与目录聚合标记，含符号与配色，可完全自定义或关闭。
 - 后台递归搜索：`:SimpleTreeSearch` 支持 substring / fuzzy 匹配，结果流式写入 quickfix。
 - 复制与移动由后台执行（`fs-ops` 能力）：粘贴一个大目录不再冻结编辑器，策略校验与提示仍全部留在 Vim 侧。
-- 树内过滤（`F`）只显示匹配节点及其祖先；`/` 跳转式查找，`]f` / `[f` 循环匹配。
+- 树内过滤（`F`）走后台递归遍历：匹配整棵树，包括从没展开过的目录，只显示匹配节点和通往它们的目录（强制展开不写进展开状态）；`/` 跳转式查找，`]f` / `[f` 循环匹配。
 - `<Space>` 标记节点（可视模式按选区标记），`c` / `x` / `D` 随即作用于整个标记集合；删除只确认一次，但每条路径的守卫逐个复验。
 - `s` 在名称、扩展名、修改时间、体积排序间循环，`gs` 反转顺序；目录始终优先，元数据按需异步获取并随缓存复用。
 - 树缓冲区按键全部可通过 `g:simpletree_mappings` 覆盖或禁用。
@@ -241,6 +241,8 @@ SimpleTree 不会覆盖已存在的 `<leader>e` 映射。树缓冲区内全部�
 | `g:simpletree_git_status` | `1` | 显示 git 状态标记（需要后台 `git-status` 能力与 git 可执行） |
 | `g:simpletree_git_status_symbols` | `{}` | 覆盖状态符号，键为 `M/S/U/C/D` |
 | `g:simpletree_use_watcher` | `1` | 使用后台文件系统 watch 推送刷新；`0` 回到 mtime 轮询 |
+| `g:simpletree_filter_mode` | `'auto'` | `F` 过滤的数据来源：`auto`（有 `search` 能力就用后台）/ `daemon` / `loaded`（只看已展开部分，历史行为）|
+| `g:simpletree_filter_max_results` | `500` | 后台过滤一次最多收集多少条命中 |
 | `g:simpletree_mappings` | `{}` | 树缓冲区按键覆盖表 `{键: action}`；空字符串禁用 |
 
 git 状态高亮组：`SimpleTreeGitModified`、`SimpleTreeGitStaged`、`SimpleTreeGitUntracked`、`SimpleTreeGitConflict`、`SimpleTreeGitDeleted`，均为 `highlight default link`，可在 colorscheme 中覆盖。

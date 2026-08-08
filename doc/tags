@@ -29,6 +29,8 @@ g:simpletree_collapse_all_key	simpletree.txt	/*g:simpletree_collapse_all_key*
 g:simpletree_daemon_path	simpletree.txt	/*g:simpletree_daemon_path*
 g:simpletree_debug	simpletree.txt	/*g:simpletree_debug*
 g:simpletree_file_icon_map	simpletree.txt	/*g:simpletree_file_icon_map*
+g:simpletree_filter_max_results	simpletree.txt	/*g:simpletree_filter_max_results*
+g:simpletree_filter_mode	simpletree.txt	/*g:simpletree_filter_mode*
 g:simpletree_folder_suffix	simpletree.txt	/*g:simpletree_folder_suffix*
 g:simpletree_git_ignore	simpletree.txt	/*g:simpletree_git_ignore*
 g:simpletree_git_status	simpletree.txt	/*g:simpletree_git_status*
@@ -66,6 +68,7 @@ simpletree-commands	simpletree.txt	/*simpletree-commands*
 simpletree-contents	simpletree.txt	/*simpletree-contents*
 simpletree-daemon	simpletree.txt	/*simpletree-daemon*
 simpletree-events	simpletree.txt	/*simpletree-events*
+simpletree-filter	simpletree.txt	/*simpletree-filter*
 simpletree-fsops	simpletree.txt	/*simpletree-fsops*
 simpletree-install	simpletree.txt	/*simpletree-install*
 simpletree-mappings	simpletree.txt	/*simpletree-mappings*
