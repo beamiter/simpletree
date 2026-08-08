@@ -98,7 +98,7 @@ git clone https://github.com/beamiter/simpletree.git \
 | `:SimpleTreeClose` | 保存当前宽度并关闭当前 tabpage 的树窗口（本 tab 没有则全部关闭） |
 | `:SimpleTreeDebug` | 输出窗口、根目录、后台和缓存状态 |
 | `:SimpleTreeStats[!]` | 查看渲染耗时、buffer diff 与子树缓存命中；`!` 仅重置计数 |
-| `:SimpleTreeHealth` | 检查 Vim 功能、配置范围、后台路径及系统 provider |
+| `:SimpleTreeHealth` | 检查 Vim 功能、配置范围、后台路径与新旧、最近一次 git status 结果、当前会话与在途请求 |
 | `:SimpleTreeVersion` | 输出当前发现的 Rust 后台版本 |
 | `:SimpleTreeToggleAutoRefresh` | 会话内切换自动刷新 |
 | `:SimpleTreeToggleAutoFollow` | 会话内切换活动文件跟随 |
@@ -339,6 +339,17 @@ let g:simpletree_width_state_file = expand('~/.vim/simpletree-width')
 ```vim
 let g:simpletree_daemon_path = '/absolute/path/to/simpletree-daemon'
 ```
+
+### 更新插件后行为异常 / git 标记不出现
+
+先看 `:SimpleTreeHealth`：
+
+- `[!!] backend build: binary built ... but src/... changed ...` 说明插件管理器
+  更新了 Vim 侧文件却没有重新构建 daemon。跑一次 `./install.sh`，再
+  `:SimpleTreeRestart`。
+- `git status: last query failed: ...` 会原样带出后台的错误文本（例如树根不在
+  任何 git 仓库内）。这一行报的是最近一次查询的真实结果，不是能力位。
+- `session:` / `requests:` 两行给出当前根、树窗口数、在途扫描与回调数量。
 
 ### 树中出现 `!` 扫描错误
 

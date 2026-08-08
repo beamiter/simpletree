@@ -4,6 +4,26 @@
 
 ## Unreleased - 2026-08-05
 
+### `:SimpleTreeHealth` 能回答"为什么不工作了"
+
+- 检测过期的 `lib/simpletree-daemon`：把二进制的 mtime 与仓库里最新的
+  `src/**/*.rs`、`Cargo.toml`、`Cargo.lock` 比较，落后就报
+  `[!!] backend build: ... — run ./install.sh, then :SimpleTreeRestart`，
+  并计入最终的 ready 判定。插件管理器更新了 Vim 侧文件却没重新构建 daemon，
+  是这套插件最常见也最难自己看出来的故障。源码不在旁边（从发行包安装）时
+  明说无法比较，不猜。
+- `git status` 不再从能力位推断出 `active`。`GitStatusRefresh()` 过去发请求
+  时不注册回调，而 `DispatchLine()` 只在 `s_bcbs` 里有对应 id 时才分发
+  `error`，于是树根不在 git 仓库内、索引损坏这类失败被彻底丢弃——树上没有
+  标记，也没有任何解释，Health 还说一切正常。现在每个请求都带回调，Health
+  报的是最近一次查询的真实结果，失败时原样带出后台的错误文本；成功事件按
+  id 摘除回调，不留下泄漏的关联项。
+- 新增 CONTEXT 行：当前会话（打开/关闭、根、树窗口数）、在途扫描与回调数、
+  缓存目录数，以及第一个扫描失败的目录及其错误。
+- 新增 `tests/vim_health.vim`：树根不在 git 仓库时必须报出后台错误且不得出现
+  `git status: active`、失败请求不得泄漏 `s_bcbs` 条目、二进制新旧比较的三种
+  结果（旧 / 新 / 无法比较）。
+
 ### 新增：标记与批量操作
 
 - `<Space>` 标记/取消标记光标节点并下移一行；可视模式下同一个键按整段选区

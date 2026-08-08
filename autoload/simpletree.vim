@@ -1,5 +1,10 @@
 vim9script
 
+# 本插件仓库根目录。<sfile> 在 def 内不可用（E1245），所以在脚本层求一次值。
+# Health() 用它把 lib/ 里的 daemon 和 src/ 里的 Rust 源码做新旧比较——插件
+# 管理器更新了 Vim 侧文件却没重新构建 daemon，是这套插件最常见的故障。
+const PLUGIN_ROOT: string = expand('<sfile>:p:h:h')
+
 def NFEnabled(): bool
   return !!get(g:, 'simpletree_use_nerdfont', 0)
 enddef
@@ -165,6 +170,11 @@ var s_fs_refresh_timer: number = 0
 var s_git_status: dict<any> = {}
 var s_git_repo_root: string = ''
 var s_git_timer: number = 0
+# git_status 的结果只在成功时才有事件；失败时 daemon 回的是一条 error。
+# 记下最近一次的结果，:SimpleTreeHealth 才能说出"为什么没有标记"，而不是
+# 从一个能力位推断出"active"——根目录不在仓库里时那句话是错的。
+var s_git_last_error: string = ''
+var s_git_last_ok: number = 0
 
 # 树内过滤：只作用于已加载缓存的节点
 var s_filter_query: string = ''
@@ -1529,6 +1539,8 @@ def ResetBackendSessionState()
   s_git_status = {}
   BumpRenderEpoch()
   s_git_repo_root = ''
+  s_git_last_error = ''
+  s_git_last_ok = 0
 enddef
 
 # doautocmd User SimpleTree{name}；无监听零开销。数据经 g:simpletree_event 传递。
@@ -1705,6 +1717,30 @@ def GitStatusEnabled(): bool
   return !!get(g:, 'simpletree_git_status', 1) && HasCap('git-status')
 enddef
 
+# git_status 曾经是"发出去就不管"：DispatchLine() 只在 s_bcbs 里有对应 id 时
+# 才分发 error，所以树根不在 git 仓库内、索引损坏这类失败连一行日志都没有,
+# 而 :SimpleTreeHealth 还从能力位断言 "git status: active"。现在每个请求都带
+# 一个真回调；成功路径由 OnGitStatusEvent() 按 id 摘除。
+def SendGitStatus(force: bool)
+  var req_id = BNextId()
+  s_bcbs[req_id] = {
+    OnChunk: (_) => {
+    },
+    OnDone: () => {
+    },
+    OnError: (msg) => {
+      s_git_last_error = msg
+      Log('git status failed: ' .. msg, 'WarningMsg')
+    },
+  }
+  if !BSend({type: 'git_status', id: req_id, path: s_root, force: force})
+    if has_key(s_bcbs, req_id)
+      call remove(s_bcbs, req_id)
+    endif
+    s_git_last_error = 'failed to send git_status request'
+  endif
+enddef
+
 def GitStatusRefresh(force: bool = false)
   if !GitStatusEnabled() || s_root ==# '' || !s_open
     return
@@ -1721,11 +1757,15 @@ def GitStatusRefresh(force: bool = false)
     if !s_open || session_generation != s_session_generation
       return
     endif
-    BSend({type: 'git_status', id: BNextId(), path: s_root, force: force})
+    SendGitStatus(force)
   })
 enddef
 
 def OnGitStatusEvent(ev: dict<any>)
+  var event_id = get(ev, 'id', 0)
+  if event_id != 0 && has_key(s_bcbs, event_id)
+    remove(s_bcbs, event_id)
+  endif
   if !s_open
     return
   endif
@@ -1733,6 +1773,8 @@ def OnGitStatusEvent(ev: dict<any>)
   if type(statuses) != v:t_dict
     return
   endif
+  s_git_last_error = ''
+  s_git_last_ok = localtime()
   s_git_status = statuses
   BumpRenderEpoch()
   s_git_repo_root = get(ev, 'repo_root', '')
@@ -5069,6 +5111,48 @@ export def Stats(reset: bool = false)
 enddef
 
 
+# 后台二进制是否比 Rust 源码旧。仓库自带源码时这是一个确定的判断：
+# `Plug 'beamiter/simpletree'` 更新了 autoload/ 和 src/ 却没跑 install.sh，
+# lib/simpletree-daemon 就停留在旧协议上，症状是能力握手缺项、请求静默失败。
+# 返回 {known, stale, binary_time, source_time, newest}。
+def BackendFreshness(backend: string): dict<any>
+  var result = {known: false, stale: false, binary_time: 0, source_time: 0, newest: ''}
+  if backend ==# '' || !filereadable(backend)
+    return result
+  endif
+  var binary_time = getftime(backend)
+  if binary_time < 0
+    return result
+  endif
+  # 只在源码就在旁边时才判断；从 release 包安装的用户没有 src/。
+  var sources = glob(PLUGIN_ROOT .. '/src/**/*.rs', true, true)
+  for extra in ['/Cargo.toml', '/Cargo.lock']
+    if filereadable(PLUGIN_ROOT .. extra)
+      sources->add(PLUGIN_ROOT .. extra)
+    endif
+  endfor
+  if empty(sources)
+    return result
+  endif
+  var newest = ''
+  var source_time = 0
+  for path in sources
+    var mtime = getftime(path)
+    if mtime > source_time
+      source_time = mtime
+      newest = path
+    endif
+  endfor
+  result.known = true
+  result.binary_time = binary_time
+  result.source_time = source_time
+  result.newest = stridx(newest, PLUGIN_ROOT .. '/') == 0
+    ? strpart(newest, len(PLUGIN_ROOT) + 1)
+    : newest
+  result.stale = source_time > binary_time
+  return result
+enddef
+
 def HealthItem(ok: bool, label: string, detail: string = '')
   echohl ok ? 'MoreMsg' : 'ErrorMsg'
   echom printf('  %s %s%s', ok ? '[ok]' : '[!!]', label,
@@ -5104,6 +5188,21 @@ export def Health()
   HealthItem(async_ok, 'async job/channel/json support')
   HealthItem(float_ok, 'floating-point support')
   HealthItem(backend_ok, 'simpletree-daemon', backend_ok ? backend : 'run ./install.sh or set g:simpletree_daemon_path')
+  var fresh = backend_ok ? BackendFreshness(backend) : {known: false, stale: false}
+  var build_ok = !get(fresh, 'stale', false)
+  if backend_ok
+    if !get(fresh, 'known', false)
+      echom '  [--] backend build: cannot compare (no Rust sources beside the plugin)'
+    else
+      HealthItem(build_ok, 'backend build',
+        fresh.stale
+          ? printf('binary built %s but %s changed %s — run ./install.sh, then :SimpleTreeRestart',
+              strftime('%Y-%m-%d %H:%M', fresh.binary_time),
+              fresh.newest,
+              strftime('%Y-%m-%d %H:%M', fresh.source_time))
+          : 'newer than the Rust sources (' .. strftime('%Y-%m-%d %H:%M', fresh.binary_time) .. ')')
+    endif
+  endif
   HealthItem(g:simpletree_page >= 1 && g:simpletree_page <= 1000,
     'page size', string(g:simpletree_page))
   HealthItem(g:simpletree_width >= 10 && g:simpletree_width <= 500,
@@ -5141,14 +5240,46 @@ export def Health()
   for line in simpletree#core#HealthLines()
     echom '  ' .. line
   endfor
-  echom '  [--] git status: ' .. (!get(g:, 'simpletree_git_status', 1)
-    ? 'disabled'
-    : (HasCap('git-status') ? 'active' : 'waiting for backend capability'))
+  # git 状态过去是从能力位推断出 "active" 的，即使每一次查询都失败。
+  # 现在报的是最近一次查询的真实结果。
+  var git_detail = ''
+  if !get(g:, 'simpletree_git_status', 1)
+    git_detail = 'disabled'
+  elseif !executable('git')
+    git_detail = 'no git executable on $PATH'
+  elseif !HasCap('git-status')
+    git_detail = len(s_backend_caps) > 0
+      ? 'backend does not advertise the git-status capability'
+      : 'not connected yet; open the tree first'
+  elseif s_git_last_error !=# ''
+    git_detail = 'last query failed: ' .. s_git_last_error
+  elseif s_git_last_ok > 0
+    git_detail = printf('%d entr%s from %s, last updated %s',
+      len(s_git_status), len(s_git_status) == 1 ? 'y' : 'ies',
+      (s_git_repo_root ==# '' ? '(unknown repo)' : s_git_repo_root),
+      strftime('%H:%M:%S', s_git_last_ok))
+  else
+    git_detail = 'capability present, no reply yet'
+  endif
+  echom '  [--] git status: ' .. git_detail
   echom '  [--] fs watch: ' .. (!get(g:, 'simpletree_use_watcher', 1)
     ? 'disabled (mtime polling)'
     : (HasCap('watch') ? ('active, ' .. len(s_watched) .. ' dir(s)') : 'waiting for backend capability (mtime polling)'))
 
-  if vim_ok && async_ok && float_ok && backend_ok
+  # 上下文：这个会话此刻到底在做什么。"为什么没反应" 的答案通常在这三行里。
+  echom '  [--] session: ' .. (s_open
+    ? printf('open, root %s, %d tree window(s)', s_root, len(TreeWindows()))
+    : 'closed')
+  echom printf('  [--] requests: %d pending scan(s), %d in-flight callback(s), %d cached dir(s)',
+    len(s_pending), len(s_bcbs), len(s_cache))
+  if !empty(s_scan_errors)
+    var failed = sort(keys(s_scan_errors))
+    echom printf('  [--] scan errors: %d director%s, e.g. %s: %s',
+      len(failed), len(failed) == 1 ? 'y' : 'ies',
+      failed[0], s_scan_errors[failed[0]])
+  endif
+
+  if vim_ok && async_ok && float_ok && backend_ok && build_ok
     echohl MoreMsg | echom '[SimpleTree] ready' | echohl None
   else
     echohl ErrorMsg | echom '[SimpleTree] not ready; resolve the [!!] item(s) above' | echohl None

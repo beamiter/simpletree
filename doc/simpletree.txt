@@ -118,6 +118,16 @@ under lib/ first, then target/release/ and target/debug/ for development use.
         Check required Vim features, normalized configuration ranges, the
         backend executable, and detected trash and clipboard providers.
 
+        Also reported: whether lib/simpletree-daemon is older than the Rust
+        sources shipped beside it — the usual state after a plugin-manager
+        update that did not rebuild, whose remedy is ./install.sh followed by
+        |:SimpleTreeRestart|; the outcome of the most recent git-status query,
+        including the backend's own error text when it failed; and the live
+        session — root, tree windows, pending scans, in-flight callbacks and
+        the first directory whose scan failed.  Git status is reported from
+        that last outcome, not from the capability bit, so a root outside any
+        repository now says why instead of claiming to be active.
+
                                                      *:SimpleTreeVersion*
 :SimpleTreeVersion
         Run the discovered backend with --version and display the result.
