@@ -1627,8 +1627,10 @@ def WatchExpandedDirs()
     return
   endif
   WatchDir(s_root)
+  # s_state 跨换根保留（旧根的展开状态在回到那棵树时还要用），所以这里必须按当前
+  # 根过滤：否则换根后旧根下的目录会被重新 watch，事件推回来也没有对应的行。
   for [p, st] in items(s_state)
-    if get(st, 'expanded', v:false) && isdirectory(p)
+    if get(st, 'expanded', v:false) && IsSubPath(s_root, p) && isdirectory(p)
       WatchDir(p)
     endif
   endfor
@@ -3434,6 +3436,19 @@ enddef
 # =============================================================
 # 根路径切换与锁定
 # =============================================================
+# 换根时必须丢掉的、只对旧根有意义的状态。SetRoot() 之外 Toggle() 也会换根
+# (`:SimpleTree {dir}`)，两条路径必须做同样的清理，否则 c/x/D 会作用在换根后
+# 已经看不见的路径上，旧根还会一直被 watch 着。
+def DiscardRootScopedState()
+  UnwatchAllDirs()
+  # 换根后旧根下的标记不再可见，留着只会让下一次批量操作作用在看不见的路径上。
+  ClearMarks()
+  s_git_status = {}
+  s_git_repo_root = ''
+  s_filter_memo = {}
+  BumpRenderEpoch()
+enddef
+
 def SetRoot(new_root: string, lock: bool = false)
   var nr = CanonDir(new_root)
   if !IsDir(nr)
@@ -3443,14 +3458,7 @@ def SetRoot(new_root: string, lock: bool = false)
     return
   endif
   var old_root = s_root
-  UnwatchAllDirs()
-  # 换根后旧根下的标记不再可见，留着只会让下一次批量操作作用在看不见的路径上。
-  ClearMarks()
-  s_git_status = {}
-  BumpRenderEpoch()
-  s_git_repo_root = ''
-  s_filter_memo = {}
-  BumpRenderEpoch()
+  DiscardRootScopedState()
   s_root = nr
   if lock
     s_root_locked = true
@@ -4840,13 +4848,18 @@ export def Toggle(root: string = '')
     endif
   endif
 
-  s_root = CanonDir(rootArg)
-  if !IsDir(s_root)
+  var new_root = CanonDir(rootArg)
+  if !IsDir(new_root)
     echohl ErrorMsg
-    echom '[SimpleTree] invalid root: ' .. s_root
+    echom '[SimpleTree] invalid root: ' .. new_root
     echohl None
     return
   endif
+  # `:SimpleTree {dir}` 也是一次换根：和 SetRoot() 一样丢掉只对旧根有意义的状态。
+  if s_root !=# '' && new_root !=# s_root
+    DiscardRootScopedState()
+  endif
+  s_root = new_root
 
   # 会话代号只在真正新开一个会话时前进。给已有会话加第二个 tab 窗口时
   # 递增它会让所有在途扫描的回调静默作废，而 s_pending 还留着它们的 id。

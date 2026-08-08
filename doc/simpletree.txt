@@ -569,9 +569,10 @@ described in |simpletree-safety| individually — an unsaved buffer or a path th
 changed while the prompt was open fails that item only, and the failures are
 reported together.
 
-The workspace root can never be marked.  Marks are cleared when the root
-changes and after a successful paste; a refresh keeps them but drops any whose
-path no longer exists.
+The workspace root can never be marked.  Marks are cleared whenever the root
+changes — by a tree key (., d, C, root-up), by auto-follow, or by |:SimpleTree|
+{dir} from any tab page — and after a successful paste; a refresh keeps them but
+drops any whose path no longer exists.
 
 ==============================================================================
 10. TAB PAGES                                       *simpletree-tabpages*

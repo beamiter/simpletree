@@ -22,6 +22,11 @@ call mkdir(s:root .. '/moved', 'p')
 call writefile(['one'], s:root .. '/one.txt')
 call writefile(['two'], s:root .. '/two.txt')
 call writefile(['three'], s:root .. '/three.txt')
+" A second workspace, used at the end to pin that a root change drops the marks
+" made under the old root.
+let s:other = tempname()
+call mkdir(s:other, 'p')
+call writefile(['bee'], s:other .. '/bee.txt')
 
 let g:simpletree_persist_width = 0
 let g:simpletree_daemon_path = s:daemon
@@ -274,6 +279,47 @@ call simpletree#Refresh()
 sleep 500m
 call assert_equal([], s:Marked(), 'refresh kept a mark on a vanished path')
 
+" ---------------------------------------------------------------- root change ---
+
+" Marks belong to the root they were made under: once the root changes they are
+" no longer on screen, and c / x / D would silently act on paths the user cannot
+" see.  ':SimpleTree {dir}' re-roots just like '.', 'd', 'C' and root-up do, so
+" it has to clear them too — including the re-root from a second tab page, which
+" |simpletree-tabpages| explicitly recommends.
+
+call s:SelectPath(s:root .. '/two.txt')
+call simpletree#OnMarkToggle()
+sleep 100m
+call assert_equal([s:root .. '/two.txt'], s:Marked())
+let s:watched_before = keys(s:Vars().s_watched)
+
+tabnew
+execute 'SimpleTree ' .. fnameescape(s:other)
+sleep 600m
+call assert_equal(s:other, simpletree#GetRoot(), ':SimpleTree {dir} did not re-root')
+call assert_equal([], s:Marked(), 'a re-root from another tab kept the old root''s marks')
+call assert_false(simpletree#StatusLine() =~# 'marked:',
+      \ 'the statusline still counts marks from the old root')
+" The old root's watches belong to the old root as well; without this the tree
+" keeps receiving fs events for a directory it no longer shows.
+if !empty(s:watched_before)
+  call assert_equal([], filter(keys(s:Vars().s_watched), 'stridx(v:val, s:root) == 0'),
+        \ 'the old root is still watched after a re-root')
+endif
+tabclose
+sleep 100m
+
+" The same holds for the single-tab flow: close, then reopen elsewhere.
+call s:SelectPath(s:other .. '/bee.txt')
+call simpletree#OnMarkToggle()
+sleep 100m
+call assert_equal([s:other .. '/bee.txt'], s:Marked())
+SimpleTreeClose
+execute 'SimpleTree ' .. fnameescape(s:root)
+sleep 600m
+call assert_equal(s:root, simpletree#GetRoot(), 'reopening elsewhere did not re-root')
+call assert_equal([], s:Marked(), 'reopening at another root kept the old marks')
+
 let s:finished = 1
 
 catch
@@ -288,6 +334,7 @@ call simpletree#OnMarkClear()
 SimpleTreeClose
 call simpletree#Stop()
 call delete(s:root, 'rf')
+call delete(s:other, 'rf')
 if len(v:errors) > 0
   call writefile(v:errors, '/tmp/simpletree-vim-marks-errors')
   for error in v:errors

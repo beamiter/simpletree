@@ -4,6 +4,23 @@
 
 ## Unreleased - 2026-08-05
 
+### 修复：`:SimpleTree {dir}` 换根时也清标记、也解 watch
+
+- `Toggle()` 过去直接给 `s_root` 赋值，绕过了 `SetRoot()`，于是"换根会清掉
+  标记"（`:help simpletree-marks`）只对树内的 `.`/`d`/`C`/root-up 成立，对
+  `:SimpleTree {dir}` 不成立——包括 `:help simpletree-tabpages` 明确推荐的
+  "在另一个 tab 里传目录换根"这条路径。结果是换根后 `marked:N` 还挂在状态行
+  上，`c`/`x` 复制的是屏幕上根本看不见的旧根路径，光标下明明是个普通文件，
+  `D` 却报 "refusing to delete a path that resolves outside the workspace"
+  并且什么也没删。现在两条换根路径共用同一段清理。
+- 同一处还漏了 `UnwatchAllDirs()`：旧根会一直被 watch 着。顺带修掉
+  `WatchExpandedDirs()`——`s_state` 是跨换根保留的，它却不按当前根过滤，
+  换根后又把旧根下所有展开过的目录重新 watch 了一遍。
+- 无效目录不再先把 `s_root` 写坏再报错：`:SimpleTree /nope` 现在保持原来的根。
+- 新增测试：`tests/vim_marks.vim` 覆盖两条换根路径（另一个 tab 里换根、
+  关闭后在别处重开），断言标记被清空、状态行不再计数、旧根不再出现在
+  `s_watched` 里。
+
 ### 修复：搜索的取消与串行化
 
 - 后台：被取消的 `search` 会永久占住一个并发扫描许可。消费端在 `break` 之后
