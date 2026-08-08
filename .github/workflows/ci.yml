@@ -18,24 +18,63 @@ jobs:
   # newly used language feature can quietly break it, because every other job
   # runs on stable.  This is the check that caught `ignore` pulling in
   # let-chains and two crates whose own sources had outgrown their declared
-  # MSRV.  Keep the toolchain here in step with rust-version in Cargo.toml.
+  # MSRV.
+  #
+  # `uses:` cannot take an expression, so the toolchain below is a literal and
+  # the first step is what keeps it honest: it reads rust-version out of
+  # Cargo.toml and fails when any pin in this file has drifted from it.  The
+  # comment that used to say "keep these in step" did not, and both pins sat at
+  # 1.85 against a declared 1.88 for long enough that `cargo check --locked`
+  # hard-errored on every push.
   msrv:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.85.0
+
+      - name: Toolchain pins match Cargo.toml's rust-version
+        shell: bash
+        run: |
+          set -euo pipefail
+          declared=$(sed -n 's/^rust-version *= *"\([^"]*\)".*/\1/p' Cargo.toml | head -1)
+          if [[ -z "$declared" ]]; then
+            echo "::error::Cargo.toml declares no rust-version"
+            exit 1
+          fi
+          mapfile -t pins < <(grep -oE 'dtolnay/rust-toolchain@[0-9]+(\.[0-9]+)*' \
+            .github/workflows/ci.yml | sed 's|.*@||' | sort -u)
+          if [[ ${#pins[@]} -eq 0 ]]; then
+            echo "::error::no dtolnay/rust-toolchain pin found to verify"
+            exit 1
+          fi
+          for pin in "${pins[@]}"; do
+            case "$pin" in
+              "$declared"|"$declared".*) ;;
+              *)
+                echo "::error::toolchain pinned to $pin but Cargo.toml declares rust-version $declared"
+                exit 1
+                ;;
+            esac
+          done
+          echo "rust-version $declared matches pins: ${pins[*]}"
+
+      - uses: dtolnay/rust-toolchain@1.88.0
       - name: Build on the declared minimum supported Rust
         run: cargo check --all-targets --locked
+
+  # One step, one gate: `make check` is what a contributor runs locally, so CI
+  # runs exactly that.  Hand-listing a subset here is how tests/vim_sorting.vim,
+  # tests/vim_reveal.vim and `make core-verify` — the sha256 guard that is the
+  # entire point of .simplecore.manifest — went unrun for their whole lives.
   test:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
 
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
 
-      - name: Install Rust 1.85
-        uses: dtolnay/rust-toolchain@1.85.0
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@1.88.0
         with:
           components: rustfmt, clippy
 
@@ -44,65 +83,5 @@ jobs:
           sudo apt-get update
           sudo apt-get install --yes vim
 
-      - name: Validate shell script
-        run: bash -n install.sh
-
-      - name: Check Rust formatting
-        run: |
-          cargo fmt --all
-          git diff -- src tests > rustfmt.patch
-          if [[ -s rustfmt.patch ]]; then
-            cat rustfmt.patch
-            exit 1
-          fi
-
-      - name: Upload rustfmt patch
-        if: failure() && hashFiles('rustfmt.patch') != ''
-        uses: actions/upload-artifact@v4
-        with:
-          name: rustfmt-patch
-          path: rustfmt.patch
-          if-no-files-found: ignore
-
-      - name: Lint Rust
-        shell: bash
-        run: |
-          set +e
-          cargo clippy --locked --all-targets -- -D warnings 2>&1 | tee clippy.log
-          status=${PIPESTATUS[0]}
-          exit "$status"
-
-      - name: Upload Clippy log
-        if: failure() && hashFiles('clippy.log') != ''
-        uses: actions/upload-artifact@v4
-        with:
-          name: clippy-log
-          path: clippy.log
-          if-no-files-found: ignore
-
-      - name: Test Rust backend
-        run: cargo test --locked --all-targets
-
-      - name: Test Vim plugin load
-        run: vim -Nu NONE -n -es -X -i NONE -S tests/vim_smoke.vim
-
-      - name: Test Vim runtime controls
-        run: vim -Nu NONE -n -es -X -i NONE -S tests/vim_runtime_controls.vim
-
-      - name: Test Vim file operations
-        run: vim -Nu NONE -n -es -X -i NONE -S tests/vim_integration.vim
-
-      - name: Test Vim protocol v2 features
-        run: vim -Nu NONE -n -es -X -i NONE -S tests/vim_v2_features.vim
-
-      - name: Subtree render cache matches an uncached render
-        run: vim -Nu NONE -n -es -X -i NONE -S tests/vim_render_cache.vim
-
-      - name: Bookmarks
-        run: vim -Nu NONE -n -es -X -i NONE -S tests/vim_bookmarks.vim
-
-      - name: Compile every Vim9 def (lazy compilation hides cold-branch errors)
-        run: make defcompile
-
-      - name: simplecore supervisor regression suite
-        run: make vim-core
+      - name: make check
+        run: make check

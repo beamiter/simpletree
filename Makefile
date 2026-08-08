@@ -1,6 +1,14 @@
-.PHONY: check fmt clippy test vim-test vim-core defcompile core-verify
+.PHONY: check shell fmt clippy test vim-test vim-core defcompile core-verify
 
-check: core-verify fmt clippy test defcompile vim-core vim-test
+check: core-verify shell fmt clippy test defcompile vim-core vim-test
+
+# The installer is the only thing a user runs before any of the above can exist,
+# so a syntax error in it is the one failure nothing else catches.  CI used to
+# check this in a step of its own; it lives here so `make check` remains the
+# whole gate and CI needs exactly one line.
+shell:
+	bash -n install.sh
+	bash -n install-common.sh
 
 fmt:
 	cargo fmt --all -- --check

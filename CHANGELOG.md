@@ -4,6 +4,22 @@
 
 ## Unreleased - 2026-08-05
 
+### CI：修好门禁本身
+
+- `.github/workflows/ci.yml` 的两处 `dtolnay/rust-toolchain@1.85.0` 提到
+  `1.88.0`。`Cargo.toml` 早已声明 `rust-version = "1.88"`，而 cargo 把更高的
+  `rust-version` 当作硬错误——`cargo check --locked` 在编译任何东西之前就失败，
+  CI 自那以后每一次 push 都是红的，msrv 与主测试作业都没真的跑过。
+- 新增一步从 `Cargo.toml` 反推校验：`uses:` 不接受表达式，所以 toolchain 仍是
+  字面量，但这一步会把本文件里所有 `dtolnay/rust-toolchain@` 的 pin 和
+  `rust-version` 对一遍，不一致就直接失败。旧的 "keep the toolchain here in
+  step with rust-version" 注释没能做到这件事。
+- CI 里手抄的 Vim 步骤换成一句 `make check`，Makefile 成为"通过"的唯一定义。
+  此前 `tests/vim_sorting.vim`、`tests/vim_reveal.vim` 和 `make core-verify`
+  （`.simplecore.manifest` 的 sha256 校验，也是它存在的全部意义）从未在 CI 里
+  跑过。`bash -n install.sh` 也从 CI 步骤挪进新的 `make shell`，顺带覆盖
+  `install-common.sh`。
+
 ### `:SimpleTreeHealth` 能回答"为什么不工作了"
 
 - 检测过期的 `lib/simpletree-daemon`：把二进制的 mtime 与仓库里最新的
