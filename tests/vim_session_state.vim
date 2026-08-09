@@ -164,12 +164,50 @@ call assert_equal([s:root .. '/sub/nested'],
       \ get(get(get(s:Stored(), 'roots', {}), s:root .. '/sub', {}), 'expanded', []),
       \ 'raising the cap did not record the expansion again')
 
-" 根的数量也有上限，按 saved_at LRU 淘汰：s:root 更旧，s:root/sub 更新。
+" 根的数量也有上限。只剩一个名额时留下的必须是正在看的那棵树：s:root 更旧，
+" s:root/sub 是当前根，而当前根永远不参与淘汰。
 let g:simpletree_state_max_roots = 1
 call simpletree#PersistSessionState()
 call assert_equal([s:root .. '/sub'], keys(get(s:Stored(), 'roots', {})),
-      \ 'the LRU root cap kept the wrong root')
+      \ 'the root cap dropped the root of the session doing the saving')
+
+" 淘汰的顺序是 saved_at LRU：名额不够时先丢最久没保存的那个。上面那条断言
+" 只有一个候选根，谁走谁留和比较器的方向无关——要看见方向，候选得比名额多。
+" 三个 saved_at 互不相同的旧根从磁盘进来，当前根之外还剩两个名额。
+let s:old = tempname()
+let s:mid = tempname()
+let s:new = tempname()
+call mkdir(s:old .. '/d', 'p')
+call mkdir(s:mid .. '/d', 'p')
+call mkdir(s:new .. '/d', 'p')
+let s:seeded = s:Stored()
+let s:seeded.roots[s:old] = {'expanded': [s:old .. '/d'], 'saved_at': 100}
+let s:seeded.roots[s:mid] = {'expanded': [s:mid .. '/d'], 'saved_at': 200}
+let s:seeded.roots[s:new] = {'expanded': [s:new .. '/d'], 'saved_at': 300}
+call writefile([json_encode(s:seeded)], s:store)
+
+let g:simpletree_state_max_roots = 3
+call simpletree#PersistSessionState()
+call assert_equal(sort([s:root .. '/sub', s:mid, s:new]),
+      \ sort(keys(get(s:Stored(), 'roots', {}))),
+      \ 'the cap evicted by the wrong end of saved_at: the oldest root must go first')
+
+" 再收一个名额：三个候选只剩一个，活下来的得是 saved_at 最大的那个。
+let g:simpletree_state_max_roots = 2
+call simpletree#PersistSessionState()
+call assert_equal(sort([s:root .. '/sub', s:new]),
+      \ sort(keys(get(s:Stored(), 'roots', {}))),
+      \ 'the most recently saved root was not the last one standing')
+
+" 把这几个种子根清掉，后面的用例接着从"只有当前根"这个状态开始。
+let g:simpletree_state_max_roots = 1
+call simpletree#PersistSessionState()
+call assert_equal([s:root .. '/sub'], keys(get(s:Stored(), 'roots', {})),
+      \ 'the seeded roots outlived a cap of one')
 let g:simpletree_state_max_roots = 20
+call delete(s:old, 'rf')
+call delete(s:mid, 'rf')
+call delete(s:new, 'rf')
 
 " -------------------------------------------------------------- 并发实例 ---
 
