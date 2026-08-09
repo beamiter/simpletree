@@ -17,7 +17,6 @@
 :SimpleTreeToggleAutoRefresh	simpletree.txt	/*:SimpleTreeToggleAutoRefresh*
 :SimpleTreeVersion	simpletree.txt	/*:SimpleTreeVersion*
 <Plug>(simpletree-toggle)	simpletree.txt	/*<Plug>(simpletree-toggle)*
-below	simpletree.txt	/*below*
 g:simpletree_async_fs_ops	simpletree.txt	/*g:simpletree_async_fs_ops*
 g:simpletree_auto_follow	simpletree.txt	/*g:simpletree_auto_follow*
 g:simpletree_auto_follow_change_root	simpletree.txt	/*g:simpletree_auto_follow_change_root*

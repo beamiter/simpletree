@@ -319,6 +319,10 @@ let g:simpletree_width_state_file = expand('~/.vim/simpletree-width')
 JSON，手工删掉没有任何后果，`:SimpleTreeStateClear` 帮你删，`:SimpleTreeHealth`
 会报里面有几个根。
 
+一个文件，多个 Vim。两个窗口开两个项目是常态，所以保存时会重新读一遍文件、
+只替换自己那个根的记录，别的根原样留下——谁后退出都不会抹掉另一个记下的东西。
+写入走"临时文件 + `rename`"，此刻正在读的实例不会看到写了一半的 JSON。
+
 ```vim
 let g:simpletree_persist_state = 0
 let g:simpletree_state_file = expand('~/.vim/simpletree-state.json')

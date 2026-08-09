@@ -1,6 +1,24 @@
-.PHONY: check shell fmt clippy test vim-test vim-core defcompile core-verify
+.PHONY: check shell fmt clippy test vim-test vim-core defcompile core-verify doc-tags
 
-check: core-verify shell fmt clippy test defcompile vim-core vim-test
+check: core-verify shell doc-tags fmt clippy test defcompile vim-core vim-test
+
+# `*word*` in a help file is not emphasis, it is a *global* tag definition, and
+# doc/tags is what :help searches suite-wide.  One stray pair of asterisks in
+# prose is enough to hijack `:help below` for every user who installs us, and
+# nothing else in the build would ever notice.  So: regenerate the tags from a
+# scratch copy of doc/, refuse any tag that is not ours, and refuse a committed
+# doc/tags that no longer matches the help text it indexes.
+doc-tags:
+	@tmp=$$(mktemp -d) && cp doc/*.txt $$tmp/ && \
+	vim -Nu NONE -n -i NONE -es -c "helptags $$tmp" -c 'qa!' </dev/null && \
+	status=0; \
+	foreign=$$(awk -F'\t' '$$1 !~ /^(simpletree|g:simpletree|:SimpleTree|<Plug>\(simpletree)/ { print $$1 }' $$tmp/tags); \
+	if [ -n "$$foreign" ]; then \
+	  echo "doc: *word* in prose defined a global help tag: $$foreign" >&2; status=1; fi; \
+	if ! diff -u doc/tags $$tmp/tags >&2; then \
+	  echo "doc/tags is stale; regenerate with :helptags doc" >&2; status=1; fi; \
+	rm -rf $$tmp; \
+	[ $$status -eq 0 ] && echo "doc: help tags are current and plugin-scoped"
 
 # The installer is the only thing a user runs before any of the above can exist,
 # so a syntax error in it is the one failure nothing else catches.  CI used to
@@ -33,6 +51,7 @@ vim-test:
 	vim -Nu NONE -n -i NONE -es -S tests/vim_health.vim
 	vim -Nu NONE -n -i NONE -es -S tests/vim_search.vim
 	vim -Nu NONE -n -i NONE -es -S tests/vim_fsops.vim
+	vim -Nu NONE -n -i NONE -es -S tests/vim_fsop_failures.vim
 	vim -Nu NONE -n -i NONE -es -S tests/vim_filter.vim
 	vim -Nu NONE -n -i NONE -es -S tests/vim_git_multi.vim
 	vim -Nu NONE -n -i NONE -es -S tests/vim_columns.vim

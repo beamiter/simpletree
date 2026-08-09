@@ -171,6 +171,49 @@ call assert_equal([s:root .. '/sub'], keys(get(s:Stored(), 'roots', {})),
       \ 'the LRU root cap kept the wrong root')
 let g:simpletree_state_max_roots = 20
 
+" -------------------------------------------------------------- 并发实例 ---
+
+" 状态文件是所有 Vim 共用的，而每个实例只知道自己那个根，还把整份文件重写。
+" 会话开始时读进来的那份快照到落盘时可能已经是几小时前的了：两个窗口开两个
+" 项目是常态，谁后退出谁的记录留下、另一个的被抹掉，文件最后收敛成一个根——
+" 那正好是 |g:simpletree_state_max_roots| 说它能记住 20 个的反面。
+"
+" 另一个实例刚刚写过文件（我们的内存快照里没有它那个根），现在轮到我们保存。
+let s:other = tempname()
+call mkdir(s:other .. '/x', 'p')
+let s:disk = s:Stored()
+let s:disk.roots[s:other] = {'expanded': [s:other .. '/x'], 'saved_at': 4242}
+call writefile([json_encode(s:disk)], s:store)
+
+call simpletree#PersistSessionState()
+call assert_equal([s:other .. '/x'],
+      \ get(get(get(s:Stored(), 'roots', {}), s:other, {}), 'expanded', []),
+      \ "saving erased the root a concurrent instance had just recorded")
+call assert_equal([s:root .. '/sub/nested'],
+      \ get(get(get(s:Stored(), 'roots', {}), s:root .. '/sub', {}), 'expanded', []),
+      \ 'merging with the file on disk lost this instance own root')
+call assert_equal(s:root .. '/sub', get(s:Stored(), 'last_root', ''),
+      \ 'last_root did not follow the instance that saved last')
+
+" 合并不是"磁盘赢"：当前根这次没有任何可恢复的展开时，磁盘上那条旧记录已经
+" 作废，不能靠合并复活。
+let g:simpletree_state_max_dirs = 0
+call simpletree#PersistSessionState()
+call assert_false(has_key(get(s:Stored(), 'roots', {}), s:root .. '/sub'),
+      \ 'a stale record for the current root came back from disk')
+call assert_true(has_key(get(s:Stored(), 'roots', {}), s:other),
+      \ 'dropping our own record took the concurrent instance down with it')
+let g:simpletree_state_max_dirs = 500
+call simpletree#PersistSessionState()
+
+" 合并之后上限还得成立，否则 roots 会随着别的实例无限长下去。
+let g:simpletree_state_max_roots = 1
+call simpletree#PersistSessionState()
+call assert_equal([s:root .. '/sub'], keys(get(s:Stored(), 'roots', {})),
+      \ 'the root cap was not applied to the merged map')
+let g:simpletree_state_max_roots = 20
+call delete(s:other, 'rf')
+
 " ------------------------------------------------------------------ 关闭 ---
 
 " 关掉持久化之后什么都不写：文件停在上一次保存的样子。

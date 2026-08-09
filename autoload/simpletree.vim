@@ -859,10 +859,9 @@ def CopyPathSafely(src: string, dst: string): dict<any>
 
   if rename(staged, dst) != 0
     call DeletePathRecursive(staged)
-    if backup !=# '' && rename(backup, dst) != 0
-      echohl ErrorMsg
-      echom '[SimpleTree] rollback failed; original target is preserved at: ' .. backup
-      echohl None
+    if backup !=# '' && rename(backup, dst) == 0
+      # 旧目标已经还原，那个备份名字下面已经没有东西了，不能再报给用户。
+      result.backup = ''
     endif
     return result
   endif
@@ -899,9 +898,6 @@ def MovePathSafely(src: string, dst: string): dict<any>
 
   if backup !=# '' && rename(backup, dst) != 0
     result.backup = backup
-    echohl ErrorMsg
-    echom '[SimpleTree] move rollback failed; original target is at: ' .. backup
-    echohl None
     return result
   endif
 
@@ -2098,26 +2094,24 @@ def StateLimit(name: string, fallback: number, maximum: number): number
   return min([value, maximum])
 enddef
 
-def LoadSessionState()
-  if s_session_state_loaded
-    return
-  endif
-  s_session_state_loaded = true
+# 磁盘上那份状态，解析成内存里的形状。手写坏了的文件不该让树开不起来：
+# 形状对得上的部分收下，其余丢掉。
+def ReadSessionStateFile(): dict<any>
+  var empty_state: dict<any> = {roots: {}, last_root: ''}
   var file = StateFile()
   if !filereadable(file)
-    return
+    return empty_state
   endif
   var decoded: any
   try
     decoded = json_decode(join(readfile(file), "\n"))
   catch
     Log('session state file is not valid JSON: ' .. file)
-    return
+    return empty_state
   endtry
   if type(decoded) != v:t_dict
-    return
+    return empty_state
   endif
-  # 手写坏了的文件不该让树开不起来：形状对得上的部分收下，其余丢掉。
   var roots: dict<any> = {}
   var raw_roots = get(decoded, 'roots', {})
   if type(raw_roots) == v:t_dict
@@ -2142,10 +2136,34 @@ def LoadSessionState()
     endfor
   endif
   var last_root = get(decoded, 'last_root', '')
-  s_session_state = {
+  return {
     roots: roots,
     last_root: type(last_root) == v:t_string ? last_root : '',
   }
+enddef
+
+def LoadSessionState()
+  if s_session_state_loaded
+    return
+  endif
+  s_session_state_loaded = true
+  s_session_state = ReadSessionStateFile()
+enddef
+
+# 一个 Vim 只知道自己那个根。文件却是所有 Vim 共用的，而它是被整份重写的：
+# 会话开始时读进来的快照到落盘时可能已经是几小时前的了，直接写回去就把另一个
+# 实例这期间记下的每一个根都抹掉——两个窗口开两个项目是常态，谁后退出谁赢。
+# 所以落盘前重新读一遍，只把当前根这一条记录盖上去，别人的原样留着。
+def MergeSessionStateFromDisk()
+  var roots: dict<any> = get(ReadSessionStateFile(), 'roots', {})
+  var mine: dict<any> = get(s_session_state, 'roots', {})
+  if has_key(mine, s_root)
+    roots[s_root] = mine[s_root]
+  elseif has_key(roots, s_root)
+    # 当前根这次没有任何可恢复的展开：那条旧记录已经作废，不能靠磁盘复活。
+    remove(roots, s_root)
+  endif
+  s_session_state = {roots: CapSessionRoots(roots), last_root: s_root}
 enddef
 
 def SaveSessionState()
@@ -2159,9 +2177,17 @@ def SaveSessionState()
       return
     endtry
   endif
+  # 先写同目录临时文件再 rename：同一时刻读这个文件的另一个实例要么看到旧的
+  # 完整内容，要么看到新的，绝不会看到写了一半的 JSON。
+  var tmp = printf('%s.%d.tmp', file, getpid())
   try
-    writefile([json_encode(s_session_state)], file)
+    writefile([json_encode(s_session_state)], tmp)
+    if rename(tmp, file) != 0
+      call delete(tmp)
+      writefile([json_encode(s_session_state)], file)
+    endif
   catch
+    call delete(tmp)
     Log('cannot write session state: ' .. v:exception)
   endtry
 enddef
@@ -2206,6 +2232,11 @@ def CaptureSessionState()
     roots[s_root] = {expanded: sort(expanded), saved_at: localtime()}
   endif
 
+  s_session_state = {roots: CapSessionRoots(roots), last_root: s_root}
+enddef
+
+# 根的数量上限。和磁盘合并之后还要再钳一次，所以它必须是个能反复施加的纯函数。
+def CapSessionRoots(roots: dict<any>): dict<any>
   var max_roots = StateLimit('simpletree_state_max_roots', 20, 1000)
   # 刚保存的这个根永远不参与淘汰：localtime() 只有秒的精度，同一秒里保存的
   # 两个根按 saved_at 分不出先后，而"此刻正看着的这棵树"是最不该被丢掉的。
@@ -2220,7 +2251,7 @@ def CaptureSessionState()
   if max_roots <= 0 && has_key(roots, s_root)
     remove(roots, s_root)
   endif
-  s_session_state = {roots: roots, last_root: s_root}
+  return roots
 enddef
 
 export def PersistSessionState()
@@ -2229,6 +2260,7 @@ export def PersistSessionState()
     return
   endif
   CaptureSessionState()
+  MergeSessionStateFromDisk()
   SaveSessionState()
 enddef
 
@@ -4727,7 +4759,19 @@ enddef
 # 所以这里不需要知道是谁做的活。
 def PasteApply(ctx: dict<any>, job: dict<any>, transfer: dict<any>)
   var mode = ctx.mode
-  if !get(transfer, 'installed', false)
+  var installed = get(transfer, 'installed', false)
+  # 备份路径必须先于失败分支上报。搬运失败时旧目标已经被挪到一个点开头的兄弟
+  # 名字下（默认 g:simpletree_hide_dotfiles 还让它在树里看不见），这条路径是
+  # 用户找回自己文件的唯一线索——恰恰是最不能吞掉它的时候。
+  var backup = get(transfer, 'backup', '')
+  if backup !=# ''
+    echohl WarningMsg
+    echom '[SimpleTree] ' .. (installed
+      ? 'operation succeeded; old target backup remains at: '
+      : 'the old target could not be restored; it is preserved at: ') .. backup
+    echohl None
+  endif
+  if !installed
     var why = get(transfer, 'message', '')
     echohl ErrorMsg
     echom '[SimpleTree] failed to ' .. (mode ==# 'copy' ? 'copy' : 'move') .. ': ' .. job.src
@@ -4737,11 +4781,6 @@ def PasteApply(ctx: dict<any>, job: dict<any>, transfer: dict<any>)
       ctx.remaining->add(job.src)
     endif
     return
-  endif
-  if get(transfer, 'backup', '') !=# ''
-    echohl WarningMsg
-    echom '[SimpleTree] operation succeeded; old target backup remains at: ' .. transfer.backup
-    echohl None
   endif
 
   # 关闭被替换目标的未修改缓冲区，再把成功移动的源缓冲区改到新路径。

@@ -26,6 +26,8 @@ call writefile(['leaf'], s:root .. '/tree/nested/leaf.txt')
 call writefile(['one'], s:root .. '/one.txt')
 call writefile(['two'], s:root .. '/two.txt')
 call writefile(['occupied'], s:root .. '/dest/two.txt')
+call mkdir(s:root .. '/chain', 'p')
+call writefile(['inner'], s:root .. '/chain/inner.txt')
 
 let g:simpletree_persist_width = 0
 let g:simpletree_daemon_path = s:daemon
@@ -134,18 +136,45 @@ try
 
   " --------------------------------------------- a refused op ends the chain ---
 
-  " The daemon rejects a source that has vanished. That error must resolve the
-  " job rather than leave the paste chain waiting for a reply that never comes.
-  call delete(s:root .. '/two.txt')
-  let s:vars = s:Vars()
-  let s:vars.s_clipboard = {'mode': 'copy', 'items': [s:root .. '/two.txt']}
+  " The daemon rejects a source that has vanished, and it must do so through a
+  " real request: nothing here may set the clipboard by hand, because
+  " getscriptinfo() hands back a *copy* of the script variables and a paste
+  " driven that way would find an empty clipboard and quietly do nothing.
+  "
+  " The whole batch is planned before the first byte moves, so a job can be
+  " approved and then have its source disappear underneath it — cutting a
+  " directory together with a file inside it is exactly that, and it is a
+  " two-key accident (`m` on both) rather than an exotic one.  The second job
+  " must come back refused, and that refusal must resolve the job instead of
+  " leaving the chain waiting for a reply that will never come.
+  call simpletree#Refresh()
+  sleep 600m
+  call s:SelectPath(s:root .. '/chain')
+  call simpletree#OnExpand()
+  sleep 600m
+  call s:SelectPath(s:root .. '/chain')
+  call simpletree#OnMarkToggle()
+  call s:SelectPath(s:root .. '/chain/inner.txt')
+  call simpletree#OnMarkToggle()
+  call simpletree#OnCut()
   call s:SelectPath(s:root .. '/dest')
   call simpletree#OnPaste()
-  sleep 400m
+  sleep 900m
   call assert_equal({}, s:Vars().s_fsop_cbs,
         \ 'a refused fs-op left its callback registered forever')
-  call assert_equal(['two'], readfile(s:root .. '/dest/two.txt'),
-        \ 'a refused copy touched the destination')
+  call assert_equal(['inner'], readfile(s:root .. '/dest/chain/inner.txt'),
+        \ 'the first job of the batch never completed')
+  call assert_false(filereadable(s:root .. '/dest/inner.txt'),
+        \ 'a refused move installed something at the destination anyway')
+  " 被拒的那一项必须留在剪贴板里：用户还没有得到这次移动。
+  call assert_equal(['cut', [s:root .. '/chain/inner.txt']],
+        \ [s:Vars().s_clipboard.mode, s:Vars().s_clipboard.items],
+        \ 'a refused cut did not stay on the clipboard')
+  let s:msgs = execute('messages')
+  call assert_true(stridx(s:msgs, 'failed to move: ' .. s:root .. '/chain/inner.txt') >= 0,
+        \ 'the refusal was never reported: ' .. s:msgs)
+  call assert_true(stridx(s:msgs, 'source does not exist') >= 0,
+        \ "the daemon's reason for refusing never reached the user: " .. s:msgs)
 catch
   call assert_report('unexpected exception: ' .. v:exception .. ' @ ' .. v:throwpoint)
 endtry

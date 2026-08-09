@@ -543,7 +543,7 @@ restricted to the root's own subtree with a pathspec.  A tree rooted at
 unrelated files on every save, and does not ship their statuses over the
 protocol either.
 
-When the root is not inside a repository, every repository *below* it is found
+When the root is not inside a repository, every repository below it is found
 instead, so a directory of checkouts (`~/projects`, `~/work`) shows marks in
 each one.  The search descends at most three levels, stops at the first
 repository on each branch, ignores dotted directories and symbolic links, and
@@ -607,6 +607,14 @@ file unless |g:simpletree_restore_last_root| is set, and neither the sort mode,
 the filter, the marks nor the hidden-file toggles survive a session.  The file
 is JSON and safe to delete by hand; |:SimpleTreeStateClear| does it for you,
 and :SimpleTreeHealth reports how many roots it holds.
+
+One file, many Vim instances.  Two windows open on two projects is the normal
+case, so a save re-reads the file and replaces only the record for its own
+root, leaving every other root exactly as it found it: whoever quits last no
+longer erases what the others recorded.  The write goes through a temporary
+sibling and a rename, so an instance reading the file at that moment sees
+either the whole old content or the whole new content, never half a JSON
+object.
 
 ==============================================================================
 8. BACKEND DIAGNOSTICS                         *simpletree-backend*
@@ -679,9 +687,15 @@ staging/backup discipline, and never follows a symbolic link: a copied link is
 recreated as a link, which is why cp -a is no longer needed for them.
 
 Items are transferred one at a time, in the order they were marked.  A backend
-that exits mid-batch fails the outstanding item with a message rather than
-leaving the paste silently unfinished.  Delete and rename remain in Vim: both
-are a single system call, not a walk.
+that exits mid-batch, and one that refuses a transfer outright, both fail the
+outstanding item with a message and move on to the next, rather than leaving
+the paste silently unfinished.  Delete and rename remain in Vim: both are a
+single system call, not a walk.
+
+When a transfer fails after the old target has already been displaced and the
+restore fails too, the message names the backup path the original is preserved
+at.  That path is a dotted sibling of the target, which |g:simpletree_hide_dotfiles|
+then hides, so the message is the only thing naming it.
 
 Without the capability (an older backend, or the option off) the previous
 in-Vim implementation runs unchanged, including
