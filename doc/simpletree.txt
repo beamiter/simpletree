@@ -865,5 +865,10 @@ simpletree#ExternalDropDirectory()
         current tree root.  SimpleRemote uses this optional API as the local
         destination for copied remote files.
 
+simpletree#ExternalSetRoot({path})
+        Switch the visible root to an existing local directory and return
+        true.  The normal cache, watcher, persistence, and RootChanged event
+        behavior is preserved.  Returns false for an invalid directory.
+
 When SimpleClipboard is loaded, y/Y path copies use
 simpleclipboard#CopyText().  Native clipboard providers remain the fallback.

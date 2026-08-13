@@ -422,3 +422,7 @@ SimpleRemote can query `simpletree#ExternalDropDirectory()` to copy a remote
 file directly into the selected local directory (falling back to the tree
 root). Path yanks use `simpleclipboard#CopyText()` when SimpleClipboard is
 loaded, while retaining the native clipboard fallback.
+
+`simpletree#ExternalSetRoot(path)` lets SimpleRemote switch an already-open
+mounted tree without toggling its window. The normal root-change event,
+watchers, cache, and persisted tree state still apply.

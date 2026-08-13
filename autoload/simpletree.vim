@@ -6528,6 +6528,18 @@ export def ExternalDropDirectory(): string
   return s_root
 enddef
 
+# Optional suite integration: switch the visible tree root without toggling
+# the tree window. Providers must pass a real local directory; SetRoot keeps
+# the normal cache, watcher, persistence, render, and RootChanged event path.
+export def ExternalSetRoot(path: string): bool
+  var target = fnamemodify(expand(path), ':p')
+  if target ==# '' || !isdirectory(target)
+    return false
+  endif
+  SetRoot(target)
+  return true
+enddef
+
 # 状态栏
 export def StatusLine(): string
   if s_root ==# ''
