@@ -89,6 +89,7 @@ simpletree-requirements	simpletree.txt	/*simpletree-requirements*
 simpletree-safety	simpletree.txt	/*simpletree-safety*
 simpletree-session-state	simpletree.txt	/*simpletree-session-state*
 simpletree-simplecore	simpletree.txt	/*simpletree-simplecore*
+simpletree-suite-integration	simpletree.txt	/*simpletree-suite-integration*
 simpletree-tabpages	simpletree.txt	/*simpletree-tabpages*
 simpletree-troubleshooting	simpletree.txt	/*simpletree-troubleshooting*
 simpletree-width-state	simpletree.txt	/*simpletree-width-state*

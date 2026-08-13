@@ -415,3 +415,10 @@ let g:simpletree_use_nerdfont = 0
 - Vim 内置帮助：`:help simpletree`，源文件见 [`doc/simpletree.txt`](doc/simpletree.txt)
 - [变更记录](CHANGELOG.md)
 - [贡献指南](CONTRIBUTING.md)
+
+## simple* plugin integration
+
+SimpleRemote can query `simpletree#ExternalDropDirectory()` to copy a remote
+file directly into the selected local directory (falling back to the tree
+root). Path yanks use `simpleclipboard#CopyText()` when SimpleClipboard is
+loaded, while retaining the native clipboard fallback.

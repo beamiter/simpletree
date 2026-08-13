@@ -6427,14 +6427,25 @@ def CopyToSystemClipboard(text: string): bool
   return false
 enddef
 
+def CopyText(text: string): bool
+  if exists('*simpleclipboard#CopyText') == 1
+    try
+      return simpleclipboard#CopyText(text)
+    catch
+      Log('SimpleClipboard copy failed: ' .. v:exception, 'WarningMsg')
+    endtry
+  endif
+  setreg('"', text)
+  return CopyToSystemClipboard(text)
+enddef
+
 export def OnYankPath()
   var node = CursorNode()
   if !IsActionableNode(node)
     return
   endif
   var name = fnamemodify(node.path, ':t')
-  setreg('"', name)
-  call CopyToSystemClipboard(name)
+  call CopyText(name)
   echo '[SimpleTree] yanked: ' .. name
 enddef
 
@@ -6443,8 +6454,7 @@ export def OnYankAbsPath()
   if !IsActionableNode(node)
     return
   endif
-  setreg('"', node.path)
-  call CopyToSystemClipboard(node.path)
+  call CopyText(node.path)
   echo '[SimpleTree] yanked: ' .. node.path
 enddef
 
@@ -6500,6 +6510,22 @@ export def OnAutoClose()
       endif
     })
   endif
+enddef
+
+# Optional suite integration: return the directory into which an external
+# provider (for example SimpleRemote) should materialize a copied file.
+export def ExternalDropDirectory(): string
+  if s_root ==# '' || !isdirectory(s_root)
+    return ''
+  endif
+  var node = CursorNode()
+  if IsActionableNode(node)
+    var target = node.is_dir ? node.path : fnamemodify(node.path, ':h')
+    if isdirectory(target)
+      return target
+    endif
+  endif
+  return s_root
 enddef
 
 # 状态栏
