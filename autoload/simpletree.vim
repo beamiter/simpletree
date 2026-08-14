@@ -4106,7 +4106,7 @@ def DiscardRootScopedState()
   BumpRenderEpoch()
 enddef
 
-def SetRoot(new_root: string, lock: bool = false)
+def SetRoot(new_root: string, lock: bool = false, source: string = 'api')
   var nr = CanonDir(new_root)
   if !IsDir(nr)
     echohl ErrorMsg
@@ -4155,7 +4155,15 @@ def SetRoot(new_root: string, lock: bool = false)
 
   ScanDirAsync(s_root)
   GitStatusRefresh()
-  Emit('RootChanged', {root: s_root, old_root: old_root})
+  # `path` keeps RootChanged consistent with the rest of the filesystem event
+  # surface, while `root` remains the canonical, documented field.  `source`
+  # lets suite integrations distinguish a user action from their own echo.
+  Emit('RootChanged', {
+    root: s_root,
+    path: s_root,
+    old_root: old_root,
+    source: source,
+  })
   Render()
 enddef
 
@@ -4181,7 +4189,7 @@ export def OnRootHere()
     return
   endif
   var p = node.is_dir ? node.path : fnamemodify(node.path, ':h')
-  SetRoot(p)
+  SetRoot(p, false, 'here')
 enddef
 
 export def OnRootUp()
@@ -4199,7 +4207,7 @@ export def OnRootUp()
     return
   endif
 
-  SetRoot(up)
+  SetRoot(up, false, 'up')
 enddef
 
 export def OnRootPrompt()
@@ -4211,14 +4219,14 @@ export def OnRootPrompt()
   if inp ==# ''
     return
   endif
-  SetRoot(inp)
+  SetRoot(inp, false, 'prompt')
 enddef
 
 export def OnRootCwd()
   if GuardRootLock()
     return
   endif
-  SetRoot(getcwd())
+  SetRoot(getcwd(), false, 'cwd')
 enddef
 
 export def OnRootCurrent()
@@ -4249,7 +4257,7 @@ export def OnRootCurrent()
   endif
 
   var p = (ap ==# '') ? getcwd() : fnamemodify(ap, ':h')
-  SetRoot(p)
+  SetRoot(p, false, 'current')
 enddef
 
 # 打印当前上下文：当前根/锁、树窗口、另一个窗口及其文件
@@ -4315,7 +4323,7 @@ export def AutoFollow()
     # 切根到当前文件所在目录，并 Reveal 到文件
     var new_root = fnamemodify(ap, ':h')
     if IsDir(new_root)
-      SetRoot(new_root)
+      SetRoot(new_root, false, 'auto-follow')
       RevealPath(ap)
     endif
   else
@@ -5632,6 +5640,7 @@ export def Toggle(root: string = '')
     return
   endif
   # `:SimpleTree {dir}` 也是一次换根：和 SetRoot() 一样丢掉只对旧根有意义的状态。
+  var old_root = s_root
   if s_root !=# '' && new_root !=# s_root
     PersistSessionState()
     DiscardRootScopedState()
@@ -5661,6 +5670,14 @@ export def Toggle(root: string = '')
   WatchExpandedDirs()
   GitStatusRefresh()
   Emit('Open', {root: s_root})
+  if old_root !=# s_root
+    Emit('RootChanged', {
+      root: s_root,
+      path: s_root,
+      old_root: old_root,
+      source: empty(root) ? 'open' : 'command',
+    })
+  endif
 
   # 改动点：如果有当前文件，优先进行 Reveal，避免初始 Render 的闪烁
   if curf_abs !=# '' && filereadable(curf_abs) && IsSubPath(s_root, curf_abs)
@@ -6531,12 +6548,12 @@ enddef
 # Optional suite integration: switch the visible tree root without toggling
 # the tree window. Providers must pass a real local directory; SetRoot keeps
 # the normal cache, watcher, persistence, render, and RootChanged event path.
-export def ExternalSetRoot(path: string): bool
+export def ExternalSetRoot(path: string, source: string = 'external'): bool
   var target = fnamemodify(expand(path), ':p')
   if target ==# '' || !isdirectory(target)
     return false
   endif
-  SetRoot(target)
+  SetRoot(target, false, source)
   return true
 enddef
 

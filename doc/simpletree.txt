@@ -291,6 +291,12 @@ SimpleTreeNodeOpened, SimpleTreeDirExpanded, SimpleTreeDirCollapsed,
 SimpleTreeFileCreated, SimpleTreeFileDeleted, SimpleTreeFileRenamed,
 SimpleTreeGitStatusUpdated, SimpleTreeFilterChanged.
 
+SimpleTreeRootChanged is emitted by every root-changing entry point.  Its
+payload contains root (also available as path), old_root, and source.  Built-in
+sources include command, open, here, up, prompt, cwd, current, auto-follow,
+api, and external; integrations may pass their own stable source name through
+simpletree#ExternalSetRoot().
+
 ==============================================================================
 6. OPTIONS                                        *simpletree-options*
 
@@ -865,10 +871,12 @@ simpletree#ExternalDropDirectory()
         current tree root.  SimpleRemote uses this optional API as the local
         destination for copied remote files.
 
-simpletree#ExternalSetRoot({path})
+simpletree#ExternalSetRoot({path} [, {source}])
         Switch the visible root to an existing local directory and return
         true.  The normal cache, watcher, persistence, and RootChanged event
-        behavior is preserved.  Returns false for an invalid directory.
+        behavior is preserved.  {source} defaults to "external" and is copied
+        into g:simpletree_event.source so providers can ignore their own echo.
+        Returns false for an invalid directory.
 
 When SimpleClipboard is loaded, y/Y path copies use
 simpleclipboard#CopyText().  Native clipboard providers remain the fallback.

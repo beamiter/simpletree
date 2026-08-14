@@ -264,7 +264,7 @@ git 状态高亮组：`SimpleTreeGitModified`、`SimpleTreeGitStaged`、`SimpleT
 autocmd User SimpleTreeFileCreated echom 'created: ' .. g:simpletree_event.path
 ```
 
-事件：`SimpleTreeOpen`、`SimpleTreeClose`、`SimpleTreeRootChanged`、`SimpleTreeNodeOpened`、`SimpleTreeDirExpanded`、`SimpleTreeDirCollapsed`、`SimpleTreeFileCreated`、`SimpleTreeFileDeleted`、`SimpleTreeFileRenamed`、`SimpleTreeGitStatusUpdated`、`SimpleTreeFilterChanged`。
+事件：`SimpleTreeOpen`、`SimpleTreeClose`、`SimpleTreeRootChanged`、`SimpleTreeNodeOpened`、`SimpleTreeDirExpanded`、`SimpleTreeDirCollapsed`、`SimpleTreeFileCreated`、`SimpleTreeFileDeleted`、`SimpleTreeFileRenamed`、`SimpleTreeGitStatusUpdated`、`SimpleTreeFilterChanged`。`SimpleTreeRootChanged` 对所有换根入口统一触发，包含 `root`（兼容别名 `path`）、`old_root` 和 `source`；`source` 会区分 `command`、`here`、`up`、`prompt`、`cwd`、`current`、`auto-follow` 与外部调用方。
 
 ### 文件操作、后台与诊断
 
@@ -423,6 +423,7 @@ file directly into the selected local directory (falling back to the tree
 root). Path yanks use `simpleclipboard#CopyText()` when SimpleClipboard is
 loaded, while retaining the native clipboard fallback.
 
-`simpletree#ExternalSetRoot(path)` lets SimpleRemote switch an already-open
-mounted tree without toggling its window. The normal root-change event,
-watchers, cache, and persisted tree state still apply.
+`simpletree#ExternalSetRoot(path[, source])` lets SimpleRemote switch an
+already-open mounted tree without toggling its window. The normal root-change
+event, watchers, cache, and persisted tree state still apply. Providers can
+identify their own echo by passing a stable `source` name.
