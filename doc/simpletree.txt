@@ -93,6 +93,11 @@ under lib/ first, then target/release/ and target/debug/ for development use.
         epoch unchanged. Completion enumerates relative paths from the tree
         root (not :lcd), escapes spaces, and refuses outside/symlink-escaping
         parents and candidates before directory traversal.
+        A buffer or path with a URL scheme (`remote:///srv/app/x`, the
+        SimpleRemote virtual-mode files) has no local row: when a projection
+        maps it to a readable local file that file is revealed, otherwise the
+        request is handed to a provider through User SimpleTreeRevealForeign
+        without an error.  See |simpletree-suite-integration|.
 
                                                      *:SimpleTreeClose*
 :SimpleTreeClose
@@ -277,6 +282,18 @@ mark_clear.
 The mark_toggle action installs a Visual-mode mapping on the same key as its
 Normal-mode one, so remapping it moves both.
 
+A value of the form "call:{function}" maps the key to a function of your own
+or of another plugin instead of a built-in action — {function} is a global
+(`g:Name`) or autoload (`plugin#Name`) function name that is called without
+arguments in the tree buffer, so it can inspect the selection through
+|simpletree#ExternalSelectedPath()| and friends: >
+  let g:simpletree_mappings = {'gu': 'call:g:SimpleRemoteUploadFromTree'}
+<
+Such keys are listed at the end of the ? help panel.  Malformed names are
+dropped like unknown actions.  A sibling plugin can also install its own
+buffer mapping from `autocmd FileType simpletree`, which is how SimpleRemote
+adds gu; SimpleTree only overrides keys it maps itself.
+
 |g:simpletree_collapse_all_key| is still honored as a compatibility alias
 for the collapse_all action.
 
@@ -289,13 +306,29 @@ operations.  Payload data is passed through g:simpletree_event: >
 Events: SimpleTreeOpen, SimpleTreeClose, SimpleTreeRootChanged,
 SimpleTreeNodeOpened, SimpleTreeDirExpanded, SimpleTreeDirCollapsed,
 SimpleTreeFileCreated, SimpleTreeFileDeleted, SimpleTreeFileRenamed,
-SimpleTreeGitStatusUpdated, SimpleTreeFilterChanged.
+SimpleTreeGitStatusUpdated, SimpleTreeFilterChanged,
+SimpleTreeRevealForeign.
 
 SimpleTreeRootChanged is emitted by every root-changing entry point.  Its
 payload contains root (also available as path), old_root, and source.  Built-in
 sources include command, open, here, up, prompt, cwd, current, auto-follow,
 api, and external; integrations may pass their own stable source name through
 simpletree#ExternalSetRoot().
+
+SimpleTreeRevealForeign is emitted when a reveal (f, |:SimpleTreeReveal|)
+targets a buffer or path with a URL scheme that no local file corresponds to.
+Its payload is {name, path, bufnr, winid}: the full buffer name
+(`remote:///srv/app/x`), the name without its scheme (`/srv/app/x`), and the
+buffer and window it was found in (0 when unknown).  A provider such as
+SimpleRemote answers by opening its own tree.
+
+The event fires with that window current whenever there is one, so a listener
+may read the current buffer and its buffer-local variables instead of the
+payload; the window switch skips autocommands, and when the listener opened no
+window of its own the cursor returns to where the reveal was requested.  With
+no such window (an explicit path for a buffer that is not loaded) the payload
+is all there is.  A listener that calls :SimpleTreeReveal again receives no
+second event, so a provider that cannot act simply does nothing.
 
 ==============================================================================
 6. OPTIONS                                        *simpletree-options*
@@ -389,6 +422,15 @@ g:simpletree_keep_focus
                                              *g:simpletree_choose_window*
 g:simpletree_choose_window
         Boolean, default 1.  Prompt when several editor windows are candidates.
+
+                                             *g:simpletree_target_buftypes*
+g:simpletree_target_buftypes
+        List, default ['', 'acwrite'].  The 'buftype' values of windows the
+        tree opens files into and follows as the most recent editor window:
+        ordinary file buffers and acwrite buffers such as SimpleRemote's
+        virtual-mode remote:// files, so opening a local file from the tree
+        reuses that window instead of forcing a new split.  Set [''] for the
+        historical normal-buffers-only behavior.
 
                                              *g:simpletree_split_force_right*
 g:simpletree_split_force_right
@@ -537,7 +579,8 @@ g:simpletree_git_status
         capability and git is executable; otherwise the tree silently
         behaves as if this were 0.  See |simpletree-git-repos| for what
         happens when the root holds more than one repository, or sits inside
-        a very large one.
+        a very large one.  A provider can switch status off for a single
+        root through the opts argument of |simpletree#ExternalSetRoot()|.
 
 REPOSITORY DISCOVERY ~
                                                    *simpletree-git-repos*
@@ -580,7 +623,10 @@ g:simpletree_use_watcher
         Boolean, default 1.  Subscribe expanded directories to backend
         filesystem watching and refresh from pushed fs_event records.
         Directories whose watch registration fails, and backends without
-        the "watch" capability, fall back to mtime polling.
+        the "watch" capability, fall back to mtime polling.  A provider can
+        switch watching off for a single root through the opts argument of
+        |simpletree#ExternalSetRoot()| (network mounts never report remote
+        changes through inotify); |:SimpleTreeHealth| says so.
 
 ==============================================================================
 7. PERSISTED STATE                         *simpletree-width-state*
@@ -866,17 +912,68 @@ vim:tw=78:ts=8:noet:ft=help:norl:
 
 SUITE INTEGRATION                                  *simpletree-suite-integration*
 
+Everything below is optional and feature-detected by both sides; SimpleTree
+never requires a sibling plugin.
+
+                                        *simpletree#ExternalDropDirectory()*
 simpletree#ExternalDropDirectory()
         Return the selected directory, the selected file's parent, or the
         current tree root.  SimpleRemote uses this optional API as the local
         destination for copied remote files.
 
-simpletree#ExternalSetRoot({path} [, {source}])
+                                        *simpletree#ExternalSelectedPath()*
+simpletree#ExternalSelectedPath()
+        Return the path of the node under the cursor of the current tab
+        page's tree window — a file or a directory — or '' when this tab has
+        no tree window or the row is a loading/error placeholder.
+        SimpleRemote offers it as the default source of its gu upload.
+
+                                        *simpletree#ExternalSelectedNode()*
+simpletree#ExternalSelectedNode()
+        The same node as a fresh {path, is_dir} dictionary, or {} when
+        nothing is selected.  Never the tree's live index entry.
+
+                                        *simpletree#ExternalMarkedPaths()*
+simpletree#ExternalMarkedPaths()
+        The marked set (<Space>, gm) as a fresh list sorted by path; [] when
+        nothing is marked.  Marks belong to the tree session, not to a tab
+        page.
+
+                                        *simpletree#ExternalSetRoot()*
+simpletree#ExternalSetRoot({path} [, {source} [, {opts}]])
         Switch the visible root to an existing local directory and return
         true.  The normal cache, watcher, persistence, and RootChanged event
         behavior is preserved.  {source} defaults to "external" and is copied
         into g:simpletree_event.source so providers can ignore their own echo.
         Returns false for an invalid directory.
+        {opts} is a dictionary with the keys "watch" and "git" (both default
+        true).  false switches backend filesystem watching, respectively git
+        status, off for this root only, on top of |g:simpletree_use_watcher|
+        and |g:simpletree_git_status|; with watching off the idle refresh
+        falls back to mtime polling.  SimpleRemote passes both as false for
+        an sshfs projection, where inotify never reports remote-side changes
+        and status walks the network.  The flags belong to that root: any
+        other root change (keys, commands, auto-follow, a later
+        ExternalSetRoot without opts) restores the defaults.
+
+Foreign buffers ~
+        A buffer whose name carries a URL scheme (`remote:///path`, the
+        SimpleRemote virtual-mode files, 'buftype' acwrite) is never a local
+        row.  Revealing it (f, |:SimpleTreeReveal|) first asks
+        g:SimpleRemoteLocalPath() for a projected local path and reveals
+        that when it is readable; otherwise it fires
+        User SimpleTreeRevealForeign (see |simpletree-events|) and returns
+        quietly, with the foreign buffer's own window current so the provider
+        can decide from the current buffer.  The d key resolves such a window
+        the same way before falling back to the current directory.  acwrite
+        windows are also edit targets, see |g:simpletree_target_buftypes|.
+
+Custom keys ~
+        Sibling plugins add tree keys either through the "call:" form of
+        |g:simpletree_mappings| (listed in the ? help) or with their own
+        `autocmd FileType simpletree nnoremap <buffer> ...`; the filetype is
+        set before SimpleTree installs its own maps, so only colliding keys
+        are overridden.
 
 When SimpleClipboard is loaded, y/Y path copies use
 simpleclipboard#CopyText().  Native clipboard providers remain the fallback.

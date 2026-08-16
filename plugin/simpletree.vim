@@ -291,8 +291,12 @@ g:simpletree_filter_max_results = ClampNumber(get(g:, 'simpletree_filter_max_res
 g:simpletree_columns = NormalizeColumns(get(g:, 'simpletree_columns', []))
 g:simpletree_column_time_format = get(g:, 'simpletree_column_time_format', '%m-%d %H:%M')
 g:simpletree_column_sep = get(g:, 'simpletree_column_sep', '  ')
-# 树缓冲区按键覆盖表：{键: action}；action 为空字符串表示禁用该键
+# 树缓冲区按键覆盖表：{键: action}；action 为空字符串表示禁用该键，
+# 'call:g:Func' / 'call:plugin#Func' 把键映射到别的插件的函数（自定义动作）
 g:simpletree_mappings = get(g:, 'simpletree_mappings', {})
+# 从树里打开文件时可以复用的窗口的 buftype：普通文件（''）和 acwrite
+# （SimpleRemote 虚拟模式的 remote:// 缓冲区）；设为 [''] 恢复只认普通缓冲区
+g:simpletree_target_buftypes = get(g:, 'simpletree_target_buftypes', ['', 'acwrite'])
 
 # =============================================================
 # 运行时控制与诊断

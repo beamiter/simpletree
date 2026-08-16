@@ -64,6 +64,7 @@ g:simpletree_split_force_right	simpletree.txt	/*g:simpletree_split_force_right*
 g:simpletree_state_file	simpletree.txt	/*g:simpletree_state_file*
 g:simpletree_state_max_dirs	simpletree.txt	/*g:simpletree_state_max_dirs*
 g:simpletree_state_max_roots	simpletree.txt	/*g:simpletree_state_max_roots*
+g:simpletree_target_buftypes	simpletree.txt	/*g:simpletree_target_buftypes*
 g:simpletree_use_nerdfont	simpletree.txt	/*g:simpletree_use_nerdfont*
 g:simpletree_use_system_clipboard	simpletree.txt	/*g:simpletree_use_system_clipboard*
 g:simpletree_use_system_copy	simpletree.txt	/*g:simpletree_use_system_copy*
@@ -73,6 +74,11 @@ g:simpletree_width	simpletree.txt	/*g:simpletree_width*
 g:simpletree_width_persist_delay	simpletree.txt	/*g:simpletree_width_persist_delay*
 g:simpletree_width_state_file	simpletree.txt	/*g:simpletree_width_state_file*
 simpletree	simpletree.txt	/*simpletree*
+simpletree#ExternalDropDirectory()	simpletree.txt	/*simpletree#ExternalDropDirectory()*
+simpletree#ExternalMarkedPaths()	simpletree.txt	/*simpletree#ExternalMarkedPaths()*
+simpletree#ExternalSelectedNode()	simpletree.txt	/*simpletree#ExternalSelectedNode()*
+simpletree#ExternalSelectedPath()	simpletree.txt	/*simpletree#ExternalSelectedPath()*
+simpletree#ExternalSetRoot()	simpletree.txt	/*simpletree#ExternalSetRoot()*
 simpletree-backend	simpletree.txt	/*simpletree-backend*
 simpletree-commands	simpletree.txt	/*simpletree-commands*
 simpletree-contents	simpletree.txt	/*simpletree-contents*

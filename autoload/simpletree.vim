@@ -108,6 +108,13 @@ var s_pending: dict<number> = {}          # path -> request id
 var s_line_index: list<dict<any>> = []    # 渲染行对应的节点
 var s_active_path: string = ''            # 当前编辑器文件（用于活动项装饰）
 var s_target_winid: number = 0            # 最近使用的编辑窗口，避免反复询问
+# 换根方（simpletree#ExternalSetRoot 的 opts）为当前根关掉的能力：sshfs 这类
+# 投影挂载上 inotify 永远收不到远端改动、git status 每次都走网络，提供方会把
+# 两者关掉让 mtime 轮询接手。只对当前根有效，任何别的换根入口都会重置。
+var s_root_opts: dict<bool> = {watch: true, git: true}
+# OnRevealActive() 正在为一个外部方案缓冲区（remote:///…）发 RevealForeign 事件。
+# 监听方若在处理时又调回 :SimpleTreeReveal，嵌套的那次不能再发一遍事件。
+var s_reveal_foreign_depth: number = 0
 
 # ─────────────────── 每个 tabpage 一个树窗口 ───────────────────
 #
@@ -402,7 +409,23 @@ enddef
 # =============================================================
 # 工具函数
 # =============================================================
-# 列出当前 tab 页的候选目标窗口（排除树窗口，且仅普通缓冲区，即 buftype 为空）
+# 可以充当"编辑窗口"的 buftype。普通文件是空串；acwrite 是 SimpleRemote 虚拟
+# 模式 remote:// 缓冲区（以及别的 BufWriteCmd 型缓冲区）用的——用户在那里编辑
+# 时，树打开的文件应当落进同一个窗口，而不是每次都被迫新开一个右侧分屏。
+# g:simpletree_target_buftypes 可以收窄回 [''] 恢复旧行为。
+def IsTargetBuftype(bt: any): bool
+  if type(bt) != v:t_string
+    return false
+  endif
+  var allowed = get(g:, 'simpletree_target_buftypes', ['', 'acwrite'])
+  if type(allowed) != v:t_list
+    return bt ==# ''
+  endif
+  return index(allowed, bt) >= 0
+enddef
+
+# 列出当前 tab 页的候选目标窗口（排除树窗口，只保留 IsTargetBuftype() 认可的
+# 缓冲区：普通文件与 acwrite）
 def CandidateWindows(): list<dict<any>>
   var wins = getwininfo()
   var tabnr = tabpagenr()
@@ -416,9 +439,9 @@ def CandidateWindows(): list<dict<any>>
     if w.bufnr == s_bufnr
       continue
     endif
-    # 只选择普通缓冲区窗口（buftype 为空）
+    # 只选择普通缓冲区窗口（buftype 为空）或 acwrite 窗口（remote:// 缓冲区）
     var bt = getbufvar(w.bufnr, '&buftype')
-    if type(bt) == v:t_string && bt ==# ''
+    if IsTargetBuftype(bt)
       var name = bufname(w.bufnr)
       res->add({winid: w.winid, winnr: w.winnr, bufnr: w.bufnr, name: name})
     endif
@@ -1723,7 +1746,7 @@ def Emit(name: string, data: dict<any> = {})
 enddef
 
 def WatcherEnabled(): bool
-  return !!get(g:, 'simpletree_use_watcher', 1) && HasCap('watch')
+  return !!get(g:, 'simpletree_use_watcher', 1) && s_root_opts.watch && HasCap('watch')
 enddef
 
 def WatchDir(path: string)
@@ -1882,7 +1905,7 @@ enddef
 
 # ---------------- git status ----------------
 def GitStatusEnabled(): bool
-  return !!get(g:, 'simpletree_git_status', 1) && HasCap('git-status')
+  return !!get(g:, 'simpletree_git_status', 1) && s_root_opts.git && HasCap('git-status')
 enddef
 
 # git_status 曾经是"发出去就不管"：DispatchLine() 只在 s_bcbs 里有对应 id 时
@@ -3368,6 +3391,16 @@ const DEFAULT_KEYS: dict<string> = {
   'gM': 'mark_clear',
 }
 
+# g:simpletree_mappings 的值除了 KEY_ACTIONS 里的 action 名，还接受
+# 'call:g:Func' / 'call:plugin#Func'：按键映射成 <Cmd>call Func()<CR>，供别的
+# 插件（SimpleRemote 的 gu 上传等）往树里挂自己的动作，而且会出现在 ? 帮助里。
+# 只校验名字的形状；函数本身允许是稍后才加载的 autoload 函数。
+const CUSTOM_ACTION_PATTERN: string = '^call:\%(g:\)\=\%(\h\w*#\)*\h\w*$'
+
+def CustomActionFunc(action: string): string
+  return action =~# CUSTOM_ACTION_PATTERN ? strpart(action, len('call:')) : ''
+enddef
+
 # 合并默认表、g:simpletree_collapse_all_key 兼容别名与 g:simpletree_mappings。
 export def EffectiveKeymap(): dict<string>
   var mapped = copy(DEFAULT_KEYS)
@@ -3388,7 +3421,7 @@ export def EffectiveKeymap(): dict<string>
         if has_key(mapped, key)
           call remove(mapped, key)
         endif
-      elseif has_key(KEY_ACTIONS, action)
+      elseif has_key(KEY_ACTIONS, action) || CustomActionFunc(action) !=# ''
         mapped[key] = action
       else
         Log('unknown mapping action: ' .. action, 'WarningMsg')
@@ -3401,6 +3434,11 @@ enddef
 def InstallKeymaps()
   var cmds: list<string> = []
   for [key, action] in items(EffectiveKeymap())
+    var Custom = CustomActionFunc(action)
+    if Custom !=# ''
+      cmds->add('nnoremap <nowait> <silent> <buffer> ' .. key .. ' <Cmd>call ' .. Custom .. '()<CR>')
+      continue
+    endif
     var Fn = get(KEY_ACTIONS, action, '')
     if Fn ==# ''
       continue
@@ -4091,6 +4129,9 @@ enddef
 # 已经看不见的路径上，旧根还会一直被 watch 着。
 def DiscardRootScopedState()
   UnwatchAllDirs()
+  # 提供方为旧根关掉的 watch/git 只属于旧根；SetRoot() 会紧接着按新的 opts
+  # 重新赋值，其余换根入口回到默认全开。
+  s_root_opts = RootOptsFrom({})
   # 命中集合是按根算出来的：换根之后它们指向的是一批屏幕上看不见的路径。
   ClearFilterHits()
   # 换根后旧根下的标记不再可见，留着只会让下一次批量操作作用在看不见的路径上。
@@ -4106,7 +4147,13 @@ def DiscardRootScopedState()
   BumpRenderEpoch()
 enddef
 
-def SetRoot(new_root: string, lock: bool = false, source: string = 'api')
+# ExternalSetRoot() 的 opts 归一成布尔表：缺省全开。
+def RootOptsFrom(opts: dict<any>): dict<bool>
+  return {watch: !!get(opts, 'watch', true), git: !!get(opts, 'git', true)}
+enddef
+
+def SetRoot(new_root: string, lock: bool = false, source: string = 'api',
+    opts: dict<any> = {})
   var nr = CanonDir(new_root)
   if !IsDir(nr)
     echohl ErrorMsg
@@ -4120,6 +4167,7 @@ def SetRoot(new_root: string, lock: bool = false, source: string = 'api')
   PersistSessionState()
   DiscardRootScopedState()
   s_root = nr
+  s_root_opts = RootOptsFrom(opts)
   if lock
     s_root_locked = true
   endif
@@ -4236,23 +4284,32 @@ export def OnRootCurrent()
   endif
 
   var ap = ''
-  var other = OtherWindowId()
-  if other != 0
-    var wi = getwininfo(other)
-    if len(wi) > 0
-      var obuf = wi[0].bufnr
-      var oname = bufname(obuf)
-      var cand = fnamemodify(oname, ':p')
-      if cand !=# '' && filereadable(cand)
-        ap = cand
-      endif
+  # 最近使用的编辑窗口优先，然后是本 tab 的其余候选窗口（含 acwrite 的
+  # remote:// 缓冲区：投影模式下它们能映射回本地路径）。
+  var cands = CandidateWindows()
+  var ordered: list<dict<any>> = []
+  for w in cands
+    if w.winid == s_target_winid
+      ordered->add(w)
     endif
-  endif
+  endfor
+  for w in cands
+    if w.winid != s_target_winid
+      ordered->add(w)
+    endif
+  endfor
+  for w in ordered
+    var cand = LocalPathForBufname(bufname(w.bufnr))
+    if cand !=# '' && filereadable(cand)
+      ap = cand
+      break
+    endif
+  endfor
 
   if ap ==# ''
-    var cur = expand('%:p')
+    var cur = LocalPathForBufname(bufname('%'))
     if cur !=# '' && filereadable(cur)
-      ap = fnamemodify(cur, ':p')
+      ap = cur
     endif
   endif
 
@@ -4294,9 +4351,15 @@ export def AutoFollow()
     return
   endif
 
-  # 只处理普通缓冲区（buftype 为空）
+  # 只跟随普通缓冲区（buftype 为空）。acwrite 窗口（remote:// 缓冲区）算作
+  # 最近使用的编辑窗口——从树里打开文件会落进去——但它的名字不是本地文件，
+  # 没有可以定位的行。
   var bt = &buftype
-  if type(bt) != v:t_string || bt !=# ''
+  if !IsTargetBuftype(bt)
+    return
+  endif
+  if bt !=# ''
+    s_target_winid = win_getid()
     return
   endif
 
@@ -5235,7 +5298,7 @@ enddef
 # ====== 帮助面板（?）======
 def BuildHelpLines(): list<string>
   var ca_key = get(g:, 'simpletree_collapse_all_key', 'z')
-  return [
+  var lines: list<string> = [
     'SimpleTree 快捷键说明',
     '----------------------------------------',
     '<CR>/o/双击  打开文件 / 展开或折叠目录',
@@ -5277,11 +5340,28 @@ def BuildHelpLines(): list<string>
     'gm    标记当前节点的全部可见同级节点',
     'gM    清除全部标记',
     '?     显示/关闭本帮助面板',
+  ]
+  # g:simpletree_mappings 里 'call:Func' 形式的自定义动作（别的插件挂进来的键，
+  # 比如 SimpleRemote 的 gu 上传）也列出来，否则 ? 面板对这些键一无所知。
+  var custom: list<string> = []
+  var mapped = EffectiveKeymap()
+  for key in sort(keys(mapped))
+    var Fn = CustomActionFunc(mapped[key])
+    if Fn !=# ''
+      custom->add(printf('%-5s 自定义动作：call %s()', key, Fn))
+    endif
+  endfor
+  if !empty(custom)
+    lines->add('----------------------------------------')
+    lines->extend(custom)
+  endif
+  lines->extend([
     '----------------------------------------',
     '提示：新建支持 foo/bar.ext；删除优先移到系统回收站；剪切成功后自动清空剪贴板。',
     '有标记时 c/x/D 作用于整个标记集合，否则作用于光标所在节点。',
     '按键可用 g:simpletree_mappings 自定义；此帮助显示默认键位。',
-  ]
+  ])
+  return lines
 enddef
 
 def HelpWinValid(): bool
@@ -5604,7 +5684,7 @@ export def Toggle(root: string = '')
   endif
 
   var source_winid = win_getid()
-  if &buftype ==# ''
+  if IsTargetBuftype(&buftype)
     s_target_winid = source_winid
   endif
   var curf0 = expand('%:p')
@@ -6066,6 +6146,8 @@ export def Health()
   var git_detail = ''
   if !get(g:, 'simpletree_git_status', 1)
     git_detail = 'disabled'
+  elseif !s_root_opts.git
+    git_detail = 'disabled for this root by its provider (ExternalSetRoot opts)'
   elseif !executable('git')
     git_detail = 'no git executable on $PATH'
   elseif !HasCap('git-status')
@@ -6088,7 +6170,9 @@ export def Health()
   echom '  [--] git status: ' .. git_detail
   echom '  [--] fs watch: ' .. (!get(g:, 'simpletree_use_watcher', 1)
     ? 'disabled (mtime polling)'
-    : (HasCap('watch') ? ('active, ' .. len(s_watched) .. ' dir(s)') : 'waiting for backend capability (mtime polling)'))
+    : (!s_root_opts.watch
+      ? 'disabled for this root by its provider (mtime polling)'
+      : (HasCap('watch') ? ('active, ' .. len(s_watched) .. ' dir(s)') : 'waiting for backend capability (mtime polling)')))
 
   var state_detail = ''
   if !StatePersistEnabled()
@@ -6161,10 +6245,63 @@ def SeedModifiedPaths()
   endfor
 enddef
 
+# 缓冲区名带 URL 方案（remote:///srv/app、fugitive://…）：本地文件系统里没有
+# 这个路径，NormPath()/fnamemodify() 也会原样放过它。
+def IsForeignName(name: string): bool
+  return name =~# '^\a\+://'
+enddef
+
+# 外部方案名去掉方案前缀之后的路径：remote:///srv/app/x -> /srv/app/x。
+def ForeignPath(name: string): string
+  return substitute(name, '^\a\+://', '', '')
+enddef
+
+# 外部方案名映射回本地路径。SimpleRemote 的投影模式（sshfs / docker-bind /
+# local-map）把远端根挂到 local_root 下，g:SimpleRemoteLocalPath() 给出对应的
+# 本地路径；虚拟模式或未连接时返回 ''。
+def ForeignLocalPath(name: string): string
+  if exists('*g:SimpleRemoteLocalPath') != 1
+    return ''
+  endif
+  var local: any = ''
+  try
+    local = g:SimpleRemoteLocalPath(ForeignPath(name))
+  catch
+    local = ''
+  endtry
+  if type(local) != v:t_string || local ==# ''
+    return ''
+  endif
+  return (filereadable(local) || isdirectory(local)) ? fnamemodify(local, ':p') : ''
+enddef
+
+# 按完整名字找缓冲区号；bufnr({name}) 把参数当模式用，URL 里的字符会干扰。
+def BufnrByName(name: string): number
+  for info in getbufinfo()
+    if get(info, 'name', '') ==# name
+      return info.bufnr
+    endif
+  endfor
+  return 0
+enddef
+
+# 缓冲区名对应的本地文件路径：普通名字取绝对路径；外部方案名走投影映射，
+# 映射不到本地则返回 ''。
+def LocalPathForBufname(name: string): string
+  if name ==# ''
+    return ''
+  endif
+  return IsForeignName(name) ? ForeignLocalPath(name) : fnamemodify(name, ':p')
+enddef
+
 def RevealInputPath(path: string): string
   var candidate = path
   if candidate !=# '' && candidate[0] ==# '~'
     candidate = expand(candidate)
+  endif
+  # 外部方案（remote:///…）已经是绝对的：既不能拼到根下面，也不能 NormPath。
+  if IsForeignName(candidate)
+    return candidate
   endif
   var absolute = candidate =~# '^/'
     || ((has('win32') || has('win64') || has('win32unix'))
@@ -6263,21 +6400,72 @@ export def OnRevealCommand(path: string = '')
   OnRevealActive(RevealCompletionLead(path))
 enddef
 
-export def OnRevealActive(path: string = '')
-  if !s_open || s_root ==# '' || !WinValid()
-    echo '[SimpleTree] open the tree before revealing a path'
+# 不带参数的 reveal 要看的"活动缓冲区"：从文件窗口执行 :SimpleTreeReveal 时是
+# 当前缓冲区，从树里按 f 时是最近使用的编辑窗口。返回 {bufnr, winid, name}，
+# 没有则 {}。
+def RevealSubjectBuffer(): dict<any>
+  var winid = win_getid()
+  if winid == s_winid || bufnr('%') == s_bufnr || !IsTargetBuftype(&buftype)
+    winid = (s_target_winid != 0 && win_id2win(s_target_winid) > 0) ? s_target_winid : 0
+  endif
+  if winid == 0
+    return {}
+  endif
+  var bnr = winbufnr(winid)
+  if bnr <= 0
+    return {}
+  endif
+  return {bufnr: bnr, winid: winid, name: bufname(bnr)}
+enddef
+
+# 目标是外部方案缓冲区（remote:///…）。投影模式下映射回本地路径就照常定位；
+# 映射不到（虚拟模式）就把它交给提供方：User SimpleTreeRevealForeign，载荷
+# {name, path, bufnr, winid}。这里不报错——树里没有这个文件不是错误。
+def RevealForeign(name: string, bnr: number, winid: number)
+  var local = ForeignLocalPath(name)
+  if local !=# ''
+    RevealLocalTarget(local, false)
     return
   endif
-
-  var explicit = path !=# ''
-  var target = explicit ? RevealInputPath(path) : s_active_path
-  if !explicit && target ==# '' && s_target_winid != 0 && win_id2win(s_target_winid) > 0
-    var bnr = winbufnr(s_target_winid)
-    var name = bufname(bnr)
-    if name !=# ''
-      target = NormPath(name)
-    endif
+  if s_reveal_foreign_depth > 0
+    # 监听方在处理事件时又调回了 :SimpleTreeReveal（例如按当前缓冲区判断
+    # 而当前缓冲区是树本身）；再发一遍只会无限递归。
+    return
   endif
+  if !exists('#User#SimpleTreeRevealForeign')
+    # 没有提供方接手：说一声就好，树里确实没有这个文件。
+    echo '[SimpleTree] no local file to reveal for ' .. name
+    return
+  endif
+  s_reveal_foreign_depth += 1
+  try
+    EmitRevealForeign(name, bnr, winid)
+  finally
+    s_reveal_foreign_depth -= 1
+  endtry
+enddef
+
+# 事件在那个外部缓冲区自己的窗口里触发（知道是哪个窗口的时候）：提供方通常
+# 就是照着"当前缓冲区"决定要打开什么的，而按 f 时当前窗口是树，光有载荷不够。
+# 切换不带 autocmd，事件返回后若监听方没有自己换窗口（窗口还在、缓冲区还是
+# 原来那个），就切回按键的那个窗口——按 f 的人留在树里。
+def EmitRevealForeign(name: string, bnr: number, winid: number)
+  var origin = win_getid()
+  var switched = winid != 0 && winid != origin && win_id2win(winid) > 0
+  if switched
+    noautocmd call win_gotoid(winid)
+  endif
+  try
+    Emit('RevealForeign', {name: name, path: ForeignPath(name), bufnr: bnr, winid: winid})
+  finally
+    if switched && win_getid() == winid && winbufnr(winid) == bnr
+        && win_id2win(origin) > 0
+      noautocmd call win_gotoid(origin)
+    endif
+  endtry
+enddef
+
+def RevealLocalTarget(target: string, explicit: bool)
   if target ==# '' || !PathExists(target)
     if explicit
       echo '[SimpleTree] reveal target does not exist: ' .. target
@@ -6300,6 +6488,35 @@ export def OnRevealActive(path: string = '')
     return
   endif
   RevealPath(target)
+enddef
+
+export def OnRevealActive(path: string = '')
+  if !s_open || s_root ==# '' || !WinValid()
+    echo '[SimpleTree] open the tree before revealing a path'
+    return
+  endif
+
+  var explicit = path !=# ''
+  var target = explicit ? RevealInputPath(path) : s_active_path
+  if explicit && IsForeignName(target)
+    # 名字给的是外部方案：缓冲区可能已经打开着，把它和它的窗口一起交出去。
+    var bnr = BufnrByName(target)
+    RevealForeign(target, bnr, bnr > 0 ? max([bufwinid(bnr), 0]) : 0)
+    return
+  endif
+  if !explicit
+    # 活动缓冲区是外部方案（remote:// 虚拟文件）时优先于 s_active_path：后者
+    # 只由本地文件更新，此刻指向的是用户更早编辑过的某个本地文件。
+    var subject = RevealSubjectBuffer()
+    if !empty(subject) && IsForeignName(subject.name)
+      RevealForeign(subject.name, subject.bufnr, subject.winid)
+      return
+    endif
+    if target ==# '' && !empty(subject) && subject.name !=# ''
+      target = NormPath(subject.name)
+    endif
+  endif
+  RevealLocalTarget(target, explicit)
 enddef
 
 export def OnPreview()
@@ -6545,15 +6762,45 @@ export def ExternalDropDirectory(): string
   return s_root
 enddef
 
+# Optional suite integration: the node under the cursor of this tab's tree
+# window — a file or a directory — or '' when the tree is not showing in the
+# current tab or the row is a loading/error placeholder.  SimpleRemote offers
+# it as the default source of its `gu` upload.
+export def ExternalSelectedPath(): string
+  var node = CursorNode()
+  return IsActionableNode(node) ? node.path : ''
+enddef
+
+# Same node as ExternalSelectedPath() as a fresh {path, is_dir} dict; {} when
+# nothing is selected.  Never the live index entry.
+export def ExternalSelectedNode(): dict<any>
+  var node = CursorNode()
+  if !IsActionableNode(node)
+    return {}
+  endif
+  return {path: node.path, is_dir: !!get(node, 'is_dir', false)}
+enddef
+
+# The marked set (<Space>/gm), sorted by path.  A fresh list; [] without marks.
+export def ExternalMarkedPaths(): list<string>
+  return MarkedPaths()
+enddef
+
 # Optional suite integration: switch the visible tree root without toggling
 # the tree window. Providers must pass a real local directory; SetRoot keeps
 # the normal cache, watcher, persistence, render, and RootChanged event path.
-export def ExternalSetRoot(path: string, source: string = 'external'): bool
+# opts.watch / opts.git (default true) switch the backend watcher and git
+# status off for this root only — SimpleRemote passes both as false for an
+# sshfs mount, where inotify never sees remote changes and status walks the
+# network — so idle mtime polling takes over.  Any other root change resets
+# them.
+export def ExternalSetRoot(path: string, source: string = 'external',
+    opts: dict<any> = {}): bool
   var target = fnamemodify(expand(path), ':p')
   if target ==# '' || !isdirectory(target)
     return false
   endif
-  SetRoot(target, false, source)
+  SetRoot(target, false, source, opts)
   return true
 enddef
 
@@ -6711,6 +6958,7 @@ export def TestGetState(): dict<any>
   return {
     caps: keys(s_backend_caps),
     watched: keys(s_watched),
+    root_opts: copy(s_root_opts),
     git_status_count: len(s_git_status),
     filter: s_filter_query,
     path_lines: len(s_path_lines),

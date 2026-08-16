@@ -17,7 +17,8 @@ SimpleTree 使用 Vim9 script，当前不支持 Neovim。
 - `<Space>` 标记节点（可视模式按选区标记），`c` / `x` / `D` 随即作用于整个标记集合；删除只确认一次，但每条路径的守卫逐个复验。
 - `s` 在名称、扩展名、修改时间、体积排序间循环，`gs` 反转顺序；目录始终优先，元数据按需异步获取并随缓存复用。
 - 可选明细列（`g:simpletree_columns` / `:SimpleTreeColumns`）：体积、修改时间、符号链接标记，右对齐显示在名字右侧，数据来自后台早就返回的 metadata。
-- 树缓冲区按键全部可通过 `g:simpletree_mappings` 覆盖或禁用。
+- 树缓冲区按键全部可通过 `g:simpletree_mappings` 覆盖或禁用；`'call:g:Func'` 形式的值把键交给别的插件的函数（会出现在 `?` 帮助里）。
+- 与 SimpleRemote 深度协作：导出光标节点 / 标记集合、按根关掉 watch 与 git status、把 `remote://` 缓冲区的定位交给提供方、复用 acwrite 窗口打开文件。
 - `User SimpleTree*` 自动命令事件（打开/关闭/换根/展开/文件操作等），便于第三方集成。
 - 后台限制并发扫描数量、合并协议输出 flush，快速展开大量目录时更稳定；watch 下的目录列表带失效信号缓存。
 - 每个 tabpage 一个树窗口，共用同一棵树：根目录、展开状态与缓存共享，第二个 tab 几乎零开销，关掉其中一个不影响其他 tab。
@@ -171,7 +172,13 @@ hit/miss、epoch 失效次数和被丢弃切片数。
 let g:simpletree_mappings = {'X': 'refresh', 'q': ''}
 ```
 
-键为按键序列，值为 action 名（见 `:help simpletree-mappings`）；空字符串禁用该键。
+键为按键序列，值为 action 名（见 `:help simpletree-mappings`）；空字符串禁用该键。值也可以是
+`'call:g:Func'` / `'call:plugin#Func'`：把键映射成 `<Cmd>call Func()<CR>`，供别的插件往树里挂
+自己的动作（函数内用 `simpletree#ExternalSelectedPath()` 读取当前选中节点），并列在 `?` 帮助末尾：
+
+```vim
+let g:simpletree_mappings = {'gu': 'call:g:SimpleRemoteUploadFromTree'}
+```
 
 根默认锁定；需要使用 `e`、`U`、`C`、`.` 或 `d` 改根时，先按 `L` 解锁。
 
@@ -224,6 +231,7 @@ SimpleTree 不会覆盖已存在的 `<leader>e` 映射。树缓冲区内全部�
 |---|---:|---|
 | `g:simpletree_keep_focus` | `1` | 打开文件后把焦点留在文件窗口；`0` 返回树 |
 | `g:simpletree_choose_window` | `1` | 多个候选编辑窗口且无法复用时询问目标 |
+| `g:simpletree_target_buftypes` | `['', 'acwrite']` | 可以作为编辑窗口复用的 buftype：普通文件与 acwrite（SimpleRemote 虚拟模式的 `remote://` 缓冲区）；设为 `['']` 回到只认普通缓冲区 |
 | `g:simpletree_split_force_right` | `1` | 创建新的垂直编辑分屏时放到右侧 |
 | `g:simpletree_split_below` | `1` | 水平分屏放到目标窗口下方 |
 | `g:simpletree_open_on_create` | `1` | 新建文件后立即在编辑区打开 |
@@ -248,13 +256,13 @@ SimpleTree 不会覆盖已存在的 `<leader>e` 映射。树缓冲区内全部�
 |---|---:|---|
 | `g:simpletree_git_status` | `1` | 显示 git 状态标记（需要后台 `git-status` 能力与 git 可执行） |
 | `g:simpletree_git_status_symbols` | `{}` | 覆盖状态符号，键为 `M/S/U/C/D` |
-| `g:simpletree_use_watcher` | `1` | 使用后台文件系统 watch 推送刷新；`0` 回到 mtime 轮询 |
+| `g:simpletree_use_watcher` | `1` | 使用后台文件系统 watch 推送刷新；`0` 回到 mtime 轮询。提供方可通过 `simpletree#ExternalSetRoot()` 的 opts 只对某个根关掉 |
 | `g:simpletree_filter_mode` | `'auto'` | `F` 过滤的数据来源：`auto`（有 `search` 能力就用后台）/ `daemon` / `loaded`（只看已展开部分，历史行为）|
 | `g:simpletree_filter_max_results` | `500` | 后台过滤一次最多收集多少条命中 |
 | `g:simpletree_columns` | `[]` | 名字右侧的明细列：`size` / `mtime` / `symlink`；开启会让列表请求带 metadata |
 | `g:simpletree_column_time_format` | `'%m-%d %H:%M'` | mtime 列的 `strftime()` 格式 |
 | `g:simpletree_column_sep` | `'  '` | 两个明细列之间的分隔 |
-| `g:simpletree_mappings` | `{}` | 树缓冲区按键覆盖表 `{键: action}`；空字符串禁用 |
+| `g:simpletree_mappings` | `{}` | 树缓冲区按键覆盖表 `{键: action}`；空字符串禁用；`'call:g:Func'` 映射到自定义函数 |
 
 git 状态高亮组：`SimpleTreeGitModified`、`SimpleTreeGitStaged`、`SimpleTreeGitUntracked`、`SimpleTreeGitConflict`、`SimpleTreeGitDeleted`，均为 `highlight default link`，可在 colorscheme 中覆盖。
 
@@ -264,7 +272,7 @@ git 状态高亮组：`SimpleTreeGitModified`、`SimpleTreeGitStaged`、`SimpleT
 autocmd User SimpleTreeFileCreated echom 'created: ' .. g:simpletree_event.path
 ```
 
-事件：`SimpleTreeOpen`、`SimpleTreeClose`、`SimpleTreeRootChanged`、`SimpleTreeNodeOpened`、`SimpleTreeDirExpanded`、`SimpleTreeDirCollapsed`、`SimpleTreeFileCreated`、`SimpleTreeFileDeleted`、`SimpleTreeFileRenamed`、`SimpleTreeGitStatusUpdated`、`SimpleTreeFilterChanged`。`SimpleTreeRootChanged` 对所有换根入口统一触发，包含 `root`（兼容别名 `path`）、`old_root` 和 `source`；`source` 会区分 `command`、`here`、`up`、`prompt`、`cwd`、`current`、`auto-follow` 与外部调用方。
+事件：`SimpleTreeOpen`、`SimpleTreeClose`、`SimpleTreeRootChanged`、`SimpleTreeNodeOpened`、`SimpleTreeDirExpanded`、`SimpleTreeDirCollapsed`、`SimpleTreeFileCreated`、`SimpleTreeFileDeleted`、`SimpleTreeFileRenamed`、`SimpleTreeGitStatusUpdated`、`SimpleTreeFilterChanged`、`SimpleTreeRevealForeign`。`SimpleTreeRootChanged` 对所有换根入口统一触发，包含 `root`（兼容别名 `path`）、`old_root` 和 `source`；`source` 会区分 `command`、`here`、`up`、`prompt`、`cwd`、`current`、`auto-follow` 与外部调用方。`SimpleTreeRevealForeign` 在定位目标是带 URL 方案的缓冲区（`remote:///srv/app/x`）且映射不到本地文件时触发，载荷 `{name, path, bufnr, winid}`，并且在那个缓冲区自己的窗口里触发，由提供方（SimpleRemote）打开自己的树。
 
 ### 文件操作、后台与诊断
 
@@ -418,12 +426,39 @@ let g:simpletree_use_nerdfont = 0
 
 ## simple* plugin integration
 
-SimpleRemote can query `simpletree#ExternalDropDirectory()` to copy a remote
-file directly into the selected local directory (falling back to the tree
-root). Path yanks use `simpleclipboard#CopyText()` when SimpleClipboard is
-loaded, while retaining the native clipboard fallback.
+Everything here is optional and feature-detected on both sides; SimpleTree
+never requires a sibling plugin. See `:help simpletree-suite-integration`.
 
-`simpletree#ExternalSetRoot(path[, source])` lets SimpleRemote switch an
-already-open mounted tree without toggling its window. The normal root-change
-event, watchers, cache, and persisted tree state still apply. Providers can
-identify their own echo by passing a stable `source` name.
+- `simpletree#ExternalDropDirectory()` — the selected directory (a file's
+  parent), falling back to the tree root. SimpleRemote copies remote files
+  there.
+- `simpletree#ExternalSelectedPath()` — the path under the cursor of this
+  tab's tree window (file or directory), `''` without one.
+  `simpletree#ExternalSelectedNode()` returns the same as a fresh
+  `{path, is_dir}` dict, `simpletree#ExternalMarkedPaths()` the marked set
+  sorted by path. SimpleRemote offers the selection as the default source of
+  its `gu` upload.
+- `simpletree#ExternalSetRoot(path[, source[, opts]])` — switch an
+  already-open mounted tree without toggling its window. The normal
+  root-change event, watchers, cache, and persisted tree state still apply;
+  providers identify their own echo by passing a stable `source` name.
+  `opts` may set `watch` and/or `git` to `false` for that root only:
+  SimpleRemote does so for sshfs projections, where inotify never sees
+  remote changes and git status walks the network, and idle mtime polling
+  takes over. Any other root change restores the defaults.
+- Foreign buffers: revealing a `remote:///…` buffer (`f`,
+  `:SimpleTreeReveal`) asks `g:SimpleRemoteLocalPath()` for a projected
+  local file first and otherwise fires `User SimpleTreeRevealForeign` with
+  `{name, path, bufnr, winid}` so the provider can open its own tree — never
+  an error. The event fires with that buffer's window current (the cursor
+  comes back when the listener opens nothing), so a provider may read the
+  current buffer instead of the payload. Such acwrite windows are also
+  reused as edit targets (`g:simpletree_target_buftypes`).
+- Custom keys: `g:simpletree_mappings` values of the form `'call:g:Func'`
+  (listed in the `?` help), or a sibling's own
+  `autocmd FileType simpletree nnoremap <buffer> …` — the filetype is set
+  before SimpleTree installs its own maps, so only colliding keys are
+  overridden.
+
+Path yanks use `simpleclipboard#CopyText()` when SimpleClipboard is loaded,
+while retaining the native clipboard fallback.

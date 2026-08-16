@@ -2,6 +2,40 @@
 
 本文件记录 SimpleTree 面向用户的重要变化。
 
+## Unreleased - 2026-08-16
+
+### 新增：与 SimpleRemote 深度协作的集成面
+
+- 导出 `simpletree#ExternalSelectedPath()`（当前 tab 树窗口光标节点的路径，
+  文件或目录；没有则 `''`）、`simpletree#ExternalSelectedNode()`（同一节点的
+  `{path, is_dir}` 拷贝）与 `simpletree#ExternalMarkedPaths()`（按路径排序的
+  标记集合）。此前外部只能通过 `ExternalDropDirectory()` 拿到目录，文件身份
+  丢失；SimpleRemote 用它把选中的本地文件/目录作为 `gu` 上传的默认来源。
+- `g:simpletree_mappings` 的值接受 `'call:g:Func'` / `'call:plugin#Func'`：
+  按键映射成 `<Cmd>call Func()<CR>`，供别的插件往树里挂自己的动作；这些键会
+  列在 `?` 帮助末尾。形状不对的名字和未知 action 一样被丢弃并记日志。
+- `simpletree#ExternalSetRoot(path, source, opts)`：`opts.watch` / `opts.git`
+  （默认 `true`）只对这一个根关掉后台 watch 与 git status——sshfs 挂载上
+  inotify 永远收不到远端改动，git status 每次都走网络——关掉 watch 后空闲
+  刷新退回 mtime 轮询。任何别的换根入口都会恢复默认；`:SimpleTreeHealth`
+  会说明"disabled for this root by its provider"。
+- 定位带 URL 方案的缓冲区（SimpleRemote 虚拟模式的 `remote:///srv/app/x`）：
+  `f` / `:SimpleTreeReveal` 先问 `g:SimpleRemoteLocalPath()` 有没有投影到本地
+  的可读文件，有就照常定位；没有就触发 `User SimpleTreeRevealForeign`
+  （载荷 `{name, path, bufnr, winid}`）交给提供方开自己的树，不再报
+  "no active file to reveal" 或悄悄定位到更早的某个本地文件。
+  `:SimpleTreeReveal remote:///…` 也不再被拼到根下面。事件在那个缓冲区自己的
+  窗口里触发（提供方通常照着"当前缓冲区"决定要打开什么），监听方没有自己开窗口
+  时光标回到按键的地方；在事件里再次调用 `:SimpleTreeReveal` 不会递归。
+  `d` 键对这类窗口做同样的映射。
+- acwrite 窗口（`remote://` 缓冲区）现在也是可复用的编辑窗口：从树里打开
+  本地文件落进最近使用的那个窗口，而不是每次被迫在右侧新开分屏；`:SimpleTree`
+  从这样的窗口切换、进入这样的窗口时都会把它记为目标窗口。新增
+  `g:simpletree_target_buftypes`（默认 `['', 'acwrite']`），设为 `['']`
+  回到只认普通缓冲区的旧行为。
+- 新增 `tests/vim_external_api.vim` 覆盖以上全部；SimpleRemote 在测试里只以
+  桩函数出现，插件不依赖它。
+
 ## Unreleased - 2026-08-09
 
 ### 修复：两个 Vim 实例不再互相抹掉会话状态
