@@ -36,6 +36,22 @@
 - 新增 `tests/vim_external_api.vim` 覆盖以上全部；SimpleRemote 在测试里只以
   桩函数出现，插件不依赖它。
 
+### 修正（同一批集成面的回归）
+
+- 外部方案缓冲区没人接手时，`f` / `:SimpleTreeReveal` 退回活动文件。既没有
+  `g:SimpleRemoteLocalPath()` 投影、也没有注册 `User SimpleTreeRevealForeign`
+  的提供方时（纯本地环境里 fugitive 的 acwrite 索引缓冲区就是这样），之前会
+  丢下一句 "no local file to reveal" 什么都不做；提供方在事件里回调
+  `:SimpleTreeReveal`（SimpleRemote 未连接时的路径）时更是一声不响。现在这两
+  种情况都回到"定位最近打开的那个本地文件"，也就是支持外部方案之前的行为。
+- 目标窗口里的缓冲区改过还没存、且 `'hidden'` 关着（Vim 默认）时，复用该窗口
+  的 `:edit` 会抛 `E37`。`remote://` 这类 acwrite 缓冲区在保存前一直是
+  modified，而它们刚刚才成为候选窗口，于是从树里打开文件会整个失败并把光标留
+  在那个窗口里。现在这一步失败会就地新开分屏，文件照常打开。
+- `g:simpletree_mappings` 里 `'call:Foo'` 这种没有作用域的裸名字不再被安装：
+  文档说的就是 `g:Name` 或 `plugin#Name`，裸名字装上去只会在每次按键时抛
+  `E117`，现在和未知 action 一样在配置期被丢弃并告警。
+
 ## Unreleased - 2026-08-09
 
 ### 修复：两个 Vim 实例不再互相抹掉会话状态

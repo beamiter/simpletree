@@ -25,6 +25,18 @@ writefile(['top'], base .. '/top.txt')
 writefile(['child'], base .. '/folder/child.txt')
 writefile(['bee'], base .. '/other/bee.txt')
 
+# opts.git is only observable against a root that really is a repository with
+# something to report; without git on $PATH that half of the test is skipped.
+var has_git = executable('git') ? true : false
+var gitroot = tempname()
+if has_git
+  mkdir(gitroot, 'p')
+  system('git -C ' .. shellescape(gitroot) .. ' init -q')
+  system('git -C ' .. shellescape(gitroot)
+    .. ' -c user.email=t@t -c user.name=t commit -q --allow-empty -m init')
+  writefile(['dirty'], gitroot .. '/dirty.txt')
+endif
+
 g:simpletree_daemon_path = daemon
 g:simpletree_persist_width = 0
 g:simpletree_persist_state = 0
@@ -41,6 +53,7 @@ g:simpletree_mappings = {
   'gU': 'call:testplugin#Upload',
   'gB': 'call:not a function',
   'gV': 'call:',
+  'gq': 'call:UnwatchAllDirs',
 }
 execute 'set runtimepath^=' .. fnameescape(repo)
 g:simpletree_state_file = tempname() .. '/state.json'
@@ -153,6 +166,11 @@ assert_equal('call:g:TestCustomUpload', get(mapped, 'gu', ''))
 assert_equal('call:testplugin#Upload', get(mapped, 'gU', ''))
 assert_false(has_key(mapped, 'gB'), 'malformed call: action must be dropped')
 assert_false(has_key(mapped, 'gV'), 'empty call: action must be dropped')
+# A bare name has no scope the mapping could reach -- it is neither a global
+# nor an autoload function, and it certainly cannot name one of the tree's own
+# script-local functions -- so it must be dropped at configuration time rather
+# than installed to die with E117 on every keypress.
+assert_false(has_key(mapped, 'gq'), 'unscoped call: action must be dropped')
 assert_equal('open', get(mapped, 'o', ''), 'built-in actions survive next to custom ones')
 var tw = TreeWin()
 win_execute(tw, 'g:TestMapGu = maparg("gu", "n")')
@@ -161,6 +179,8 @@ win_execute(tw, 'g:TestMapGU = maparg("gU", "n")')
 assert_match('call testplugin#Upload()', get(g:, 'TestMapGU', ''))
 win_execute(tw, 'g:TestMapGB = maparg("gB", "n")')
 assert_equal('', get(g:, 'TestMapGB', 'x'), 'malformed action must not be installed')
+win_execute(tw, 'g:TestMapGq = maparg("gq", "n")')
+assert_equal('', get(g:, 'TestMapGq', 'x'), 'unscoped action must not be installed')
 SelectPath(base .. '/folder')
 simpletree#OnExpand()
 assert_true(WaitFor(() => LineOfPath(base .. '/folder/child.txt') > 0), 'folder should expand')
@@ -227,6 +247,50 @@ assert_equal({watch: false, git: true}, simpletree#TestGetState().root_opts)
 assert_true(simpletree#ExternalSetRoot(base, 'simpleremote'))
 assert_equal({watch: true, git: true}, simpletree#TestGetState().root_opts)
 assert_true(WaitFor(() => LineOfPath(base .. '/top.txt') > 0))
+
+# The git half of the same switch.  Everything else in this file runs with
+# git status off globally, which would leave the per-root flag dead code: turn
+# it on for this section only, against a root that is a real repository.
+if has_git
+  g:simpletree_git_status = 1
+  assert_true(simpletree#ExternalSetRoot(gitroot, 'simpleremote'))
+  assert_true(WaitFor(() => LineOfPath(gitroot .. '/dirty.txt') > 0), 'git fixture should be listed')
+  assert_equal({watch: true, git: true}, simpletree#TestGetState().root_opts)
+  assert_true(WaitFor(() => simpletree#TestGetState().git_status_count > 0),
+    'without the opt-out the same root must produce git marks')
+  var git_health = substitute(execute('call simpletree#Health()'), '\n', ' || ', 'g')
+  assert_true(git_health =~# 'git status: \d\+ entr',
+    'health should report a working git query: ' .. git_health)
+
+  # ...and the provider can switch it off for its own root, which is the point
+  # on an sshfs mount: git status would walk the network on every refresh.
+  assert_true(simpletree#ExternalSetRoot(gitroot, 'simpleremote', {git: false}))
+  assert_equal({watch: true, git: false}, simpletree#TestGetState().root_opts)
+  assert_true(WaitFor(() => LineOfPath(gitroot .. '/dirty.txt') > 0))
+  # The query is debounced by 200ms; give it more than that to prove it never
+  # goes out rather than merely has not gone out yet.
+  sleep 800m
+  assert_equal(0, simpletree#TestGetState().git_status_count,
+    'git:false must not issue a git status query for this root')
+  git_health = substitute(execute('call simpletree#Health()'), '\n', ' || ', 'g')
+  assert_true(git_health =~# 'git status: disabled for this root by its provider',
+    'health must name the provider as the reason: ' .. git_health)
+  # A refresh of the same root does not sneak the query back in either.
+  simpletree#OnRefresh()
+  sleep 800m
+  assert_equal(0, simpletree#TestGetState().git_status_count,
+    'refreshing a git:false root must stay quiet')
+
+  # Any other root change resets it, and the marks come back.
+  assert_true(simpletree#ExternalSetRoot(gitroot, 'simpleremote'))
+  assert_equal({watch: true, git: true}, simpletree#TestGetState().root_opts)
+  assert_true(WaitFor(() => simpletree#TestGetState().git_status_count > 0),
+    'the reset must restore git status for the same root')
+  g:simpletree_git_status = 0
+  assert_true(simpletree#ExternalSetRoot(base, 'simpleremote'))
+  assert_true(WaitFor(() => LineOfPath(base .. '/top.txt') > 0))
+endif
+
 augroup TestExternalRoot
   autocmd!
 augroup END
@@ -268,6 +332,39 @@ sleep 100m
 assert_equal(3, winnr('$'), 'with acwrite excluded a new split is forced')
 assert_equal(remote_buf, winbufnr(remote_win), 'the acwrite window must be left alone')
 unlet g:simpletree_target_buftypes
+only!
+SimpleTreeClose
+sleep 100m
+
+# A remote:// buffer is modified for as long as the edit is unsaved, and with
+# 'hidden' off (Vim's default) :edit into that window raises E37.  Before
+# acwrite windows were candidates at all such a window simply forced a split;
+# now that it is a candidate the reuse must fall back to that split rather than
+# throwing out of the mapping and leaving the cursor in the remote buffer.
+assert_false(&hidden, 'this case only exists with nohidden')
+enew
+execute 'silent file remote:///srv/app/dirty.py'
+setlocal buftype=acwrite
+setline(1, 'unsaved remote edit')
+var dirty_win = win_getid()
+var dirty_buf = bufnr('%')
+assert_true(getbufvar(dirty_buf, '&modified') ? true : false, 'fixture buffer must be modified')
+execute 'SimpleTree ' .. fnameescape(base)
+assert_true(WaitFor(() => LineOfPath(base .. '/top.txt') > 0))
+assert_equal(dirty_win, Vars().s_target_winid)
+SelectPath(base .. '/top.txt')
+try
+  simpletree#OnEnter()
+catch
+  assert_report('opening next to a modified acwrite buffer threw: ' .. v:exception)
+endtry
+sleep 100m
+assert_equal(3, winnr('$'), 'a target window that cannot be reused must be split')
+assert_equal(dirty_buf, winbufnr(dirty_win), 'the unsaved buffer must be left alone')
+assert_equal(base .. '/top.txt', Vars().s_active_path, 'the file must still be opened')
+assert_notequal(dirty_win, Vars().s_target_winid, 'the new split becomes the edit target')
+assert_equal(TreeWin(), win_getid(), 'the cursor must come back to the tree, not stay in the remote buffer')
+setbufvar(dirty_buf, '&modified', 0)
 only!
 SimpleTreeClose
 sleep 100m
@@ -381,13 +478,17 @@ quit
 
 # A listener that bounces back into :SimpleTreeReveal (a provider deciding on
 # the current buffer, which after its own window switch is no longer the
-# remote one) must not recurse.
+# remote one) must not recurse.  This is also what SimpleRemote does while it
+# is disconnected, so the bounce must not turn f into a silent no-op either:
+# the nested call falls back to the last local file the tree opened.
 g:foreign_events = []
 g:foreign_context = []
 augroup TestForeign
   autocmd!
   autocmd User SimpleTreeRevealForeign call g:RecordForeign() | SimpleTreeReveal
 augroup END
+SelectPath(base .. '/folder')
+assert_notequal(base .. '/top.txt', CursorPath())
 win_gotoid(tree_win)
 try
   simpletree#OnRevealActive()
@@ -395,6 +496,8 @@ catch
   assert_report('re-entrant reveal raised: ' .. v:exception)
 endtry
 assert_equal(1, len(g:foreign_events), 'a re-entrant provider must see exactly one event')
+assert_equal(base .. '/top.txt', CursorPath(),
+  'a provider that cannot act must leave f with the active file, not with nothing')
 
 # Projected mode: g:SimpleRemoteLocalPath maps the remote path to a readable
 # local file, which is revealed as usual and never reaches the provider.
@@ -434,8 +537,55 @@ augroup TestForeign
 augroup END
 delfunction g:SimpleRemoteLocalPath
 
+# ----------------- 6. a foreign buffer nobody claims is not a dead end ---
+# On a plain local setup nothing listens for SimpleTreeRevealForeign and there
+# is no g:SimpleRemoteLocalPath -- yet acwrite buffers exist anyway (fugitive's
+# index buffers are the common case).  Handing such a buffer to a provider that
+# is not there must not cost the user the reveal: f falls back to the active
+# file, which is exactly what it did before foreign names were understood.
+assert_false(exists('#User#SimpleTreeRevealForeign'), 'no provider may be registered here')
+assert_false(exists('*g:SimpleRemoteLocalPath'), 'no projection may be available here')
+assert_true(simpletree#ExternalSetRoot(base, 'test'))
+assert_true(WaitFor(() => LineOfPath(base .. '/top.txt') > 0))
+only!
+SimpleTreeClose
+sleep 100m
+enew
+execute 'SimpleTree ' .. fnameescape(base)
+assert_true(WaitFor(() => LineOfPath(base .. '/top.txt') > 0))
+SelectPath(base .. '/top.txt')
+simpletree#OnEnter()
+sleep 100m
+assert_equal(base .. '/top.txt', Vars().s_active_path)
+
+# A fugitive-style acwrite window becomes the most recently used editor window.
+wincmd p
+new
+execute 'silent file fugitive:///repo/.git//0/some/file.txt'
+setlocal buftype=acwrite
+doautocmd BufEnter
+assert_equal(win_getid(), Vars().s_target_winid, 'the acwrite window is the edit target')
+
+SelectPath(base .. '/other')
+assert_notequal(base .. '/top.txt', CursorPath())
+win_gotoid(TreeWin())
+var unclaimed = execute('call simpletree#OnRevealActive()')
+assert_equal(base .. '/top.txt', CursorPath(),
+  'an unclaimed foreign buffer must not swallow f')
+assert_false(unclaimed =~# 'no local file to reveal',
+  'the fallback must be quiet, not an excuse: ' .. unclaimed)
+
+# When there is no local file behind the name either, say so instead of
+# failing silently.
+var missing = execute('call simpletree#OnRevealActive("fugitive:///repo/.git//0/nowhere.txt")')
+assert_true(missing =~# 'no local file to reveal for fugitive:///repo/.git//0/nowhere.txt',
+  'an unclaimed explicit foreign path must be reported: ' .. missing)
+
 SimpleTreeClose
 delete(base, 'rf')
+if has_git
+  delete(gitroot, 'rf')
+endif
 if !empty(v:errors)
   writefile(v:errors, '/dev/stderr')
   cquit

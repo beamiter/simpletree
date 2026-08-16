@@ -97,7 +97,10 @@ under lib/ first, then target/release/ and target/debug/ for development use.
         SimpleRemote virtual-mode files) has no local row: when a projection
         maps it to a readable local file that file is revealed, otherwise the
         request is handed to a provider through User SimpleTreeRevealForeign
-        without an error.  See |simpletree-suite-integration|.
+        without an error.  With no provider listening either, an argumentless
+        reveal falls back to the active file as it always did, so an unclaimed
+        acwrite buffer (fugitive's index buffers, say) never costs you the
+        reveal.  See |simpletree-suite-integration|.
 
                                                      *:SimpleTreeClose*
 :SimpleTreeClose
@@ -289,8 +292,10 @@ arguments in the tree buffer, so it can inspect the selection through
 |simpletree#ExternalSelectedPath()| and friends: >
   let g:simpletree_mappings = {'gu': 'call:g:SimpleRemoteUploadFromTree'}
 <
-Such keys are listed at the end of the ? help panel.  Malformed names are
-dropped like unknown actions.  A sibling plugin can also install its own
+Such keys are listed at the end of the ? help panel.  Malformed names, and
+unscoped ones ("call:Name", which the mapping could never reach), are dropped
+like unknown actions instead of being installed to fail on every keypress.
+A sibling plugin can also install its own
 buffer mapping from `autocmd FileType simpletree`, which is how SimpleRemote
 adds gu; SimpleTree only overrides keys it maps itself.
 
@@ -328,7 +333,9 @@ payload; the window switch skips autocommands, and when the listener opened no
 window of its own the cursor returns to where the reveal was requested.  With
 no such window (an explicit path for a buffer that is not loaded) the payload
 is all there is.  A listener that calls :SimpleTreeReveal again receives no
-second event, so a provider that cannot act simply does nothing.
+second event, so a provider that cannot act cannot loop; that nested call
+falls back to the active file instead, which is what happens when SimpleRemote
+handles the event while it is disconnected.
 
 ==============================================================================
 6. OPTIONS                                        *simpletree-options*
@@ -429,8 +436,11 @@ g:simpletree_target_buftypes
         tree opens files into and follows as the most recent editor window:
         ordinary file buffers and acwrite buffers such as SimpleRemote's
         virtual-mode remote:// files, so opening a local file from the tree
-        reuses that window instead of forcing a new split.  Set [''] for the
-        historical normal-buffers-only behavior.
+        reuses that window instead of forcing a new split.  A window whose
+        buffer cannot be replaced in place (unsaved changes with 'hidden' off,
+        which is every remote:// buffer with a pending edit) is split instead,
+        so the open never fails half-way.  Set [''] for the historical
+        normal-buffers-only behavior.
 
                                              *g:simpletree_split_force_right*
 g:simpletree_split_force_right
@@ -964,9 +974,12 @@ Foreign buffers ~
         that when it is readable; otherwise it fires
         User SimpleTreeRevealForeign (see |simpletree-events|) and returns
         quietly, with the foreign buffer's own window current so the provider
-        can decide from the current buffer.  The d key resolves such a window
-        the same way before falling back to the current directory.  acwrite
-        windows are also edit targets, see |g:simpletree_target_buftypes|.
+        can decide from the current buffer.  With neither a projection nor a
+        listener the reveal falls back to the active file, so a plain local
+        setup keeps the behaviour it had before foreign names were understood.
+        The d key resolves such a window the same way before falling back to
+        the current directory.  acwrite windows are also edit targets, see
+        |g:simpletree_target_buftypes|.
 
 Custom keys ~
         Sibling plugins add tree keys either through the "call:" form of

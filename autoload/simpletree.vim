@@ -3395,7 +3395,10 @@ const DEFAULT_KEYS: dict<string> = {
 # 'call:g:Func' / 'call:plugin#Func'：按键映射成 <Cmd>call Func()<CR>，供别的
 # 插件（SimpleRemote 的 gu 上传等）往树里挂自己的动作，而且会出现在 ? 帮助里。
 # 只校验名字的形状；函数本身允许是稍后才加载的 autoload 函数。
-const CUSTOM_ACTION_PATTERN: string = '^call:\%(g:\)\=\%(\h\w*#\)*\h\w*$'
+# 名字必须自带作用域：g: 全局函数，或至少一个 # 的 autoload 函数。裸名字
+# （'call:Foo'）在这里是够不着的——脚本局部函数不在其中——装上去只会在每次
+# 按键时抛 E117，所以按"未知动作"处理，配置时就丢掉并告警。
+const CUSTOM_ACTION_PATTERN: string = '^call:\%(g:\h\w*\|\%(g:\)\=\%(\h\w*#\)\+\h\w*\)$'
 
 def CustomActionFunc(action: string): string
   return action =~# CUSTOM_ACTION_PATTERN ? strpart(action, len('call:')) : ''
@@ -4496,6 +4499,17 @@ def ToggleDir(path: string)
   Render()
 enddef
 
+# 在当前窗口旁新开一个分屏并在里面打开 p；新窗口成为此后的编辑目标。
+def OpenInNewSplit(p: string)
+  if !!get(g:, 'simpletree_split_force_right', 1)
+    execute 'belowright vsplit'
+  else
+    execute 'vsplit'
+  endif
+  execute 'edit ' .. fnameescape(p)
+  s_target_winid = win_getid()
+enddef
+
 def OpenFile(p: string)
   if p ==# ''
     return
@@ -4510,16 +4524,19 @@ def OpenFile(p: string)
 
   if target_win != 0
     call win_gotoid(target_win)
-    execute 'edit ' .. fnameescape(p)
+    try
+      execute 'edit ' .. fnameescape(p)
+    catch
+      # 目标窗口里的缓冲区改过还没存，而 'hidden' 关着（Vim 默认）：:edit 抛
+      # E37 / E162。remote:// 这类 acwrite 缓冲区在编辑期间天然是 modified 的，
+      # 从前它们根本不是候选窗口、这一步会走分屏；现在别让整个打开动作失败，
+      # 也别把用户丢在那个窗口里，就地另开一个分屏。
+      Log('cannot reuse target window (' .. v:exception .. '); opening a split', 'WarningMsg')
+      OpenInNewSplit(p)
+    endtry
   else
     # 无候选或选择了“新建分屏”时，右侧新建分屏并打开
-    if !!get(g:, 'simpletree_split_force_right', 1)
-      execute 'belowright vsplit'
-    else
-      execute 'vsplit'
-    endif
-    execute 'edit ' .. fnameescape(p)
-    s_target_winid = win_getid()
+    OpenInNewSplit(p)
   endif
   s_active_path = AbsPath(p)
   Emit('NodeOpened', {path: s_active_path})
@@ -6421,21 +6438,22 @@ enddef
 # 目标是外部方案缓冲区（remote:///…）。投影模式下映射回本地路径就照常定位；
 # 映射不到（虚拟模式）就把它交给提供方：User SimpleTreeRevealForeign，载荷
 # {name, path, bufnr, winid}。这里不报错——树里没有这个文件不是错误。
-def RevealForeign(name: string, bnr: number, winid: number)
+# 返回值是"这个名字已经有人接手了"：false 表示既映射不回本地、也没有提供方能
+# 处理，调用方应当退回原来的行为（reveal 最近打开的那个本地文件）。
+def RevealForeign(name: string, bnr: number, winid: number): bool
   var local = ForeignLocalPath(name)
   if local !=# ''
     RevealLocalTarget(local, false)
-    return
+    return true
   endif
   if s_reveal_foreign_depth > 0
     # 监听方在处理事件时又调回了 :SimpleTreeReveal（例如按当前缓冲区判断
-    # 而当前缓冲区是树本身）；再发一遍只会无限递归。
-    return
+    # 而当前缓冲区是树本身）；再发一遍只会无限递归。外层那次事件已经发出去
+    # 了，嵌套的这次就当没人接手，让它去走本地回退。
+    return false
   endif
   if !exists('#User#SimpleTreeRevealForeign')
-    # 没有提供方接手：说一声就好，树里确实没有这个文件。
-    echo '[SimpleTree] no local file to reveal for ' .. name
-    return
+    return false
   endif
   s_reveal_foreign_depth += 1
   try
@@ -6443,6 +6461,7 @@ def RevealForeign(name: string, bnr: number, winid: number)
   finally
     s_reveal_foreign_depth -= 1
   endtry
+  return true
 enddef
 
 # 事件在那个外部缓冲区自己的窗口里触发（知道是哪个窗口的时候）：提供方通常
@@ -6501,18 +6520,30 @@ export def OnRevealActive(path: string = '')
   if explicit && IsForeignName(target)
     # 名字给的是外部方案：缓冲区可能已经打开着，把它和它的窗口一起交出去。
     var bnr = BufnrByName(target)
-    RevealForeign(target, bnr, bnr > 0 ? max([bufwinid(bnr), 0]) : 0)
+    if !RevealForeign(target, bnr, bnr > 0 ? max([bufwinid(bnr), 0]) : 0)
+      echo '[SimpleTree] no local file to reveal for ' .. target
+    endif
     return
   endif
   if !explicit
-    # 活动缓冲区是外部方案（remote:// 虚拟文件）时优先于 s_active_path：后者
-    # 只由本地文件更新，此刻指向的是用户更早编辑过的某个本地文件。
+    # 活动缓冲区是外部方案（remote:// 虚拟文件）时先于 s_active_path 尝试：
+    # 后者只由本地文件更新，此刻指向的是用户更早编辑过的某个本地文件。只是
+    # "先试"而不是"取代"——真有人接得住才算数，见下面的回退。
     var subject = RevealSubjectBuffer()
     if !empty(subject) && IsForeignName(subject.name)
-      RevealForeign(subject.name, subject.bufnr, subject.winid)
-      return
-    endif
-    if target ==# '' && !empty(subject) && subject.name !=# ''
+      if RevealForeign(subject.name, subject.bufnr, subject.winid)
+        return
+      endif
+      # 没人接手：既没有 g:SimpleRemoteLocalPath 能把它映射回本地，也没有注册
+      # User SimpleTreeRevealForeign 的提供方。这时把优先权还给 s_active_path
+      # ——fugitive 的索引缓冲区之类的 acwrite 窗口只是碰巧是最近的编辑窗口，
+      # 不该让 f 对着一个本来能用的活动文件失灵（这也是引入外部方案支持之前
+      # 的行为）。实在也没有本地文件可退，才说明是哪个名字定位不了。
+      if target ==# '' || !PathExists(target)
+        echo '[SimpleTree] no local file to reveal for ' .. subject.name
+        return
+      endif
+    elseif target ==# '' && !empty(subject) && subject.name !=# ''
       target = NormPath(subject.name)
     endif
   endif

@@ -174,7 +174,8 @@ let g:simpletree_mappings = {'X': 'refresh', 'q': ''}
 
 键为按键序列，值为 action 名（见 `:help simpletree-mappings`）；空字符串禁用该键。值也可以是
 `'call:g:Func'` / `'call:plugin#Func'`：把键映射成 `<Cmd>call Func()<CR>`，供别的插件往树里挂
-自己的动作（函数内用 `simpletree#ExternalSelectedPath()` 读取当前选中节点），并列在 `?` 帮助末尾：
+自己的动作（函数内用 `simpletree#ExternalSelectedPath()` 读取当前选中节点），并列在 `?` 帮助末尾。
+名字必须带作用域（`g:` 或 `#`），裸名字和未知 action 一样被丢弃：
 
 ```vim
 let g:simpletree_mappings = {'gu': 'call:g:SimpleRemoteUploadFromTree'}
@@ -452,10 +453,15 @@ never requires a sibling plugin. See `:help simpletree-suite-integration`.
   `{name, path, bufnr, winid}` so the provider can open its own tree — never
   an error. The event fires with that buffer's window current (the cursor
   comes back when the listener opens nothing), so a provider may read the
-  current buffer instead of the payload. Such acwrite windows are also
-  reused as edit targets (`g:simpletree_target_buftypes`).
-- Custom keys: `g:simpletree_mappings` values of the form `'call:g:Func'`
-  (listed in the `?` help), or a sibling's own
+  current buffer instead of the payload. With neither a projection nor a
+  listener the reveal falls back to the active file, so a plain local setup
+  (fugitive's acwrite index buffers) keeps the behaviour it always had. Such
+  acwrite windows are also reused as edit targets
+  (`g:simpletree_target_buftypes`); one holding unsaved changes that cannot be
+  replaced in place is split instead of failing the open.
+- Custom keys: `g:simpletree_mappings` values of the form `'call:g:Func'` or
+  `'call:plugin#Func'` (listed in the `?` help; an unscoped `'call:Func'` is
+  dropped like an unknown action), or a sibling's own
   `autocmd FileType simpletree nnoremap <buffer> …` — the filetype is set
   before SimpleTree installs its own maps, so only colliding keys are
   overridden.
