@@ -1356,6 +1356,59 @@ def BNextId(): number
   return s_bnext_id
 enddef
 
+# Streaming list requests do not go through simplecore#Request(): one logical
+# reply is several list_chunk events, so the supervisor cannot know which one
+# is final.  Give that stream its own deadline; otherwise a daemon that sends
+# an early chunk and never sends done leaves s_loading/s_pending wedged forever.
+def ScanRequestTimeout(): number
+  var configured = get(g:, 'simpletree_scan_timeout', 15000)
+  if type(configured) != v:t_number || configured <= 0
+    return 0
+  endif
+  return min([600000, max([100, configured])])
+enddef
+
+def RemoveBackendCallback(id: number): dict<any>
+  if id <= 0 || !has_key(s_bcbs, id)
+    return {}
+  endif
+  var entry = remove(s_bcbs, string(id))
+  var timer = get(entry, 'timer', 0)
+  if timer > 0
+    try | timer_stop(timer) | catch | endtry
+  endif
+  return entry
+enddef
+
+def ClearBackendCallbacks()
+  for id in keys(s_bcbs)
+    RemoveBackendCallback(str2nr(id))
+  endfor
+enddef
+
+def ListRequestTimedOut(id: number)
+  var entry = RemoveBackendCallback(id)
+  if empty(entry)
+    return
+  endif
+  if BIsRunning()
+    BSend({type: 'cancel', id: id})
+  endif
+  try
+    entry.OnError('directory scan timed out')
+  catch
+    Log('timeout callback failed: ' .. v:exception)
+  endtry
+enddef
+
+def ArmListRequestTimeout(id: number)
+  var timeout = ScanRequestTimeout()
+  if timeout <= 0 || !has_key(s_bcbs, id)
+    return
+  endif
+  s_bcbs[id].timer = timer_start(timeout, (_) => ListRequestTimedOut(id))
+enddef
+
 # 进程生命周期交给 vendored simplecore supervisor：job_status 真实存活判定、
 # 代际守卫、指数退避自动重启与崩溃循环熔断。协议解码仍留在本文件，
 # DispatchLine() 作为 headless 测试的注入点必须保持按行接收。
@@ -1394,7 +1447,7 @@ def OnBackendStart()
 enddef
 
 def OnBackendExit(code: number, restarting: bool)
-  s_bcbs = {}
+  ClearBackendCallbacks()
   ResetBackendSessionState()
   BackendCrashed(restarting)
 enddef
@@ -1450,7 +1503,7 @@ export def DispatchLine(line: string)
         catch
           Log('done callback failed: ' .. v:exception)
         endtry
-        call remove(s_bcbs, id)
+        RemoveBackendCallback(id)
       endif
     endif
   elseif ev.type ==# 'fs_op_done'
@@ -1464,7 +1517,7 @@ export def DispatchLine(line: string)
       catch
         Log('error callback failed: ' .. v:exception)
       endtry
-      call remove(s_bcbs, id)
+      RemoveBackendCallback(id)
     endif
     # 被拒绝的搬运也必须结束作业链，否则粘贴会挂在那一项上。
     FinishFsOp(id, {message: msg2})
@@ -1476,7 +1529,7 @@ export def DispatchLine(line: string)
       catch
         Log('ok callback failed: ' .. v:exception)
       endtry
-      call remove(s_bcbs, id)
+      RemoveBackendCallback(id)
     endif
   elseif ev.type ==# 'pong'
     ApplyCapabilities(get(ev, 'capabilities', []), get(ev, 'protocol_version', 1))
@@ -1541,7 +1594,7 @@ def BStop(): void
   SetupCore()
   FailPendingFsOps('backend stopped; the operation did not finish')
   simpletree#core#Stop()
-  s_bcbs = {}
+  ClearBackendCallbacks()
   ResetBackendSessionState()
 enddef
 
@@ -1558,16 +1611,17 @@ def BList(path: string, show_hidden: bool, git_ignore: bool, max: number, with_m
     return 0
   endif
   var id = BNextId()
-  s_bcbs[id] = {OnChunk: OnChunk, OnDone: OnDone, OnError: OnError}
+  s_bcbs[id] = {OnChunk: OnChunk, OnDone: OnDone, OnError: OnError, timer: 0}
   if !BSend({type: 'list', id: id, path: path, show_hidden: show_hidden,
       git_ignore: git_ignore, max: max, meta: with_metadata})
-    call remove(s_bcbs, id)
+    RemoveBackendCallback(id)
     try
       OnError('failed to send request to backend')
     catch
     endtry
     return 0
   endif
+  ArmListRequestTimeout(id)
   return id
 enddef
 
@@ -1637,7 +1691,7 @@ def BCancel(id: number): void
     return
   endif
   if has_key(s_bcbs, id)
-    call remove(s_bcbs, id)
+    RemoveBackendCallback(id)
   endif
   if BIsRunning()
     BSend({type: 'cancel', id: id})
@@ -1700,7 +1754,7 @@ def CancelFrontendWork()
   s_loading = {}
   s_loading_has_metadata = {}
   # 也清掉尚未进入 s_pending 或已经脱离路径索引的旧请求回调。
-  s_bcbs = {}
+  ClearBackendCallbacks()
 enddef
 
 def EndFrontendSession()
@@ -6080,7 +6134,7 @@ enddef
 
 export def Restart()
   SetupCore()
-  s_bcbs = {}
+  ClearBackendCallbacks()
   ResetBackendSessionState()
   if simpletree#core#Restart()
     echom '[SimpleTree] backend restarted'

@@ -382,6 +382,12 @@ g:simpletree_git_ignore
 g:simpletree_page
         Number, default 200.  Entries per response chunk, clamped to 1..1000.
 
+                                      *g:simpletree_scan_timeout*
+g:simpletree_scan_timeout
+        Number, default 15000.  Milliseconds a streaming directory scan may
+        wait for its final done record.  Positive values are clamped to
+        100..600000; 0 disables the deadline.
+
                                              *g:simpletree_sort*
 g:simpletree_sort
         String, default "name".  One of name, extension, mtime or size.  The

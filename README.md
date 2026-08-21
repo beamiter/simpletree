@@ -217,6 +217,7 @@ SimpleTree 不会覆盖已存在的 `<leader>e` 映射。树缓冲区内全部�
 | `g:simpletree_hide_dotfiles` | `1` | 隐藏点文件 |
 | `g:simpletree_git_ignore` | `1` | 遵循 Git ignore 规则 |
 | `g:simpletree_page` | `200` | 后台每块返回条目数；限制在 `1..1000` |
+| `g:simpletree_scan_timeout` | `15000` | 目录流等待最终 `done` 的毫秒上限；正数最少 `100`，`0` 禁用 |
 | `g:simpletree_sort` | `'name'` | `name` / `extension` / `mtime` / `size`；后两者默认最新/最大优先 |
 | `g:simpletree_sort_reverse` | `0` | 反转当前模式的顺序；目录仍始终优先 |
 | `g:simpletree_auto_follow` | `1` | 进入普通文件缓冲区时在树中跟随 |

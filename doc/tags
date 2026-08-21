@@ -52,6 +52,7 @@ g:simpletree_persist_state	simpletree.txt	/*g:simpletree_persist_state*
 g:simpletree_persist_width	simpletree.txt	/*g:simpletree_persist_width*
 g:simpletree_restore_last_root	simpletree.txt	/*g:simpletree_restore_last_root*
 g:simpletree_root_locked	simpletree.txt	/*g:simpletree_root_locked*
+g:simpletree_scan_timeout	simpletree.txt	/*g:simpletree_scan_timeout*
 g:simpletree_set_default_mapping	simpletree.txt	/*g:simpletree_set_default_mapping*
 g:simpletree_show_bookmarks	simpletree.txt	/*g:simpletree_show_bookmarks*
 g:simpletree_show_file_icons	simpletree.txt	/*g:simpletree_show_file_icons*

@@ -201,6 +201,10 @@ g:simpletree_hide_dotfiles = get(g:, 'simpletree_hide_dotfiles', 1)
 g:simpletree_git_ignore = get(g:, 'simpletree_git_ignore', 1)
 # 后端也会执行同样的边界检查；前端先钳制可避免无效配置进入协议。
 g:simpletree_page = ClampNumber(get(g:, 'simpletree_page', 200), 200, 1, 1000)
+# A list reply is a stream of chunks.  Bound the wait for its final `done`
+# record so a wedged backend cannot leave a directory loading forever.
+g:simpletree_scan_timeout = ClampNumber(
+  get(g:, 'simpletree_scan_timeout', 15000), 15000, 0, 600000)
 # 目录始终优先；name/extension 默认升序，mtime/size 默认最新/最大优先。
 g:simpletree_sort = NormalizeSortMode(get(g:, 'simpletree_sort', 'name'))
 g:simpletree_sort_reverse = NormalizeFlag(get(g:, 'simpletree_sort_reverse', 0))

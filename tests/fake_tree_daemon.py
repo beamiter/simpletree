@@ -52,6 +52,8 @@ def main():
                 "capabilities": [],
             })
         elif request_type == "list":
+            if os.environ.get("SIMPLETREE_FAKE_SILENT_LIST"):
+                continue
             try:
                 entries = list_entries(request)
                 if first_list:

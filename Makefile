@@ -58,6 +58,7 @@ vim-test:
 	vim -Nu NONE -n -i NONE -es -S tests/vim_session_state.vim
 	vim -Nu NONE -n -i NONE -es -S tests/vim_root_events.vim
 	vim -Nu NONE -n -i NONE -es -S tests/vim_external_api.vim
+	vim -Nu NONE -n -i NONE -es -S tests/vim_scan_timeout.vim
 
 # ---------------------------------------------------------------------------
 # simplecore: the vendored daemon supervisor shared by the simple* suite.
