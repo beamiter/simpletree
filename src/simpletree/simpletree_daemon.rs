@@ -8,17 +8,17 @@ mod watch;
 
 use anyhow::{Context, Result, bail};
 use protocol::{
-    BASE_CAPABILITIES, Event, OUTPUT_CHANNEL_CAPACITY, PROTOCOL_VERSION, Request,
-    best_effort_request_id, normalize_page,
+    BASE_CAPABILITIES, Event, MAX_REQUEST_LINE_BYTES, OUTPUT_CHANNEL_CAPACITY, PROTOCOL_VERSION,
+    Request, best_effort_request_id, normalize_page,
 };
 use scan::{ScanOptions, emit_entries, scan_directory};
 use server::{
-    ActiveRequests, EventTx, activate_request, remove_active_if_generation, send_event,
-    send_event_unless_cancelled, stdout_writer,
+    ActiveRequests, EventTx, RequestReader, activate_request, remove_active_if_generation,
+    send_event, send_event_unless_cancelled, stdout_writer,
 };
 use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Instant};
 use tokio::{
-    io::{AsyncBufReadExt, BufReader},
+    io::{AsyncRead, AsyncWrite, BufReader},
     sync::{Mutex, Semaphore, mpsc},
     task::{JoinError, JoinSet},
 };
@@ -51,7 +51,16 @@ fn runtime_capabilities(watch_available: bool, git_available: bool) -> Vec<&'sta
 /// and a version string only proves the file is not corrupt.  A scan exercises
 /// the directory walk — the one code path every session starts with, and the
 /// one that depends on the `ignore` crate being linked and functional.
-fn self_test() -> Result<()> {
+///
+/// The handshake half used to re-derive the reply — it called
+/// `runtime_capabilities(true, true)` itself and then asserted that `"search"`
+/// was in the list `runtime_capabilities` pushes unconditionally, and that
+/// `PROTOCOL_VERSION` (a `u32` constant of 2) was not `0`.  Neither line could
+/// ever fail, in any build, for any edit.  It now does what simplegit's and
+/// simpleline's self-tests do: drive the real request loop over a pipe and
+/// parse the reply the daemon actually emitted, so a handshake that stops
+/// announcing a capability, or announces the wrong protocol, is a failure.
+async fn self_test() -> Result<()> {
     let directory = std::env::temp_dir();
     let cancel = CancellationToken::new();
     let options = ScanOptions {
@@ -62,17 +71,45 @@ fn self_test() -> Result<()> {
     scan_directory(&directory, options, &cancel)
         .with_context(|| format!("scanning {} failed", directory.display()))?;
 
-    let capabilities = runtime_capabilities(true, true);
-    if !capabilities.contains(&"search") {
-        bail!("handshake omitted the search capability");
+    let request = format!("{}\n", serde_json::json!({"type": "ping", "id": 1}));
+    // `run` spawns its writer task, so the sink has to be owned and 'static —
+    // a borrowed Vec will not do.  A duplex pipe gives an owned write half;
+    // run drops it on the way out, which is what ends the read below.
+    let (mut client, server) = tokio::io::duplex(64 * 1024);
+    run(request.as_bytes(), server)
+        .await
+        .context("daemon loop failed")?;
+
+    let mut reply = String::new();
+    tokio::io::AsyncReadExt::read_to_string(&mut client, &mut reply)
+        .await
+        .context("could not read the handshake reply")?;
+    let first = reply.lines().next().context("daemon produced no reply")?;
+    let parsed: serde_json::Value =
+        serde_json::from_str(first).context("handshake reply was not JSON")?;
+
+    match parsed.get("protocol_version").and_then(|v| v.as_u64()) {
+        Some(version) if version == u64::from(PROTOCOL_VERSION) => {}
+        Some(version) => {
+            bail!("daemon announced protocol {version}, this build is {PROTOCOL_VERSION}")
+        }
+        None => bail!("handshake reply carried no protocol version: {first}"),
     }
-    if PROTOCOL_VERSION == 0 {
-        bail!("handshake announces protocol 0");
+
+    let announced: Vec<&str> = parsed
+        .get("capabilities")
+        .and_then(|value| value.as_array())
+        .map(|items| items.iter().filter_map(|item| item.as_str()).collect())
+        .unwrap_or_default();
+    for required in BASE_CAPABILITIES.iter().chain(["search", "fs-ops"].iter()) {
+        if !announced.contains(required) {
+            bail!("handshake omitted the {required} capability: {first}");
+        }
     }
     Ok(())
 }
 
-fn handle_cli() -> Result<bool> {
+async fn handle_cli() -> Result<bool> {
     let mut args = std::env::args().skip(1);
     let Some(arg) = args.next() else {
         return Ok(false);
@@ -94,7 +131,7 @@ fn handle_cli() -> Result<bool> {
             Ok(true)
         }
         "--self-test" => {
-            self_test()?;
+            self_test().await?;
             println!("ok");
             Ok(true)
         }
@@ -104,18 +141,31 @@ fn handle_cli() -> Result<bool> {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
-    if handle_cli()? {
+    if handle_cli().await? {
         return Ok(());
     }
+    run(tokio::io::stdin(), tokio::io::stdout()).await
+}
 
-    let stdin = BufReader::new(tokio::io::stdin());
-    let mut lines = stdin.lines();
+/// The request loop, over any pipe.
+///
+/// It used to be the body of `main` and could only be reached through the real
+/// stdin/stdout, which is why `--self-test` re-derived the handshake instead of
+/// asking for one.  simplegit and simpleline both take the pipe as an argument
+/// for exactly that reason.
+async fn run<R, W>(input: R, output: W) -> Result<()>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    let mut lines = RequestReader::new(BufReader::new(input), MAX_REQUEST_LINE_BYTES);
     debug_log!("start");
 
     // A bounded queue provides backpressure when Vim is slow. The writer drains
     // bursts before flushing so large directories do not pay one flush per page.
-    let (out_tx, out_rx) = mpsc::channel::<String>(OUTPUT_CHANNEL_CAPACITY);
-    let writer = tokio::spawn(stdout_writer(out_rx));
+    let (sender, out_rx) = mpsc::channel::<String>(OUTPUT_CHANNEL_CAPACITY);
+    let out_tx = EventTx::new(sender);
+    let writer = tokio::spawn(stdout_writer(out_rx, output));
 
     let active: ActiveRequests = Arc::new(Mutex::new(HashMap::new()));
     let scan_slots = Arc::new(Semaphore::new(protocol::MAX_CONCURRENT_SCANS));
@@ -128,15 +178,35 @@ async fn main() -> Result<()> {
         watch::WatchService::start(out_tx.clone(), git_cache.clone(), scan_cache.clone());
 
     loop {
+        // Fail-closed: once the output path is declared dead there is nothing
+        // left to answer with, so stop accepting work and drain.
+        if out_tx.is_stalled() {
+            break;
+        }
         tokio::select! {
             completed = tasks.join_next(), if !tasks.is_empty() => {
                 if let Some(completed) = completed {
                     finish_request_task(completed);
                 }
             }
+            // A producer that gave up on the stdout queue has to reach the loop
+            // even while it is parked here on the stdin read; otherwise a
+            // client that stopped reading wedges the daemon with no way out,
+            // not even closing stdin.
+            _ = out_tx.wait_stalled() => break,
             line = lines.next_line() => {
                 let Some(line) = line? else {
                     break;
+                };
+                let line = match line {
+                    Ok(line) => line,
+                    Err(message) => {
+                        debug_log!("REQ FRAMING ERR: {message}");
+                        if send_event(&out_tx, &Event::Error { id: 0, message }).await.is_err() {
+                            break;
+                        }
+                        continue;
+                    }
                 };
                 if line.trim().is_empty() {
                     continue;
@@ -147,14 +217,18 @@ async fn main() -> Result<()> {
                     Ok(request) => request,
                     Err(error) => {
                         debug_log!("REQ PARSE ERR: {error}");
-                        send_event(
+                        if send_event(
                             &out_tx,
                             &Event::Error {
                                 id: best_effort_request_id(&line),
                                 message: format!("invalid request: {error}"),
                             },
                         )
-                        .await?;
+                        .await
+                        .is_err()
+                        {
+                            break;
+                        }
                         continue;
                     }
                 };
@@ -162,19 +236,19 @@ async fn main() -> Result<()> {
 
                 match req {
                     Request::Ping { id } => {
-                        send_event(
+                        if send_event(
                             &out_tx,
-                            &Event::Pong {
+                            &handshake_event(
                                 id,
-                                protocol_version: PROTOCOL_VERSION,
-                                daemon_version: env!("CARGO_PKG_VERSION"),
-                                capabilities: runtime_capabilities(
-                                    watch_service.is_some(),
-                                    git_available,
-                                ),
-                            },
+                                watch_service.is_some(),
+                                git_available,
+                            ),
                         )
-                        .await?;
+                        .await
+                        .is_err()
+                        {
+                            break;
+                        }
                     }
                     Request::List {
                         id,
@@ -185,8 +259,11 @@ async fn main() -> Result<()> {
                         meta,
                     } => {
                         let Some((generation, cancel)) =
-                            begin_request(&active, &mut next_generation, id, &out_tx).await?
+                            begin_request(&active, &mut next_generation, id, &out_tx).await
                         else {
+                            // Either the active-request limit refused it, or the
+                            // refusal could not be delivered; the stall check at
+                            // the top of the loop handles the second case.
                             continue;
                         };
 
@@ -212,8 +289,11 @@ async fn main() -> Result<()> {
                     }
                     Request::GitStatus { id, path, force } => {
                         let Some((generation, cancel)) =
-                            begin_request(&active, &mut next_generation, id, &out_tx).await?
+                            begin_request(&active, &mut next_generation, id, &out_tx).await
                         else {
+                            // Either the active-request limit refused it, or the
+                            // refusal could not be delivered; the stall check at
+                            // the top of the loop handles the second case.
                             continue;
                         };
 
@@ -226,6 +306,7 @@ async fn main() -> Result<()> {
                             out_tx.clone(),
                             cancel,
                             active.clone(),
+                            scan_slots.clone(),
                         ));
                     }
                     Request::Search {
@@ -238,8 +319,11 @@ async fn main() -> Result<()> {
                         git_ignore,
                     } => {
                         let Some((generation, cancel)) =
-                            begin_request(&active, &mut next_generation, id, &out_tx).await?
+                            begin_request(&active, &mut next_generation, id, &out_tx).await
                         else {
+                            // Either the active-request limit refused it, or the
+                            // refusal could not be delivered; the stall check at
+                            // the top of the loop handles the second case.
                             continue;
                         };
 
@@ -263,8 +347,11 @@ async fn main() -> Result<()> {
                     }
                     Request::FsOp { id, op, src, dst } => {
                         let Some((generation, cancel)) =
-                            begin_request(&active, &mut next_generation, id, &out_tx).await?
+                            begin_request(&active, &mut next_generation, id, &out_tx).await
                         else {
+                            // Either the active-request limit refused it, or the
+                            // refusal could not be delivered; the stall check at
+                            // the top of the loop handles the second case.
                             continue;
                         };
 
@@ -303,13 +390,17 @@ async fn main() -> Result<()> {
                                 },
                             },
                         };
-                        send_event(&out_tx, &event).await?;
+                        if send_event(&out_tx, &event).await.is_err() {
+                            break;
+                        }
                     }
                     Request::Unwatch { id, path } => {
                         if let Some(service) = watch_service.as_mut() {
                             service.unwatch(std::path::Path::new(&path));
                         }
-                        send_event(&out_tx, &Event::Ok { id }).await?;
+                        if send_event(&out_tx, &Event::Ok { id }).await.is_err() {
+                            break;
+                        }
                     }
                 }
             }
@@ -340,14 +431,30 @@ fn finish_request_task(completed: std::result::Result<Result<()>, JoinError>) {
     }
 }
 
-/// Allocate a generation and register the request id. Returns Ok(None) after
-/// reporting the active-request limit to the client.
+/// The handshake reply.
+///
+/// One function, so `--self-test` and the `ping` arm cannot disagree: the
+/// self-test used to build its own capability list, which is why no edit to
+/// the real handshake could ever make it fail.
+fn handshake_event(id: u64, watch_available: bool, git_available: bool) -> Event {
+    Event::Pong {
+        id,
+        protocol_version: PROTOCOL_VERSION,
+        daemon_version: env!("CARGO_PKG_VERSION"),
+        capabilities: runtime_capabilities(watch_available, git_available),
+    }
+}
+
+/// Allocate a generation and register the request id. Returns None after
+/// reporting the active-request limit to the client — or after failing to
+/// report it, which only happens once the output path is already dead and the
+/// loop's own stall check is about to end the loop.
 async fn begin_request(
     active: &ActiveRequests,
     next_generation: &mut u64,
     id: u64,
     out: &EventTx,
-) -> Result<Option<(u64, CancellationToken)>> {
+) -> Option<(u64, CancellationToken)> {
     *next_generation = next_generation.wrapping_add(1);
     if *next_generation == 0 {
         *next_generation = 1;
@@ -360,7 +467,7 @@ async fn begin_request(
     };
 
     if !accepted {
-        send_event(
+        let _ = send_event(
             out,
             &Event::Error {
                 id,
@@ -370,10 +477,10 @@ async fn begin_request(
                 ),
             },
         )
-        .await?;
-        return Ok(None);
+        .await;
+        return None;
     }
-    Ok(Some((generation, cancel)))
+    Some((generation, cancel))
 }
 
 /// Convert a request outcome into protocol delivery (errors become error
@@ -444,8 +551,18 @@ async fn run_git_status_request(
     out: EventTx,
     cancel: CancellationToken,
     active: ActiveRequests,
+    scan_slots: Arc<Semaphore>,
 ) -> Result<()> {
-    let result = handle_git_status(id, path, force, cache, out.clone(), cancel.clone()).await;
+    let result = handle_git_status(
+        id,
+        path,
+        force,
+        cache,
+        out.clone(),
+        cancel.clone(),
+        scan_slots,
+    )
+    .await;
     end_request(id, generation, result, &out, &cancel, &active).await
 }
 
@@ -453,6 +570,7 @@ async fn run_git_status_request(
 /// checkouts used to resolve to none at all and show no marks anywhere.  Each
 /// repository gets its own event so the frontend can render the first one
 /// without waiting for the last, and only the final event carries `done`.
+#[allow(clippy::too_many_arguments)]
 async fn handle_git_status(
     id: u64,
     path: PathBuf,
@@ -460,7 +578,18 @@ async fn handle_git_status(
     cache: git::GitCache,
     out: EventTx,
     cancel: CancellationToken,
+    scan_slots: Arc<Semaphore>,
 ) -> Result<()> {
+    // git status was the one handler that took no scan permit, so its only
+    // bound was MAX_ACTIVE_REQUESTS: sixty-four concurrent `status -uall`
+    // walks over the same worktree.  It walks a directory tree exactly like
+    // list, search and fs_op do, so it queues behind the same eight slots.
+    let _permit = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => return Ok(()),
+        permit = scan_slots.acquire_owned() => permit.context("directory scan limiter closed")?,
+    };
+
     let discover_path = path.clone();
     let scopes = tokio::select! {
         biased;
@@ -639,4 +768,116 @@ async fn handle_list(
         cache.store_if_epoch(key, Arc::new(result.clone()), epoch);
     }
     emit_entries(id, result, page, &out, &cancel).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The whole point of `finish_request_task` — and of the doc comment on it.
+    ///
+    /// This assertion is only meaningful while the shipped binary unwinds; the
+    /// manifest test below is the other half, because a `cargo test` run can
+    /// never observe the release profile's panic strategy on its own.
+    #[tokio::test]
+    async fn a_panicked_request_task_does_not_take_the_daemon_down() {
+        let mut tasks: JoinSet<Result<()>> = JoinSet::new();
+        tasks.spawn(async { panic!("a request handler hit an internal assertion") });
+        let completed = tasks.join_next().await.expect("the task must complete");
+        assert!(
+            completed.as_ref().is_err_and(JoinError::is_panic),
+            "a panic must arrive as a JoinError, not as process death"
+        );
+        finish_request_task(completed);
+
+        // And the daemon is still able to run the next request.
+        tasks.spawn(async { Ok(()) });
+        finish_request_task(tasks.join_next().await.expect("the next task"));
+    }
+
+    /// `install-common.sh` builds `--release`, so the profile decides whether
+    /// the containment above exists at all: under `panic = "abort"` the process
+    /// dies at the panic site, `JoinError::is_panic` is unreachable, and the
+    /// test above passes anyway because `cargo test` builds the dev profile.
+    #[test]
+    fn the_release_profile_keeps_panics_unwinding() {
+        let manifest = include_str!("../../Cargo.toml");
+        let release = manifest
+            .split("[profile.release]")
+            .nth(1)
+            .expect("a [profile.release] section");
+        let release = release.split("\n[").next().unwrap_or(release);
+        for line in release.lines() {
+            let line = line.trim();
+            if line.starts_with('#') {
+                continue;
+            }
+            assert!(
+                !line.starts_with("panic"),
+                "[profile.release] sets {line:?}: per-request panic containment \
+                 is dead code in the shipped binary unless panics unwind"
+            );
+        }
+    }
+
+    /// The self-test used to re-derive its own answer, so no edit to the real
+    /// handshake could make it fail. It now drives the request loop.
+    #[tokio::test]
+    async fn the_self_test_round_trips_the_real_handshake() {
+        self_test().await.expect("the built-in self-test must pass");
+    }
+
+    /// A capability that stops being announced must fail the self-test. The
+    /// handshake is built in one place now, so this asserts the loop's reply
+    /// and `handshake_event` cannot disagree about it.
+    #[tokio::test]
+    async fn the_handshake_announces_every_optional_capability_it_has() {
+        let Event::Pong { capabilities, .. } = handshake_event(1, true, true) else {
+            panic!("handshake_event must produce a pong");
+        };
+        for required in BASE_CAPABILITIES
+            .iter()
+            .chain(["search", "fs-ops", "watch", "git-status"].iter())
+        {
+            assert!(capabilities.contains(required), "{required} went missing");
+        }
+
+        let Event::Pong { capabilities, .. } = handshake_event(1, false, false) else {
+            panic!("handshake_event must produce a pong");
+        };
+        assert!(!capabilities.contains(&"watch"));
+        assert!(!capabilities.contains(&"git-status"));
+    }
+
+    /// A record with no newline must not grow the daemon without bound, and the
+    /// stream must resume at the next well-formed request.
+    #[tokio::test]
+    async fn an_oversized_request_costs_one_error_and_not_the_stream() {
+        let oversized = "x".repeat(MAX_REQUEST_LINE_BYTES + 1);
+        let input = format!(
+            "{oversized}\n{}\n",
+            serde_json::json!({"type": "ping", "id": 5})
+        );
+        let (mut client, server) = tokio::io::duplex(64 * 1024);
+        run(input.as_bytes(), server).await.expect("daemon loop");
+
+        let mut reply = String::new();
+        tokio::io::AsyncReadExt::read_to_string(&mut client, &mut reply)
+            .await
+            .expect("read replies");
+        let events: Vec<serde_json::Value> = reply
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("JSON event"))
+            .collect();
+        assert_eq!(events[0]["type"], "error");
+        assert!(
+            events[0]["message"]
+                .as_str()
+                .expect("message")
+                .contains("exceeds"),
+            "{events:?}"
+        );
+        assert_eq!(events[1]["type"], "pong", "{events:?}");
+        assert_eq!(events[1]["id"], 5);
+    }
 }

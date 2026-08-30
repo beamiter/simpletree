@@ -1,12 +1,13 @@
 " spacemacs_theme autoload — 兼容 Vim 8.x / 9.0+
 
 if v:version >= 900
-  " Vim 9.0+: 转发到 vim9 实现
+  " Vim 9.0+: 转发到 vim9 实现。函数名必须首字母大写，否则 vim9 脚本在
+  " 第一个 def 处就以 E1267 中止，三个命令在所有受支持的 Vim 上全都失效。
   function! spacemacs_theme#set(mode) abort
-    call spacemacs_theme_v9#set(a:mode)
+    call spacemacs_theme_v9#Set(a:mode)
   endfunction
   function! spacemacs_theme#toggle() abort
-    call spacemacs_theme_v9#toggle()
+    call spacemacs_theme_v9#Toggle()
   endfunction
   finish
 endif

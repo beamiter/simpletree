@@ -5,9 +5,36 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const CACHE_TTL: Duration = Duration::from_secs(5);
+/// Upper bound on one `git status` run.  Without it a repository on a stalled
+/// NFS/sshfs mount, or one with a contended index lock, holds its request slot
+/// for as long as the mount takes to give up — which can be never.  simplegit
+/// uses 15 s and simpleline 5 s; the longer of the two is the right one here
+/// because `--untracked-files=all` walks every untracked directory as well,
+/// which is strictly more work than the `normal` status simpleline runs.
+const GIT_TIMEOUT: Duration = Duration::from_secs(15);
 /// Repos with more dirty paths than this get truncated with a warning so a
-/// single pathological worktree cannot flood the protocol stream.
+/// single pathological worktree cannot flood the protocol stream.  Note that
+/// this bounds the *StatusMap*, not the subprocess output it is parsed from;
+/// what bounds that is GIT_TIMEOUT plus `kill_on_drop`.
 pub const MAX_STATUS_ENTRIES: usize = 20_000;
+/// Git exports the repository it is working on into the environment of the
+/// editor it launches: `git commit`, `git rebase -i` and `git merge` all set
+/// GIT_DIR and GIT_INDEX_FILE, and GIT_DIR takes precedence over the discovery
+/// that `-C` drives.  A tree opened on repository B from inside the Vim that
+/// `git commit` started in repository A would otherwise be painted with A's
+/// marks — and, because status refreshes the index it is handed, the polling
+/// would write into the live index of a commit in progress.  simplegit and
+/// simpleline carry this identical list; it belongs anywhere git is spawned.
+const GIT_REPOSITORY_ENV_VARS: [&str; 8] = [
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_COMMON_DIR",
+    "GIT_CEILING_DIRECTORIES",
+    "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+];
 /// How far below a non-repository root to look for repositories.  `~/projects`
 /// needs 1 and `~/work/<client>/<repo>` needs 2; past that the walk costs more
 /// than the marks are worth, and a tree rooted that far above its code has
@@ -187,6 +214,37 @@ pub fn discover_repos(path: &Path) -> Vec<RepoScope> {
     found
 }
 
+/// The `git status` invocation for one scope.
+///
+/// Split out from `repo_status` so a test can inspect the argv and the
+/// environment the child would inherit without running git at all — the same
+/// seam simpleline's `git_status_command` provides.
+fn status_command(scope: &RepoScope) -> tokio::process::Command {
+    // --no-optional-locks is a global git option and must precede the
+    // subcommand; it keeps status runs from contending on index locks.
+    let mut command = tokio::process::Command::new("git");
+    command
+        .arg("--no-optional-locks")
+        .arg("-C")
+        .arg(&scope.repo_root)
+        // -uall lists files inside untracked directories so every visible
+        // node can carry its own mark.
+        .args(["status", "--porcelain=v2", "-z", "--untracked-files=all"])
+        // Tree navigation cancels and reissues status on every cursor move, so
+        // the cancelled future is the normal path.  Dropping a tokio `Child`
+        // without this detaches the process instead of killing it, and each
+        // abandoned `-uall` walk keeps reading the whole worktree into a pipe
+        // nobody drains.  simplegit, simpleline and simpleplug all set it.
+        .kill_on_drop(true);
+    if let Some(prefix) = &scope.prefix {
+        command.arg("--").arg(prefix);
+    }
+    for variable in GIT_REPOSITORY_ENV_VARS {
+        command.env_remove(variable);
+    }
+    command
+}
+
 pub async fn repo_status(cache: &GitCache, scope: &RepoScope, force: bool) -> Result<RepoStatus> {
     let repo_root = scope.repo_root.clone();
     let key: CacheKey = (repo_root.clone(), scope.prefix.clone());
@@ -199,20 +257,16 @@ pub async fn repo_status(cache: &GitCache, scope: &RepoScope, force: bool) -> Re
         });
     }
 
-    // --no-optional-locks is a global git option and must precede the
-    // subcommand; it keeps status runs from contending on index locks.
-    let mut command = tokio::process::Command::new("git");
-    command
-        .arg("--no-optional-locks")
-        .arg("-C")
-        .arg(&repo_root)
-        // -uall lists files inside untracked directories so every visible
-        // node can carry its own mark; MAX_STATUS_ENTRIES caps the flood.
-        .args(["status", "--porcelain=v2", "-z", "--untracked-files=all"]);
-    if let Some(prefix) = &scope.prefix {
-        command.arg("--").arg(prefix);
-    }
-    let output = command.output().await.context("failed to run git status")?;
+    let output = tokio::time::timeout(GIT_TIMEOUT, status_command(scope).output())
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "git status timed out after {} seconds in {}",
+                GIT_TIMEOUT.as_secs(),
+                repo_root.display()
+            )
+        })?
+        .context("failed to run git status")?;
     if !output.status.success() {
         bail!(
             "git status failed: {}",
@@ -468,6 +522,83 @@ mod tests {
 
         // At the repository root there is nothing to scope to.
         assert_eq!(discover_repos(&repo)[0].prefix, None);
+    }
+
+    /// `git commit` exports GIT_DIR and GIT_INDEX_FILE into its editor, and
+    /// GIT_DIR beats the discovery `-C` drives.  Without this the tree opened
+    /// inside that Vim reports the committing repository's status for every
+    /// other repository, and refreshes that repository's live index doing it.
+    #[test]
+    fn the_status_command_clears_repository_override_environment() {
+        let scope = RepoScope {
+            repo_root: PathBuf::from("/repo"),
+            prefix: None,
+        };
+        let command = status_command(&scope);
+        let environment: Vec<_> = command.as_std().get_envs().collect();
+        for variable in GIT_REPOSITORY_ENV_VARS {
+            assert!(
+                environment.iter().any(|(key, value)| {
+                    *key == std::ffi::OsStr::new(variable) && value.is_none()
+                }),
+                "{variable} is still inherited by git status"
+            );
+        }
+    }
+
+    /// Tree navigation cancels and reissues status on every cursor move, so the
+    /// dropped future is the normal path.  Without `kill_on_drop` each dropped
+    /// `status -uall` is detached and keeps walking the whole worktree into a
+    /// pipe nobody reads, and nothing ever stops it.
+    #[test]
+    fn the_status_command_kills_its_child_when_the_request_is_dropped() {
+        let command = status_command(&RepoScope {
+            repo_root: PathBuf::from("/repo"),
+            prefix: None,
+        });
+        assert!(
+            command.get_kill_on_drop(),
+            "a cancelled git status must not outlive its request"
+        );
+    }
+
+    #[test]
+    fn the_status_command_still_scopes_and_keeps_its_porcelain_flags() {
+        let scoped = status_command(&RepoScope {
+            repo_root: PathBuf::from("/repo"),
+            prefix: Some("services/api".to_owned()),
+        });
+        let args: Vec<String> = scoped
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            args,
+            vec![
+                "--no-optional-locks",
+                "-C",
+                "/repo",
+                "status",
+                "--porcelain=v2",
+                "-z",
+                "--untracked-files=all",
+                "--",
+                "services/api",
+            ]
+        );
+
+        let unscoped = status_command(&RepoScope {
+            repo_root: PathBuf::from("/repo"),
+            prefix: None,
+        });
+        assert!(
+            !unscoped
+                .as_std()
+                .get_args()
+                .any(|arg| arg == std::ffi::OsStr::new("--")),
+            "an unscoped run must not carry an empty pathspec"
+        );
     }
 
     #[test]

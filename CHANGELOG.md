@@ -2,6 +2,43 @@
 
 本文件记录 SimpleTree 面向用户的重要变化。
 
+## Unreleased - 2026-08-30
+
+### 修正：守护进程的三处无界等待，以及三个命令从来就没能用过
+
+- `:SpacemacsThemeToggle` / `:SpacemacsThemeDark` / `:SpacemacsThemeLight`
+  在所有受支持的 Vim（9.1+）上都是坏的。`autoload/spacemacs_theme_v9.vim`
+  写的是 `export def set()` / `export def toggle()`，而 Vim9 拒绝首字母小写的
+  `def`：脚本在第 3 行以 E1267 中止，第一次调用报 E1267，之后每次报 E117。
+  第 20 行的 `set(next)` 还会被解析成 `:set` 命令而不是函数调用。函数名改为
+  `Set` / `Toggle`，`autoload/spacemacs_theme.vim` 的转发同步更新。
+  `tests/defcompile-skip` 里的 `spacemacs_theme*.vim` 正好盖住了这条诊断
+  （理由写的是"`:defcompile` 只是原则上拒绝它们，并不是真有问题"），现在只
+  跳过确实无法独立 source 的 Vim 8.x 兼容层 `spacemacs_theme.vim`，新增
+  `tests/vim_spacemacs_theme.vim` 真正调用这三个命令。
+- `git status` 现在有 15 秒超时和 `kill_on_drop`，并在 spawn 前清掉
+  `GIT_DIR` / `GIT_WORK_TREE` / `GIT_INDEX_FILE` 等 8 个变量（与 simplegit、
+  simpleline 同一份清单）。此前：在 `git commit` 启动的 Vim 里打开任何别的
+  仓库，画上去的是**正在提交那个仓库**的标记，而且后台轮询会刷新它那份正在
+  使用的 index；树里移动光标不断取消并重发 status，每个被取消的
+  `status -uall` 都会脱离父进程继续遍历整个工作区，没有任何东西能停下它。
+  `git status` 也和 list/search/fs_op 一样占用 8 个扫描槽之一，不再只受
+  `MAX_ACTIVE_REQUESTS = 64` 约束。
+- stdin 改用有界读取（8 KiB 量级的上限由字段最大值推导）：丢了换行的客户端
+  不再能把守护进程撑到内存耗尽；超长记录只换来一条 error 事件，读取从下一个
+  换行处恢复，后面的请求照常服务。
+- 往 stdout 发事件带 2 秒截止时间和一个共享的 fail-closed 位。此前一个不读
+  stdout 的客户端能把守护进程彻底卡死——连关掉 stdin 都救不回来，因为循环
+  根本回不到读取 stdin 的地方。
+- `[profile.release]` 去掉 `panic = "abort"`。在 `-C panic=abort` 下进程在
+  panic 现场就死了，`finish_request_task` 上"某个请求 panic 不该拖垮整个
+  守护进程"的注释在用户实际运行的二进制里是假的，而 `cargo test` 走 dev
+  profile（unwind）所以一直是绿的。
+- `--self-test` 改为驱动真正的请求循环并解析守护进程自己发出的握手回复。
+  原来的两行检查（`PROTOCOL_VERSION == 0`、能力列表里有没有 `search`）是
+  恒真的，任何改动都不可能让它们失败。`make check` 新增 `test-daemon`，
+  现在真的会跑 `--self-test`。
+
 ## Unreleased - 2026-08-16
 
 ### 新增：与 SimpleRemote 深度协作的集成面

@@ -6,6 +6,15 @@ pub const MAX_ACTIVE_REQUESTS: usize = 64;
 pub const MAX_CONCURRENT_SCANS: usize = 8;
 pub const OUTPUT_CHANNEL_CAPACITY: usize = 64;
 pub const PROTOCOL_VERSION: u32 = 2;
+/// Every non-scalar field a request can carry is a filesystem path or a
+/// filename query typed by a human, and PATH_MAX is 4096 on Linux.
+pub const MAX_REQUEST_PATH_BYTES: usize = 4_096;
+/// A valid path may expand sixfold when JSON escapes ASCII control bytes, and
+/// `fs_op` carries two paths (`src` and `dst`).  Keep enough headroom for the
+/// request envelope and a maximum-width u64 request ID.  This is the ceiling
+/// the bounded request reader enforces; without one, a producer that loses its
+/// newline grows the daemon until the machine runs out of memory.
+pub const MAX_REQUEST_LINE_BYTES: usize = MAX_REQUEST_PATH_BYTES * 2 * 6 + 1_024;
 
 /// Capabilities that do not depend on runtime probing.
 pub const BASE_CAPABILITIES: &[&str] = &[

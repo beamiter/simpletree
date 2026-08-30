@@ -59,13 +59,23 @@ fn init_repo(root: &Path) {
 }
 
 fn run_daemon(requests: &[Value]) -> Vec<Value> {
+    run_daemon_with_env(requests, &[])
+}
+
+/// Same, with extra environment variables exported to the daemon — the way
+/// `git commit` exports them to the editor it launches.
+fn run_daemon_with_env(requests: &[Value], environment: &[(&str, &Path)]) -> Vec<Value> {
     let input = requests
         .iter()
         .map(Value::to_string)
         .collect::<Vec<_>>()
         .join("\n")
         + "\n";
-    let mut child = Command::new(env!("CARGO_BIN_EXE_simpletree-daemon"))
+    let mut builder = Command::new(env!("CARGO_BIN_EXE_simpletree-daemon"));
+    for (key, value) in environment {
+        builder.env(key, value);
+    }
+    let mut child = builder
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -224,5 +234,58 @@ fn a_root_with_no_repository_anywhere_reports_an_error() {
             .as_str()
             .expect("message")
             .contains("not inside a git repository")
+    );
+}
+
+/// `git commit`, `git rebase -i` and `git merge` all launch $EDITOR with
+/// GIT_DIR and GIT_INDEX_FILE exported, and GIT_DIR beats the repository
+/// discovery that `-C` drives.  Without stripping them, a tree opened on
+/// repository B inside that Vim was painted with repository A's marks — and
+/// the polling refreshed A's live index while a commit was in progress.
+/// simplegit and simpleline strip the same eight variables.
+#[test]
+fn an_inherited_git_dir_does_not_redirect_status_to_another_repository() {
+    if !git_available() {
+        return;
+    }
+    let directory = tempdir().expect("temporary directory");
+    let committing = directory.path().join("committing");
+    let browsed = directory.path().join("browsed");
+    init_repo(&committing);
+    init_repo(&browsed);
+    std::fs::write(committing.join("in-the-commit.txt"), b"a").expect("fixture");
+    std::fs::write(browsed.join("in-the-tree.txt"), b"b").expect("fixture");
+
+    let events = run_daemon_with_env(
+        &[json!({"type": "git_status", "id": 1, "path": browsed})],
+        &[
+            ("GIT_DIR", &committing.join(".git")),
+            ("GIT_WORK_TREE", &committing),
+            ("GIT_INDEX_FILE", &committing.join(".git/index")),
+        ],
+    );
+
+    let status = events
+        .iter()
+        .find(|event| event["type"] == "git_status")
+        .unwrap_or_else(|| panic!("no git_status event: {events:?}"));
+    assert_eq!(
+        status["repo_root"],
+        browsed.to_string_lossy().as_ref(),
+        "the inherited GIT_DIR redirected the whole request: {events:?}"
+    );
+    let map = status["statuses"].as_object().expect("status map");
+    assert!(
+        map.contains_key(browsed.join("in-the-tree.txt").to_string_lossy().as_ref()),
+        "the browsed repository lost its own marks: {map:?}"
+    );
+    assert!(
+        !map.contains_key(
+            committing
+                .join("in-the-commit.txt")
+                .to_string_lossy()
+                .as_ref()
+        ),
+        "the committing repository's paths were painted onto the browsed tree: {map:?}"
     );
 }

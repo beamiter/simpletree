@@ -1,5 +1,13 @@
-# The bundled spacemacs colour-scheme helpers deliberately use lowercase
-# function names (spacemacs_theme#set) and are sourced by colors/spacemacs.vim,
-# not as autoload scripts in their own right; :defcompile rejects them on
-# principle rather than because anything is wrong.
-spacemacs_theme*.vim
+# autoload/spacemacs_theme.vim is the Vim 8.x compatibility shim: it contains
+# no `def` at all, only legacy `function! spacemacs_theme#set()`, and a legacy
+# autoload function may only be defined in a file whose name matches its
+# prefix.  This harness sources a *copy* under a tempname, so that file — and
+# only that file — reports E746 for reasons that have nothing to do with its
+# contents.  There is also nothing for :defcompile to do in it.
+#
+# The previous entry was the glob `spacemacs_theme*.vim`, whose stated reason
+# was that ":defcompile rejects them on principle rather than because anything
+# is wrong".  That was false for autoload/spacemacs_theme_v9.vim: the glob was
+# hiding a real E1267 that made :SpacemacsThemeToggle, :SpacemacsThemeDark and
+# :SpacemacsThemeLight dead on every supported Vim.  Do not widen it again.
+spacemacs_theme.vim

@@ -227,7 +227,8 @@ mod tests {
             .expect("runtime");
 
         runtime.block_on(async {
-            let (out, _undrained) = mpsc::channel::<String>(1);
+            let (sender, _undrained) = mpsc::channel::<String>(1);
+            let out = EventTx::new(sender);
             let cancel = CancellationToken::new();
             let task = tokio::spawn(handle_search(
                 7,
