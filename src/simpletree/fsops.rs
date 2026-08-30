@@ -213,6 +213,11 @@ fn remove_tree(path: &Path) -> Result<()> {
         return Ok(()); // Already gone: the caller's goal is satisfied.
     };
     if meta.file_type().is_dir() {
+        // copy_tree preserves source directory modes after populating them. A
+        // staged copy of a 0555/000 tree is therefore not removable until its
+        // directories regain owner traversal/write permission. Never follow
+        // links while doing this: they are removed as links below.
+        make_tree_removable(path);
         fs::remove_dir_all(path)?;
     } else {
         fs::remove_file(path)?;
@@ -220,18 +225,82 @@ fn remove_tree(path: &Path) -> Result<()> {
     Ok(())
 }
 
+fn make_tree_removable(path: &Path) {
+    let Ok(meta) = fs::symlink_metadata(path) else {
+        return;
+    };
+    if meta.file_type().is_symlink() {
+        return;
+    }
+    if meta.file_type().is_dir() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = meta.permissions();
+            let mode = permissions.mode();
+            if mode & 0o700 != 0o700 {
+                permissions.set_mode(mode | 0o700);
+                let _ = fs::set_permissions(path, permissions);
+            }
+        }
+        #[cfg(windows)]
+        if meta.permissions().readonly() {
+            let mut permissions = meta.permissions();
+            permissions.set_readonly(false);
+            let _ = fs::set_permissions(path, permissions);
+        }
+        if let Ok(entries) = fs::read_dir(path) {
+            for entry in entries.flatten() {
+                make_tree_removable(&entry.path());
+            }
+        }
+    } else {
+        #[cfg(windows)]
+        if meta.permissions().readonly() {
+            let mut permissions = meta.permissions();
+            permissions.set_readonly(false);
+            let _ = fs::set_permissions(path, permissions);
+        }
+    }
+}
+
 fn best_effort_remove(path: &Path) {
     let _ = remove_tree(path);
 }
 
-/// Copy `src` over `dst` without ever leaving `dst` in a partial state.
-fn copy_safely(src: &Path, dst: &Path, cancel: &CancellationToken) -> FsOpOutcome {
-    let staged = match unique_sibling(dst, "staged") {
-        Ok(staged) => staged,
-        Err(error) => return FsOpOutcome::failed(error.to_string()),
-    };
-    if let Err(error) = copy_tree(src, &staged, 0, cancel) {
-        best_effort_remove(&staged);
+/// Abort between target displacement and commit.  Once an old destination has
+/// been renamed aside, cancellation is still a failed transaction: restore it
+/// before returning so "cancel" never means "the destination disappeared".
+fn rollback_cancelled(staged: Option<&Path>, backup: &Path, dst: &Path) -> FsOpOutcome {
+    if let Some(staged) = staged {
+        best_effort_remove(staged);
+    }
+    if !backup.as_os_str().is_empty() && fs::rename(backup, dst).is_err() {
+        return FsOpOutcome {
+            backup: backup.to_string_lossy().into_owned(),
+            message: "canceled and rollback failed".to_owned(),
+            ..Default::default()
+        };
+    }
+    FsOpOutcome::failed("canceled")
+}
+
+/// Install an already complete staged copy.  The callback is a deliberately
+/// tiny phase boundary: production passes a no-op, while unit tests cancel at
+/// the exact point after displacement and before commit without timing races.
+fn install_staged_with_hook<F>(
+    staged: &Path,
+    dst: &Path,
+    cancel: &CancellationToken,
+    before_commit: F,
+) -> FsOpOutcome
+where
+    F: FnOnce(),
+{
+    // The copy may have taken minutes.  Re-read the token before the first
+    // mutation of the destination, not only while walking the source tree.
+    if let Err(error) = cancelled(cancel) {
+        best_effort_remove(staged);
         return FsOpOutcome::failed(error.to_string());
     }
 
@@ -240,19 +309,30 @@ fn copy_safely(src: &Path, dst: &Path, cancel: &CancellationToken) -> FsOpOutcom
         let candidate = match unique_sibling(dst, "backup") {
             Ok(candidate) => candidate,
             Err(error) => {
-                best_effort_remove(&staged);
+                best_effort_remove(staged);
                 return FsOpOutcome::failed(error.to_string());
             }
         };
+        if let Err(error) = cancelled(cancel) {
+            best_effort_remove(staged);
+            return FsOpOutcome::failed(error.to_string());
+        }
         if let Err(error) = fs::rename(dst, &candidate) {
-            best_effort_remove(&staged);
+            best_effort_remove(staged);
             return FsOpOutcome::failed(format!("could not displace the old target: {error}"));
         }
         backup = candidate;
     }
 
-    if let Err(error) = fs::rename(&staged, dst) {
-        best_effort_remove(&staged);
+    before_commit();
+    // This is the last cooperative-cancellation point: if the target was
+    // displaced above, rollback makes the destination byte-for-byte unchanged.
+    if cancel.is_cancelled() {
+        return rollback_cancelled(Some(staged), &backup, dst);
+    }
+
+    if let Err(error) = fs::rename(staged, dst) {
+        best_effort_remove(staged);
         if !backup.as_os_str().is_empty() && fs::rename(&backup, dst).is_err() {
             return FsOpOutcome {
                 backup: backup.to_string_lossy().into_owned(),
@@ -266,21 +346,65 @@ fn copy_safely(src: &Path, dst: &Path, cancel: &CancellationToken) -> FsOpOutcom
     finish(backup)
 }
 
+fn install_staged(staged: &Path, dst: &Path, cancel: &CancellationToken) -> FsOpOutcome {
+    install_staged_with_hook(staged, dst, cancel, || {})
+}
+
+/// Copy `src` over `dst` without ever leaving `dst` in a partial state.
+fn copy_safely(src: &Path, dst: &Path, cancel: &CancellationToken) -> FsOpOutcome {
+    let staged = match unique_sibling(dst, "staged") {
+        Ok(staged) => staged,
+        Err(error) => return FsOpOutcome::failed(error.to_string()),
+    };
+    if let Err(error) = copy_tree(src, &staged, 0, cancel) {
+        best_effort_remove(&staged);
+        return FsOpOutcome::failed(error.to_string());
+    }
+    // A cancellation during the final fs::copy()/permissions call is observed
+    // here, after staging has completed but before the destination can move.
+    if let Err(error) = cancelled(cancel) {
+        best_effort_remove(&staged);
+        return FsOpOutcome::failed(error.to_string());
+    }
+    install_staged(&staged, dst, cancel)
+}
+
 /// Same-filesystem rename first: it is atomic and, unlike copy-then-delete, has
 /// no window in which the source can change between the two halves. The
 /// cross-device fallback installs a complete copy and keeps the source, exactly
 /// as the Vim implementation does, because deleting it would be that race.
-fn move_safely(src: &Path, dst: &Path, cancel: &CancellationToken) -> FsOpOutcome {
+fn move_safely_with_hook<F>(
+    src: &Path,
+    dst: &Path,
+    cancel: &CancellationToken,
+    before_commit: F,
+) -> FsOpOutcome
+where
+    F: FnOnce(),
+{
+    if let Err(error) = cancelled(cancel) {
+        return FsOpOutcome::failed(error.to_string());
+    }
     let mut backup = PathBuf::new();
     if fs::symlink_metadata(dst).is_ok() {
         let candidate = match unique_sibling(dst, "backup") {
             Ok(candidate) => candidate,
             Err(error) => return FsOpOutcome::failed(error.to_string()),
         };
+        if let Err(error) = cancelled(cancel) {
+            return FsOpOutcome::failed(error.to_string());
+        }
         if fs::rename(dst, &candidate).is_err() {
             return FsOpOutcome::failed("could not displace the old target");
         }
         backup = candidate;
+    }
+
+    before_commit();
+    // A move has no long copy loop of its own.  Its meaningful cancellation
+    // boundary is immediately before the rename that removes the source.
+    if cancel.is_cancelled() {
+        return rollback_cancelled(None, &backup, dst);
     }
 
     if fs::rename(src, dst).is_ok() {
@@ -300,6 +424,10 @@ fn move_safely(src: &Path, dst: &Path, cancel: &CancellationToken) -> FsOpOutcom
     let mut outcome = copy_safely(src, dst, cancel);
     outcome.source_removed = false;
     outcome
+}
+
+fn move_safely(src: &Path, dst: &Path, cancel: &CancellationToken) -> FsOpOutcome {
+    move_safely_with_hook(src, dst, cancel, || {})
 }
 
 /// Retire the displaced target. Failing to delete it is not a failed operation —
@@ -459,6 +587,77 @@ mod tests {
         let leftovers: Vec<_> = fs::read_dir(dir.path())
             .unwrap()
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with(".simpletree-"))
+            .collect();
+        assert!(leftovers.is_empty(), "leftovers: {leftovers:?}");
+    }
+
+    #[test]
+    fn cancellation_after_copy_staging_restores_the_existing_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let staged = dir.path().join(".simpletree-staged-test");
+        let dst = dir.path().join("dst");
+        fs::write(&staged, b"new").unwrap();
+        fs::write(&dst, b"old").unwrap();
+
+        let token = cancel();
+        let outcome = install_staged_with_hook(&staged, &dst, &token, || token.cancel());
+
+        assert!(!outcome.installed);
+        assert_eq!(outcome.message, "canceled");
+        assert_eq!(fs::read(&dst).unwrap(), b"old");
+        assert!(!staged.exists(), "canceled staging file survived");
+        let leftovers: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with(".simpletree-"))
+            .collect();
+        assert!(leftovers.is_empty(), "leftovers: {leftovers:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancellation_cleans_a_read_only_staged_tree() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let staged = dir.path().join(".simpletree-staged-test");
+        let locked = staged.join("locked");
+        let dst = dir.path().join("dst");
+        fs::create_dir_all(&locked).unwrap();
+        fs::write(locked.join("new.txt"), b"new").unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o555)).unwrap();
+        fs::set_permissions(&staged, fs::Permissions::from_mode(0o555)).unwrap();
+        fs::write(&dst, b"old").unwrap();
+
+        let token = cancel();
+        let outcome = install_staged_with_hook(&staged, &dst, &token, || token.cancel());
+
+        assert!(!outcome.installed);
+        assert_eq!(outcome.message, "canceled");
+        assert_eq!(fs::read(&dst).unwrap(), b"old");
+        assert!(!staged.exists(), "read-only canceled staging tree survived");
+    }
+
+    #[test]
+    fn cancellation_before_move_commit_keeps_source_and_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        let dst = dir.path().join("dst");
+        fs::write(&src, b"new").unwrap();
+        fs::write(&dst, b"old").unwrap();
+
+        let token = cancel();
+        let outcome = move_safely_with_hook(&src, &dst, &token, || token.cancel());
+
+        assert!(!outcome.installed);
+        assert!(!outcome.source_removed);
+        assert_eq!(outcome.message, "canceled");
+        assert_eq!(fs::read(&src).unwrap(), b"new");
+        assert_eq!(fs::read(&dst).unwrap(), b"old");
+        let leftovers: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
             .filter(|name| name.starts_with(".simpletree-"))
             .collect();
         assert!(leftovers.is_empty(), "leftovers: {leftovers:?}");
