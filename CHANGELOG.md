@@ -2,6 +2,21 @@
 
 本文件记录 SimpleTree 面向用户的重要变化。
 
+## Unreleased - 2026-09-28
+
+### 修正：重新 source 一次 vimrc 之后，每次 CursorHold 都报 E933
+
+- 插件管理器在 vimrc 被重新 source 时会把 `plugin/` 再 source 一遍。
+  `plugin/simpletree.vim` 有 `g:loaded_simpletree` 守卫，什么都不会重新定义——
+  但普通的 `vim9script` 在走到守卫的 `finish` 之前，就已经把脚本里所有的
+  script-local 函数和变量删掉了，而第一次加载时定义的命令、自动命令和 `g:`
+  函数还在，继续引用它们。于是 `SimpleTreeMaybeAutoRefresh()` 每次 CursorHold
+  都以 `E933: Function was deleted: <SNR>N_ClampNumber` 失败，每次都弹一个
+  hit-enter 提示把屏幕顶上去；宽度持久化用到的那几个函数和变量同样没了。
+  首行改为 `vim9script noclear`。
+- 新增 `tests/vim_reload.vim`：把脚本 source 两遍，断言 script-local 的函数和
+  变量一个不少，并且空闲刷新的钩子照常跑完。
+
 ## Unreleased - 2026-08-30
 
 ### 修正：守护进程的三处无界等待，以及三个命令从来就没能用过
