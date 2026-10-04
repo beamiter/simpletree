@@ -97,8 +97,86 @@ if has('unix') && executable('touch')
   call assert_false(s:unknown.known)
   call assert_false(s:unknown.stale)
 
+  " Equal timestamps are "as new as", not "newer".  A just-built daemon
+  " shares a second with Cargo.toml; Health used to call that newer.
+  let s:src = s:repo .. '/' .. s:new.newest
+  if filereadable(s:src)
+    let s:equal = tempname()
+    call writefile(['#!/bin/sh'], s:equal)
+    call system('touch -r ' .. shellescape(s:src) .. ' ' .. shellescape(s:equal))
+    call assert_equal(0, v:shell_error)
+    let s:same = call(s:Fresh, [s:equal])
+    call assert_true(s:same.known)
+    call assert_false(s:same.stale)
+    call assert_equal(s:same.binary_time, s:same.source_time)
+    let s:saved_path = get(g:, 'simpletree_daemon_path', '')
+    let g:simpletree_daemon_path = s:equal
+    call system('chmod +x ' .. shellescape(s:equal))
+    let s:text = s:HealthText()
+    call assert_true(s:text =~# 'as new as the Rust sources',
+          \ 'equal mtime was not reported as as-new: ' .. s:text)
+    call assert_false(s:text =~# 'newer than the Rust sources',
+          \ 'equal mtime was still called newer: ' .. s:text)
+    let g:simpletree_daemon_path = s:saved_path
+    call delete(s:equal)
+  endif
+
   call delete(s:fake)
 endif
+
+function! s:Call(name, ...) abort
+  let l:sid = s:Sid()
+  return call(function(printf('<SNR>%d_%s', l:sid, a:name)), get(a:, 1, []))
+endfunction
+
+" String option types must not abort :SimpleTreeHealth (E1030) and must be
+" readable as flags the same way simplecc/simplegit already do.
+let g:simpletree_page = 'wide'
+let g:simpletree_width = 'narrow'
+call assert_equal(200, s:Call('PageSize'), 'a string page size must fall back')
+let s:text = s:HealthText()
+call assert_true(s:text =~# '\[!!\] page size', 'string page size must fail the health item')
+call assert_true(s:text =~# '\[!!\] tree width', 'string width must fail the health item')
+let g:simpletree_page = 200
+let g:simpletree_width = 45
+
+let g:simpletree_use_nerdfont = 'on'
+call assert_true(s:Call('NFEnabled'), 'nerdfont=on must enable icons')
+let g:simpletree_use_nerdfont = 'off'
+call assert_false(s:Call('NFEnabled'), 'nerdfont=off must stay off')
+unlet g:simpletree_use_nerdfont
+
+let g:simpletree_use_trash = 'off'
+call assert_equal([], s:Call('TrashCommand', ['/tmp/x']), 'trash=off must not pick a provider')
+let s:text = s:HealthText()
+call assert_true(s:text =~# 'trash: disabled', 'Health still treated trash=off as on: ' .. s:text)
+let g:simpletree_use_trash = 1
+
+let g:simpletree_use_system_clipboard = 'off'
+call assert_false(s:Call('CopyToSystemClipboard', ['x']), 'clipboard=off must not copy')
+unlet g:simpletree_use_system_clipboard
+
+let g:simpletree_use_watcher = 'off'
+call assert_false(s:Call('ConfFlag', ['simpletree_use_watcher', 1]), 'watcher=off must be false')
+unlet g:simpletree_use_watcher
+
+let g:simpletree_git_status = 'off'
+call assert_false(s:Call('ConfFlag', ['simpletree_git_status', 1]))
+let s:text = s:HealthText()
+call assert_true(s:text =~# 'git status: disabled', 'git_status=off must show disabled: ' .. s:text)
+unlet g:simpletree_git_status
+
+let g:simpletree_sort_reverse = 'on'
+call assert_true(s:Call('ConfFlag', ['simpletree_sort_reverse', 0]), 'sort_reverse=on')
+unlet g:simpletree_sort_reverse
+
+let g:simpletree_columns = 'mtime'
+call assert_equal(['mtime'], s:Call('ColumnList'), 'a string column name must be a one-item list')
+unlet g:simpletree_columns
+
+let g:simpletree_git_ignore = 'off'
+call assert_false(s:Call('ConfFlag', ['simpletree_git_ignore', 1]), 'git_ignore=off')
+unlet g:simpletree_git_ignore
 
 let s:finished = 1
 

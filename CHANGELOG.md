@@ -2,6 +2,59 @@
 
 本文件记录 SimpleTree 面向用户的重要变化。
 
+## Unreleased - 2026-10-04
+
+### 修正：刚编完的 daemon 被 Health 说成「比源码新」
+
+- `:SimpleTreeHealth` 在 `binary_time == source_time` 时仍写
+  `newer than the Rust sources`。刚跑完 `install.sh` 的二进制经常和
+  `Cargo.toml` 落在同一秒，这句是假的。相等改说 `as new as`。
+- `tests/vim_health.vim` 把假二进制 `touch -r` 到最新 `.rs`，断言文案。
+
+### 修正：`g:simpletree_page` / `width` 写成字符串时 Health 直接 E1030
+
+- `HealthItem(g:simpletree_page >= 1 …)` 假定选项是数字。vimrc 里写
+  `'wide'` 时 `:SimpleTreeHealth` 中止，后面的 git / watch 一行都看不到。
+  先查类型，非数字记 `[!!]`；真正发给 daemon 的块大小走 `PageSize()`，
+  不再把字符串塞进 `BList`。
+
+### 修正：`use_nerdfont='off'` 仍被当成开
+
+- `!!get()` 对非空字符串为真，`'0'` / `'off'` 都会画 Nerd Font。
+  `NFEnabled()` 改走 `ConfFlag()`。
+
+### 修正：`use_trash='off'` 仍走回收站
+
+- 同一套 `!!get()`。`TrashCommand()` 与 Health 的 trash 行现在认
+  `off` / `0` / `false` / `no`。
+
+### 修正：`use_system_clipboard='off'` 仍往 `+` 里写
+
+- `CopyToSystemClipboard()` 与 Health 的 clipboard 行同样改 `ConfFlag()`。
+
+### 修正：`use_watcher='off'` 时 Health 与真正的 watch 不一致
+
+- `WatcherEnabled()` 已能被字符串骗开；Health 的 fs watch 行读同一套标志。
+
+### 修正：`git_status='off'` 时 Health 仍去解释最近一次查询
+
+- 关了 git 标记却还报 `last query failed` / `capability present`。
+  `GitStatusEnabled()` 与 Health 都认字符串开关。
+
+### 修正：`sort_reverse='on'` 排序仍按升序
+
+- `SortedEntries()` 用 `!!get()`，非空字符串恒为真——`'off'` 会反序，
+  `'on'` 碰巧对，`'0'` 也会反序。改 `ConfFlag()`。
+
+### 修正：`g:simpletree_columns = 'mtime'` 等于关掉列
+
+- `ColumnList()` 只接受 list，字符串被当成非法配置丢成 `[]`。
+  现在单字符串当单元素列表，和 simplecc 的 `diag_sources` 同一形状。
+
+### 修正：`git_ignore='off'` 在脚本加载时仍是开
+
+- `s_git_ignore = !!get(...)` 把 `'off'` 当成开。加载时改走 `ConfFlag()`。
+
 ## Unreleased - 2026-09-28
 
 ### 修正：重新 source 一次 vimrc 之后，每次 CursorHold 都报 E933

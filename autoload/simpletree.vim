@@ -5,8 +5,36 @@ vim9script
 # 管理器更新了 Vim 侧文件却没重新构建 daemon，是这套插件最常见的故障。
 const PLUGIN_ROOT: string = expand('<sfile>:p:h:h')
 
+def ConfFlag(name: string, default_val: bool): bool
+  var value = get(g:, name, default_val)
+  if type(value) == v:t_bool
+    return value
+  endif
+  if type(value) == v:t_number
+    return value != 0
+  endif
+  if type(value) == v:t_string
+    var folded = tolower(trim(value))
+    if index(['1', 'true', 'on', 'yes'], folded) >= 0
+      return true
+    endif
+    if index(['0', 'false', 'off', 'no'], folded) >= 0
+      return false
+    endif
+  endif
+  return default_val
+enddef
+
 def NFEnabled(): bool
-  return !!get(g:, 'simpletree_use_nerdfont', 0)
+  return ConfFlag('simpletree_use_nerdfont', false)
+enddef
+
+def PageSize(): number
+  var page = get(g:, 'simpletree_page', 200)
+  if type(page) != v:t_number
+    return 200
+  endif
+  return min([1000, max([1, page])])
 enddef
 
 # 图标集合（会根据 NF 状态初始化，并允许 g:simpletree_icons 覆盖）
@@ -94,9 +122,9 @@ var s_bufnr: number = -1
 # 读它的地方一律先过 WinValid()/TreeWin(),否则拿到的是别的 tab 的窗口。
 var s_winid: number = 0
 var s_root: string = ''
-var s_hide_dotfiles: bool = !!g:simpletree_hide_dotfiles
-var s_root_locked: bool = !!g:simpletree_root_locked
-var s_git_ignore: bool = !!get(g:, 'simpletree_git_ignore', 1)
+var s_hide_dotfiles: bool = ConfFlag('simpletree_hide_dotfiles', true)
+var s_root_locked: bool = ConfFlag('simpletree_root_locked', false)
+var s_git_ignore: bool = ConfFlag('simpletree_git_ignore', true)
 
 var s_state: dict<any> = {}               # path -> {expanded: bool}
 var s_cache: dict<list<dict<any>>> = {}   # path -> entries[]
@@ -256,6 +284,9 @@ const COLUMN_NAMES = ['size', 'mtime', 'symlink']
 
 def ColumnList(): list<string>
   var configured = get(g:, 'simpletree_columns', [])
+  if type(configured) == v:t_string
+    configured = configured ==# '' ? [] : [configured]
+  endif
   if type(configured) != v:t_list
     return []
   endif
@@ -379,7 +410,7 @@ enddef
 
 def SortedEntries(entries: list<dict<any>>): list<dict<any>>
   var mode = SortMode()
-  var reverse = !!get(g:, 'simpletree_sort_reverse', 0)
+  var reverse = ConfFlag('simpletree_sort_reverse', false)
   # daemon 的基础顺序已经是目录优先、名称升序；默认路径保持零复制。
   if mode ==# 'name' && !reverse
     return entries
@@ -1183,7 +1214,7 @@ def ApplyBufferRenamePlan(plan: list<dict<any>>)
 enddef
 
 def TrashCommand(path: string): list<string>
-  if !get(g:, 'simpletree_use_trash', 1)
+  if !ConfFlag('simpletree_use_trash', true)
     return []
   endif
   if has('unix') && executable('gio')
@@ -1800,7 +1831,7 @@ def Emit(name: string, data: dict<any> = {})
 enddef
 
 def WatcherEnabled(): bool
-  return !!get(g:, 'simpletree_use_watcher', 1) && s_root_opts.watch && HasCap('watch')
+  return ConfFlag('simpletree_use_watcher', true) && s_root_opts.watch && HasCap('watch')
 enddef
 
 def WatchDir(path: string)
@@ -1959,7 +1990,7 @@ enddef
 
 # ---------------- git status ----------------
 def GitStatusEnabled(): bool
-  return !!get(g:, 'simpletree_git_status', 1) && s_root_opts.git && HasCap('git-status')
+  return ConfFlag('simpletree_git_status', true) && s_root_opts.git && HasCap('git-status')
 enddef
 
 # git_status 曾经是"发出去就不管"：DispatchLine() 只在 s_bcbs 里有对应 id 时
@@ -3054,7 +3085,7 @@ def ScanDirAsync(path: string, force: bool = false)
     p,
     !s_hide_dotfiles,
     s_git_ignore,
-    g:simpletree_page,
+    PageSize(),
     request_has_metadata,
     (entries) => {
       if !s_open || session_generation != s_session_generation
@@ -6172,25 +6203,29 @@ export def Health()
               strftime('%Y-%m-%d %H:%M', fresh.binary_time),
               fresh.newest,
               strftime('%Y-%m-%d %H:%M', fresh.source_time))
-          : 'newer than the Rust sources (' .. strftime('%Y-%m-%d %H:%M', fresh.binary_time) .. ')')
+          : (fresh.binary_time == fresh.source_time
+            ? 'as new as the Rust sources (' .. strftime('%Y-%m-%d %H:%M', fresh.binary_time) .. ')'
+            : 'newer than the Rust sources (' .. strftime('%Y-%m-%d %H:%M', fresh.binary_time) .. ')'))
     endif
   endif
-  HealthItem(g:simpletree_page >= 1 && g:simpletree_page <= 1000,
-    'page size', string(g:simpletree_page))
-  HealthItem(g:simpletree_width >= 10 && g:simpletree_width <= 500,
-    'tree width', string(g:simpletree_width))
+  var page = get(g:, 'simpletree_page', 200)
+  HealthItem(type(page) == v:t_number && page >= 1 && page <= 1000,
+    'page size', string(page))
+  var width = get(g:, 'simpletree_width', 45)
+  HealthItem(type(width) == v:t_number && width >= 10 && width <= 500,
+    'tree width', string(width))
   var configured_sort = get(g:, 'simpletree_sort', 'name')
   HealthItem(type(configured_sort) == v:t_string
       && index(SORT_MODES, tolower(trim(configured_sort))) >= 0,
     'sort mode', string(configured_sort))
 
   var trash = TrashCommand('/tmp/simpletree-health-check')
-  var trash_detail = !get(g:, 'simpletree_use_trash', 1)
+  var trash_detail = !ConfFlag('simpletree_use_trash', true)
     ? 'disabled'
     : (len(trash) > 0 ? trash[0] : 'no provider; deletes require permanent-delete confirmation')
   echom '  [--] trash: ' .. trash_detail
 
-  var clipboard = !get(g:, 'simpletree_use_system_clipboard', 1) ? 'disabled' : ''
+  var clipboard = !ConfFlag('simpletree_use_system_clipboard', true) ? 'disabled' : ''
   if clipboard ==# '' && has('clipboard')
     clipboard = 'Vim + register'
   endif
@@ -6215,7 +6250,7 @@ export def Health()
   # git 状态过去是从能力位推断出 "active" 的，即使每一次查询都失败。
   # 现在报的是最近一次查询的真实结果。
   var git_detail = ''
-  if !get(g:, 'simpletree_git_status', 1)
+  if !ConfFlag('simpletree_git_status', true)
     git_detail = 'disabled'
   elseif !s_root_opts.git
     git_detail = 'disabled for this root by its provider (ExternalSetRoot opts)'
@@ -6239,7 +6274,7 @@ export def Health()
     git_detail = 'capability present, no reply yet'
   endif
   echom '  [--] git status: ' .. git_detail
-  echom '  [--] fs watch: ' .. (!get(g:, 'simpletree_use_watcher', 1)
+  echom '  [--] fs watch: ' .. (!ConfFlag('simpletree_use_watcher', true)
     ? 'disabled (mtime polling)'
     : (!s_root_opts.watch
       ? 'disabled for this root by its provider (mtime polling)'
@@ -6721,7 +6756,7 @@ def ClipboardProviders(): list<list<string>>
 enddef
 
 def CopyToSystemClipboard(text: string): bool
-  if !get(g:, 'simpletree_use_system_clipboard', 1)
+  if !ConfFlag('simpletree_use_system_clipboard', true)
     return false
   endif
   if has('clipboard')
