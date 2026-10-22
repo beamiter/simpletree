@@ -4173,7 +4173,7 @@ def Render()
   var maxline = max([1, len(out)])
   for winid in TreeWindows()
     try
-      call win_execute(winid, 'if line(".") > ' .. maxline .. ' | normal! G | endif')
+      call win_execute(winid, 'if line(".") > ' .. maxline .. ' | call cursor(' .. maxline .. ', 1) | endif')
     catch
     endtry
   endfor
@@ -4505,13 +4505,15 @@ def CursorNode(): dict<any>
 enddef
 
 # 不再在找不到目标时跳到顶部，保持当前位置
+# 后台渲染也会恢复焦点；直接移动 cursor 避免 :normal 把合成按键
+# 放入 typeahead、使 Vim 离开 SafeState，进而阻塞宿主的下一次动作。
 def FocusPath(path: string): void
   if !WinValid() || path ==# ''
     return
   endif
   var target = PathLine(path)
   if target > 0
-    try | call win_execute(s_winid, 'normal! ' .. target .. 'G') | catch | endtry
+    try | call win_execute(s_winid, 'call cursor(' .. target .. ', 1)') | catch | endtry
   endif
 enddef
 
@@ -4536,7 +4538,7 @@ def FocusFirstChild(dir_path: string): void
     var next = s_line_index[next_idx]
     if get(next, 'depth', -1) == dir_depth + 1
       try
-        call win_execute(s_winid, 'normal! ' .. (next_idx + 1) .. 'G')
+        call win_execute(s_winid, 'call cursor(' .. (next_idx + 1) .. ', 1)')
       catch
       endtry
     endif

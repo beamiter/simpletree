@@ -313,6 +313,25 @@ call call(s:P('UpdateBufferDiff'), [s:probe_base])
 call setbufvar(s:Buf(), '&modifiable', 0)
 call assert_equal(s:probe_base, s:Snapshot(), 'buffer-write probe did not restore tree lines')
 
+" Restoring a tree selection from another active window never borrows that
+" window's cursor or view. These helpers also run from background render jobs.
+let s:treewin = bufwinid(s:Buf())
+rightbelow vnew
+call setline(1, ['source one', 'source two', 'source three'])
+call cursor(2, 4)
+let s:sourcewin = win_getid()
+let s:sourceview = winsaveview()
+call call(s:P('FocusPath'), [s:tmp . '/top.md'])
+call assert_equal(s:sourcewin, win_getid(), 'tree restoration stole source focus')
+call assert_equal(s:sourceview, winsaveview(), 'tree restoration moved source view')
+let s:target = call(s:P('PathLine'), [s:tmp . '/top.md'])
+call assert_equal(s:target, getcurpos(s:treewin)[1], 'tree selection was not restored')
+call assert_equal(1, getcurpos(s:treewin)[2], 'tree restoration should use its cursor-column convention')
+call call(s:P('FocusFirstChild'), [s:tmp . '/alpha'])
+call assert_equal(s:sourcewin, win_getid(), 'first-child restoration stole source focus')
+call assert_equal(s:sourceview, winsaveview(), 'first-child restoration moved source view')
+close!
+
 " ------------------------------------------------------------------ 收尾 ---
 
 call simpletree#Toggle()
