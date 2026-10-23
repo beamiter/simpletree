@@ -4993,6 +4993,13 @@ enddef
 def PasteStep(ctx: dict<any>)
   while ctx.index < len(ctx.jobs)
     var job = ctx.jobs[ctx.index]
+    if ctx.mode ==# 'cut' && !PathExists(job.dst)
+        && !empty(globpath(&runtimepath, 'autoload/simplecc/files.vim'))
+        && simplecc#core#IsRunning()
+      simplecc#files#Begin(job.src, job.dst, job.source_subtree,
+        () => CompleteIntegratedMove(ctx, job))
+      return
+    endif
     if BFsOp(ctx.mode ==# 'cut' ? 'move' : 'copy', job.src, job.dst,
         function(PasteStepDone, [ctx])) > 0
       return
@@ -5004,6 +5011,25 @@ def PasteStep(ctx: dict<any>)
     ctx.index += 1
   endwhile
   PasteFinish(ctx)
+enddef
+
+# The preview is deferred; only this callback may advance its cut queue.
+# A cross-device rename is rejected instead of silently becoming a copy while
+# the server/import edits assume the old URI has ceased to exist.
+def CompleteIntegratedMove(ctx: dict<any>, job: dict<any>): bool
+  if PathExists(job.dst) || !WorkspaceContainsOperationPath(job.src, true)
+      || !WorkspaceContainsOperationPath(fnamemodify(job.dst, ':h'))
+      || RefuseModifiedBuffers(job.src, job.source_subtree, 'move', !job.source_is_link)
+      || rename(job.src, job.dst) != 0
+    echohl ErrorMsg | echom '[SimpleTree] move failed; source retained and imports were not changed' | echohl None
+    return false
+  endif
+  job.rename_plan = BufferRenamePlan(job.src, job.dst, job.source_subtree)
+  PasteApply(ctx, job, {installed: true, source_removed: true, backup: ''})
+  ctx.index += 1
+  s_clipboard = {mode: 'cut', items: mapnew(ctx.jobs[ctx.index :], (_, item) => item.src) + ctx.remaining}
+  timer_start(0, (_) => PasteStep(ctx))
+  return true
 enddef
 
 def PasteStepDone(ctx: dict<any>, transfer: dict<any>)
@@ -5222,20 +5248,37 @@ export def OnRename()
     endif
   endif
 
+  if !empty(globpath(&runtimepath, 'autoload/simplecc/files.vim')) && !replacing && !PathEq(src, dst)
+    simplecc#files#Begin(src, dst, subtree, () => CompleteTreeRename(src, dst, subtree,
+      source_is_link, target_is_link, destination_buffer_subtree, rename_plan))
+    return
+  endif
+  CompleteTreeRename(src, dst, subtree, source_is_link, target_is_link,
+    destination_buffer_subtree, rename_plan)
+enddef
+
+def CompleteTreeRename(src: string, dst: string, subtree: bool, source_is_link: bool,
+    target_is_link: bool, destination_buffer_subtree: bool, rename_plan: list<dict<any>>): bool
+  if !WorkspaceContainsOperationPath(src, true)
+      || RefuseModifiedBuffers(src, subtree, 'rename', !source_is_link)
+    return false
+  endif
   if RenamePathSafely(src, dst)
-    echo '[SimpleTree] renamed: ' .. base .. ' -> ' .. newname
+    echo '[SimpleTree] renamed: ' .. fnamemodify(src, ':t') .. ' -> ' .. fnamemodify(dst, ':t')
     if !PathEq(src, dst)
       WipeBuffersForPath(dst, destination_buffer_subtree,
         !target_is_link && !source_is_link)
     endif
-    ApplyBufferRenamePlan(rename_plan)
+    ApplyBufferRenamePlan(BufferRenamePlan(src, dst, subtree))
     Emit('FileRenamed', {old: src, new: dst})
-    InvalidateAndRescan(parent)
+    InvalidateAndRescan(fnamemodify(src, ':h'))
     Render()
     RevealPath(dst)
+    return true
   else
     echohl ErrorMsg | echom '[SimpleTree] rename failed' | echohl None
   endif
+  return false
 enddef
 
 # 删除单个已确认的路径。确认框可能开了任意长时间，所以每一条破坏性守卫都在
