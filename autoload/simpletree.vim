@@ -5453,7 +5453,7 @@ def BuildHelpLines(): list<string>
     'h/←/<BS>      折叠当前目录或最近的已展开祖先',
     'R     刷新树（仅重扫缓存）',
     'H     显示/隐藏点文件',
-    'I     切换 gitignore 过滤（显示/隐藏被 git 忽略的文件）',
+    'I     切换 Git / .ignore 过滤（点文件显示由 H 单独控制）',
     's     循环排序：name / extension / mtime / size',
     'gs    反转当前排序',
     'q     关闭树窗口',

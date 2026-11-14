@@ -76,6 +76,7 @@ fn search_worker(
     builder
         .follow_links(false)
         .hidden(!options.show_hidden)
+        .ignore(options.git_ignore)
         .git_ignore(options.git_ignore)
         .git_global(options.git_ignore)
         .git_exclude(options.git_ignore)
@@ -175,6 +176,46 @@ pub async fn handle_search(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn disabling_ignore_filter_searches_dot_ignore_subtrees() {
+        for inherited in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join("root");
+            fs::create_dir(&root).unwrap();
+            let config_root = if inherited {
+                dir.path()
+            } else {
+                root.as_path()
+            };
+            fs::create_dir(root.join("excluded")).unwrap();
+            fs::write(config_root.join(".ignore"), "excluded/\n").unwrap();
+            fs::write(root.join("excluded/match.txt"), "payload").unwrap();
+            fs::write(root.join("match-visible.txt"), "payload").unwrap();
+            for filtering in [true, false] {
+                let (tx, mut rx) = mpsc::channel(4);
+                search_worker(
+                    &root,
+                    "match",
+                    SearchOptions {
+                        mode: SearchMode::Substring,
+                        max_results: 20,
+                        show_hidden: false,
+                        git_ignore: filtering,
+                    },
+                    &CancellationToken::new(),
+                    tx,
+                )
+                .unwrap();
+                let mut names = Vec::new();
+                while let Ok(batch) = rx.try_recv() {
+                    names.extend(batch.into_iter().map(|entry| entry.name));
+                }
+                assert!(names.iter().any(|name| name == "match-visible.txt"));
+                assert_eq!(names.iter().any(|name| name == "match.txt"), !filtering);
+            }
+        }
+    }
 
     #[test]
     fn substring_matching_is_case_insensitive() {

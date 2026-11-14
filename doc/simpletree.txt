@@ -209,7 +209,7 @@ h, Left, <BS>
 
 R       Refresh.
 H       Toggle dotfiles.
-I       Toggle Git ignore filtering.
+I       Toggle Git and .ignore filtering.
 s       Cycle name / extension / mtime / size sorting.
 gs      Reverse the current sorting mode.
 q       Close the tree.
@@ -376,7 +376,9 @@ g:simpletree_hide_dotfiles
 
                                              *g:simpletree_git_ignore*
 g:simpletree_git_ignore
-        Boolean, default 1.  Follow Git ignore rules.
+        Boolean, default 1.  Follow Git ignore and .ignore rules for listings
+        and recursive search. Disabling this includes ignored entries; hidden
+        dotfiles are still controlled separately by the H toggle.
 
                                              *g:simpletree_page*
 g:simpletree_page

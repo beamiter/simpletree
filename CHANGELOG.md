@@ -2,6 +2,12 @@
 
 本文件记录 SimpleTree 面向用户的重要变化。
 
+## Unreleased - 2026-11-14
+
+- `I` / `g:simpletree_git_ignore = 0` 现在同时关闭 `.ignore` 过滤，目录扫描和
+  递归搜索都能看到原先始终被 `.ignore` 隐藏的条目。过滤开启时行为不变，
+  点文件仍由 `H` 单独控制。
+
 ## Unreleased - 2026-10-04
 
 ### 修正：刚编完的 daemon 被 Health 说成「比源码新」

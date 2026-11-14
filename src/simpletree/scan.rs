@@ -105,6 +105,7 @@ pub fn scan_directory(
     builder
         .follow_links(false)
         .hidden(!options.show_hidden)
+        .ignore(options.git_ignore)
         .git_ignore(options.git_ignore)
         .git_global(options.git_ignore)
         .git_exclude(options.git_ignore)
@@ -248,6 +249,46 @@ pub async fn emit_entries(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn disabling_ignore_filter_reveals_dot_ignore_entries() {
+        for inherited in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join("root");
+            fs::create_dir(&root).unwrap();
+            let config_root = if inherited {
+                dir.path()
+            } else {
+                root.as_path()
+            };
+            fs::write(config_root.join(".ignore"), "ignored.txt\n").unwrap();
+            fs::write(root.join("ignored.txt"), "payload").unwrap();
+            fs::write(root.join("visible.txt"), "payload").unwrap();
+            for filtering in [true, false] {
+                let result = scan_directory(
+                    &root,
+                    ScanOptions {
+                        show_hidden: false,
+                        git_ignore: filtering,
+                        meta: false,
+                    },
+                    &CancellationToken::new(),
+                )
+                .unwrap();
+                let names: Vec<_> = result
+                    .entries
+                    .iter()
+                    .map(|entry| entry.name.as_str())
+                    .collect();
+                assert!(names.contains(&"visible.txt"));
+                assert_eq!(names.contains(&"ignored.txt"), !filtering);
+                assert!(
+                    !names.contains(&".ignore"),
+                    "hidden-file toggle remains independent"
+                );
+            }
+        }
+    }
 
     fn entry(name: &str, is_dir: bool) -> Entry {
         Entry::new(name.to_owned(), format!("/tmp/{name}"), is_dir)
