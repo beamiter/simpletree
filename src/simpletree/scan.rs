@@ -141,7 +141,7 @@ pub fn scan_directory(
         if non_utf8 {
             result
                 .warnings
-                .push(format!("entry name is not valid UTF-8: {}", name));
+                .push(format!("entry name is not valid UTF-8: {name}"));
         }
 
         let file_type = dent.file_type();
