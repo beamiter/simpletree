@@ -311,7 +311,7 @@ operations.  Payload data is passed through g:simpletree_event: >
 Events: SimpleTreeOpen, SimpleTreeClose, SimpleTreeRootChanged,
 SimpleTreeNodeOpened, SimpleTreeDirExpanded, SimpleTreeDirCollapsed,
 SimpleTreeFileCreated, SimpleTreeFileDeleted, SimpleTreeFileRenamed,
-SimpleTreeGitStatusUpdated, SimpleTreeFilterChanged,
+SimpleTreePathsChanged, SimpleTreeGitStatusUpdated, SimpleTreeFilterChanged,
 SimpleTreeRevealForeign.
 
 SimpleTreeRootChanged is emitted by every root-changing entry point.  Its
@@ -319,6 +319,14 @@ payload contains root (also available as path), old_root, and source.  Built-in
 sources include command, open, here, up, prompt, cwd, current, auto-follow,
 api, and external; integrations may pass their own stable source name through
 simpletree#ExternalSetRoot().
+
+SimpleTreePathsChanged describes filesystem entries affected by each item in
+a paste. Its payload is {paths: [absolute-path, ...]}, with one or two exact
+paths. Copies and cross-device moves that retain the source name only the
+destination; a completed move names source then destination. A failed
+transfer that could not restore a displaced destination names that destination
+as changed, without implying success. A failure leaving the destination
+untouched emits nothing. Other file operations keep their existing events.
 
 SimpleTreeRevealForeign is emitted when a reveal (f, |:SimpleTreeReveal|)
 targets a buffer or path with a URL scheme that no local file corresponds to.

@@ -54,6 +54,9 @@ let g:simpletree_state_file = tempname() .. '/state.json'
 execute 'set runtimepath^=' .. fnameescape(s:repo)
 runtime plugin/simpletree.vim
 
+let s:changes = []
+autocmd User SimpleTreePathsChanged call add(s:changes, deepcopy(g:simpletree_event.paths))
+
 function! s:Sid() abort
   return getscriptinfo({'name': 'autoload/simpletree.vim'})[0].sid
 endfunction
@@ -127,6 +130,8 @@ call assert_equal(['plain'], readfile(s:root .. '/dest/b-plain.txt'),
       \ 'the refusal stalled the batch: the next item was never sent')
 call assert_false(filereadable(s:root .. '/dest/a-refuse.txt'),
       \ 'a refused copy installed something at the destination anyway')
+call assert_equal([[s:root .. '/dest/b-plain.txt']], s:changes,
+        \ 'a refused operation must not publish any path')
 let s:msgs = execute('messages')
 call assert_true(stridx(s:msgs, 'failed to copy: ' .. s:root .. '/a-refuse.txt') >= 0,
       \ 'the refusal was never reported: ' .. s:msgs)
@@ -145,6 +150,8 @@ call s:SelectPath(s:root .. '/dest')
 call simpletree#OnPaste()
 call assert_true(s:WaitFor(function('s:Settled')),
       \ 'a failed fs-op left its callback registered forever')
+call assert_equal([[s:root .. '/dest/b-plain.txt'], [s:root .. '/dest/c-orphan.txt']],
+        \ s:changes, 'rollback failure publishes the displaced destination only')
 let s:msgs = execute('messages')
 call assert_true(stridx(s:msgs, s:root .. '/dest/c-orphan.txt.simpletree-backup-proxy') >= 0,
       \ 'the displaced original was left unnamed: ' .. s:msgs)

@@ -41,6 +41,9 @@ execute 'set runtimepath^=' .. fnameescape(s:repo)
 let g:simpletree_state_file = tempname() . '/state.json'
 runtime plugin/simpletree.vim
 
+let s:changes = []
+autocmd User SimpleTreePathsChanged call add(s:changes, deepcopy(g:simpletree_event.paths))
+
 function! s:Sid() abort
   return getscriptinfo({'name': 'autoload/simpletree.vim'})[0].sid
 endfunction
@@ -88,6 +91,8 @@ try
   sleep 600m
   call assert_equal(['leaf'], readfile(s:root .. '/dest/tree/nested/leaf.txt'),
         \ 'the daemon copy did not reproduce the tree')
+  call assert_equal([[s:root .. '/dest/tree']], s:changes,
+        \ 'a daemon copy emits its installed destination')
 
   " ----------------------------------------------- the fallback still works ---
 
@@ -133,6 +138,8 @@ try
   call assert_equal(['one'], readfile(s:root .. '/tree/one.txt'))
   call assert_equal(['', []], [s:Vars().s_clipboard.mode, s:Vars().s_clipboard.items],
         \ 'a fully applied cut must empty the clipboard')
+  call assert_equal([s:root .. '/one.txt', s:root .. '/tree/one.txt'], s:changes[-1],
+        \ 'a daemon move emits both exact paths')
 
   " --------------------------------------------- a refused op ends the chain ---
 

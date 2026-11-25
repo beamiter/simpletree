@@ -4955,13 +4955,18 @@ def PasteApply(ctx: dict<any>, job: dict<any>, transfer: dict<any>)
     if mode ==# 'cut'
       ctx.remaining->add(job.src)
     endif
+    if backup !=# ''
+      # The failed rollback left the old destination displaced.
+      Emit('PathsChanged', {paths: [job.dst]})
+    endif
     return
   endif
 
+  var source_removed = mode ==# 'cut' && get(transfer, 'source_removed', false)
   # 关闭被替换目标的未修改缓冲区，再把成功移动的源缓冲区改到新路径。
   WipeBuffersForPath(job.dst, job.destination_buffer_subtree,
     !job.target_is_link && !job.source_is_link)
-  if mode ==# 'cut' && get(transfer, 'source_removed', false)
+  if source_removed
     ApplyBufferRenamePlan(job.rename_plan)
   endif
   ctx.focused = job.dst
@@ -4971,7 +4976,7 @@ def PasteApply(ctx: dict<any>, job: dict<any>, transfer: dict<any>)
     if sp !=# ctx.destDir
       InvalidateAndRescan(sp)
     endif
-    if get(transfer, 'source_removed', false)
+    if source_removed
       echo '[SimpleTree] moved: ' .. job.base .. ' -> ' .. ctx.destDir
     else
       ctx.remaining->add(job.src)
@@ -4982,6 +4987,9 @@ def PasteApply(ctx: dict<any>, job: dict<any>, transfer: dict<any>)
   else
     echo '[SimpleTree] copied: ' .. job.base .. ' -> ' .. ctx.destDir
   endif
+  # One exact notification per transfer. A cross-device cut that installed a
+  # copy kept the source intact; only a completed move changes both entries.
+  Emit('PathsChanged', {paths: source_removed ? [job.src, job.dst] : [job.dst]})
 enddef
 
 # 作业一项一项地跑，而不是一次全部发给守护进程：并发搬运会让失败报告的顺序和

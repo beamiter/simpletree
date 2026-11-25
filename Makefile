@@ -65,6 +65,7 @@ vim-test:
 	vim -Nu NONE -n -i NONE -es -S tests/vim_health.vim
 	vim -Nu NONE -n -i NONE -es -S tests/vim_search.vim
 	vim -Nu NONE -n -i NONE -es -S tests/vim_fsops.vim
+	vim -Nu NONE -n -i NONE -es -S tests/vim_paste_paths.vim
 	vim -Nu NONE -n -i NONE -es -S tests/vim_fsop_failures.vim
 	vim -Nu NONE -n -i NONE -es -S tests/vim_filter.vim
 	vim -Nu NONE -n -i NONE -es -S tests/vim_git_multi.vim
