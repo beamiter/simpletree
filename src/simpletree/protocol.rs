@@ -116,7 +116,11 @@ pub enum Event {
     #[serde(rename = "ok")]
     Ok { id: u64 },
     #[serde(rename = "fs_event")]
-    FsEvent { dirs: Vec<String> },
+    FsEvent {
+        dirs: Vec<String>,
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        ignore_scopes: Vec<String>,
+    },
     #[serde(rename = "git_status")]
     GitStatus {
         id: u64,

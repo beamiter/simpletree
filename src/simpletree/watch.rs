@@ -3,7 +3,10 @@ use crate::protocol::Event;
 use crate::scan::ScanCache;
 use crate::server::{EventTx, send_event};
 use anyhow::{Context, Result, bail};
-use notify::{RecommendedWatcher, RecursiveMode, Watcher};
+use notify::{
+    EventKind, RecommendedWatcher, RecursiveMode, Watcher,
+    event::{AccessKind, AccessMode},
+};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -19,16 +22,55 @@ type WatchedDirs = Arc<Mutex<HashSet<PathBuf>>>;
 
 struct RawChange {
     dir: PathBuf,
-    /// Ignore-rule files influence listings far beyond their own directory,
-    /// so their changes clear the whole scan cache instead of one entry.
-    ignore_rules_changed: bool,
+    /// Root of the subtree whose effective ignore policy can change.
+    ignore_scope: Option<PathBuf>,
 }
 
-fn is_ignore_rules_file(path: &Path) -> bool {
-    matches!(
-        path.file_name().and_then(|name| name.to_str()),
-        Some(".gitignore" | ".ignore" | "exclude")
-    )
+fn listing_can_change(kind: EventKind) -> bool {
+    // The daemon itself opens and reads the directories and ignore files it
+    // watches. Forwarding those accesses indefinitely requeues its own scans.
+    !matches!(kind, EventKind::Access(access) if access != AccessKind::Close(AccessMode::Write))
+}
+
+fn ignore_scope(path: &Path, dir: &Path) -> Option<PathBuf> {
+    match path.file_name().and_then(|name| name.to_str()) {
+        Some(".gitignore" | ".ignore") => Some(dir.to_path_buf()),
+        Some("exclude") => {
+            // Preserve invalidation for other files named exclude, while
+            // recognizing the repository scope of a watched .git/info file.
+            let scope = dir
+                .parent()
+                .filter(|git| dir.ends_with("info") && git.ends_with(".git"))
+                .and_then(Path::parent)
+                .unwrap_or(dir);
+            Some(scope.to_path_buf())
+        }
+        _ => None,
+    }
+}
+
+fn add_policy_watches(
+    dirs: &mut HashSet<PathBuf>,
+    scopes: &HashSet<PathBuf>,
+    watched: &HashSet<PathBuf>,
+) {
+    if !scopes.is_empty() {
+        dirs.extend(
+            watched
+                .iter()
+                .filter(|dir| scopes.iter().any(|scope| dir.starts_with(scope)))
+                .cloned(),
+        );
+    }
+}
+
+fn sorted_paths(paths: HashSet<PathBuf>) -> Vec<String> {
+    let mut paths: Vec<_> = paths
+        .into_iter()
+        .map(|dir| dir.to_string_lossy().into_owned())
+        .collect();
+    paths.sort_unstable();
+    paths
 }
 
 /// Non-recursive per-directory watcher. Raw notify events cross from the
@@ -52,6 +94,9 @@ impl WatchService {
             let Ok(event) = event else {
                 return;
             };
+            if !listing_can_change(event.kind) {
+                return;
+            }
             let Ok(watched) = handler_watched.lock() else {
                 return;
             };
@@ -59,8 +104,8 @@ impl WatchService {
                 if let Some(dir) = owning_watched_dir(&watched, path) {
                     // Send failures mean the daemon is shutting down.
                     let _ = raw_tx.send(RawChange {
+                        ignore_scope: ignore_scope(path, &dir),
                         dir,
-                        ignore_rules_changed: is_ignore_rules_file(path),
                     });
                 }
             }
@@ -72,6 +117,7 @@ impl WatchService {
             out,
             git_cache,
             scan_cache.clone(),
+            watched.clone(),
         ));
         Some(WatchService {
             watcher,
@@ -138,10 +184,11 @@ async fn debounce_fs_events(
     out: EventTx,
     git_cache: GitCache,
     scan_cache: ScanCache,
+    watched: WatchedDirs,
 ) {
     while let Some(first) = rx.recv().await {
         let mut dirs: HashSet<PathBuf> = HashSet::new();
-        let mut ignore_rules_changed = first.ignore_rules_changed;
+        let mut ignore_scopes: HashSet<_> = first.ignore_scope.into_iter().collect();
         dirs.insert(first.dir);
         let deadline = Instant::now() + HARD_DEADLINE;
 
@@ -151,7 +198,7 @@ async fn debounce_fs_events(
                 _ = sleep_until(deadline) => break,
                 more = rx.recv() => match more {
                     Some(change) => {
-                        ignore_rules_changed |= change.ignore_rules_changed;
+                        ignore_scopes.extend(change.ignore_scope);
                         dirs.insert(change.dir);
                     }
                     None => break,
@@ -159,7 +206,7 @@ async fn debounce_fs_events(
             }
         }
 
-        if ignore_rules_changed {
+        if !ignore_scopes.is_empty() {
             scan_cache.clear();
         } else {
             for dir in &dirs {
@@ -169,12 +216,21 @@ async fn debounce_fs_events(
         // Any filesystem change may move git state; refresh on next query.
         git_cache.mark_all_dirty();
 
-        let mut dirs: Vec<String> = dirs
-            .into_iter()
-            .map(|dir| dir.to_string_lossy().into_owned())
-            .collect();
-        dirs.sort_unstable();
-        if send_event(&out, &Event::FsEvent { dirs }).await.is_err() {
+        // Keep active descendants in the existing field for older clients.
+        // New clients also receive the roots to expire collapsed caches.
+        if let Ok(watched) = watched.lock() {
+            add_policy_watches(&mut dirs, &ignore_scopes, &watched);
+        }
+        if send_event(
+            &out,
+            &Event::FsEvent {
+                dirs: sorted_paths(dirs),
+                ignore_scopes: sorted_paths(ignore_scopes),
+            },
+        )
+        .await
+        .is_err()
+        {
             return;
         }
     }
@@ -183,6 +239,55 @@ async fn debounce_fs_events(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reads_do_not_refresh_but_write_closes_do() {
+        assert!(!listing_can_change(EventKind::Access(AccessKind::Read)));
+        assert!(!listing_can_change(EventKind::Access(AccessKind::Open(
+            AccessMode::Any
+        ))));
+        assert!(!listing_can_change(EventKind::Access(AccessKind::Close(
+            AccessMode::Read
+        ))));
+        assert!(listing_can_change(EventKind::Access(AccessKind::Close(
+            AccessMode::Write
+        ))));
+        assert!(listing_can_change(EventKind::Modify(
+            notify::event::ModifyKind::Any
+        )));
+    }
+
+    #[test]
+    fn ignore_changes_include_watched_descendants_but_not_siblings() {
+        assert_eq!(
+            ignore_scope(Path::new("/work/src/.gitignore"), Path::new("/work/src")),
+            Some("/work/src".into())
+        );
+        assert_eq!(
+            ignore_scope(
+                Path::new("/work/.git/info/exclude"),
+                Path::new("/work/.git/info")
+            ),
+            Some("/work".into())
+        );
+        assert_eq!(
+            ignore_scope(Path::new("/work/src/main.rs"), Path::new("/work/src")),
+            None
+        );
+        let mut dirs = HashSet::from([PathBuf::from("/work/src")]);
+        let watched = ["/work", "/work/src", "/work/src/nested", "/work/src-other"]
+            .into_iter()
+            .map(PathBuf::from)
+            .collect();
+        add_policy_watches(&mut dirs, &HashSet::new(), &watched);
+        assert_eq!(sorted_paths(dirs.clone()), ["/work/src"]);
+        add_policy_watches(
+            &mut dirs,
+            &HashSet::from([PathBuf::from("/work/src")]),
+            &watched,
+        );
+        assert_eq!(sorted_paths(dirs), ["/work/src", "/work/src/nested"]);
+    }
 
     #[test]
     fn event_paths_resolve_to_the_watched_directory() {

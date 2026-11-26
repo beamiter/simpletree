@@ -198,6 +198,7 @@ var s_backend_protocol: number = 0
 var s_watched: dict<bool> = {}        # dir -> true（已发出 watch 请求）
 var s_watch_failed: dict<bool> = {}   # dir -> true（watch 被拒绝，回退轮询）
 var s_fs_pending_dirs: dict<bool> = {}
+var s_fs_pending_ignore: dict<bool> = {}
 var s_fs_refresh_timer: number = 0
 
 # git status（daemon 查询；path -> 状态码 M/S/U/C/D，目录为聚合码）。
@@ -1567,7 +1568,8 @@ export def DispatchLine(line: string)
   elseif ev.type ==# 'fs_event'
     var dirs = get(ev, 'dirs', [])
     if type(dirs) == v:t_list
-      OnFsEvent(dirs)
+      var scopes = get(ev, 'ignore_scopes', [])
+      OnFsEvent(dirs, type(scopes) == v:t_list ? scopes : [])
     endif
   elseif ev.type ==# 'git_status'
     OnGitStatusEvent(ev)
@@ -1756,6 +1758,7 @@ def CancelFrontendWork()
     s_fs_refresh_timer = 0
   endif
   s_fs_pending_dirs = {}
+  s_fs_pending_ignore = {}
   if s_git_timer != 0
     try
       call timer_stop(s_git_timer)
@@ -1912,7 +1915,7 @@ def UnwatchAllDirs()
 enddef
 
 # fs_event 已在 daemon 侧去抖；这里再合并一拍，处理连续推送与展开状态过滤。
-def OnFsEvent(dirs: list<any>)
+def OnFsEvent(dirs: list<any>, scopes: list<any>)
   if !s_open
     return
   endif
@@ -1921,6 +1924,13 @@ def OnFsEvent(dirs: list<any>)
       s_fs_pending_dirs[d] = true
     endif
   endfor
+  if s_git_ignore
+    for scope in scopes
+      if type(scope) == v:t_string && scope !=# '' && PathVisibleInTree(scope)
+        s_fs_pending_ignore[scope] = true
+      endif
+    endfor
+  endif
   if s_fs_refresh_timer != 0
     return
   endif
@@ -1931,11 +1941,26 @@ def OnFsEvent(dirs: list<any>)
     endif
     if !s_open || session_generation != s_session_generation
       s_fs_pending_dirs = {}
+      s_fs_pending_ignore = {}
       return
     endif
-    var pending = keys(s_fs_pending_dirs)
+    var pending = s_fs_pending_dirs
+    var ignore_scopes = keys(s_fs_pending_ignore)
     s_fs_pending_dirs = {}
-    RefreshDirs(pending)
+    s_fs_pending_ignore = {}
+    if s_git_ignore && !empty(ignore_scopes)
+      # A collapsed child may have a cached listing even after UnwatchDir.
+      # Expire only cached or in-flight entries underneath the changed rules.
+      for path in keys(s_cache) + keys(s_loading) + keys(s_scan_errors)
+        for scope in ignore_scopes
+          if PathEq(scope, path) || IsSubPath(scope, path)
+            pending[path] = true
+            break
+          endif
+        endfor
+      endfor
+    endif
+    RefreshDirs(keys(pending))
   })
 enddef
 
